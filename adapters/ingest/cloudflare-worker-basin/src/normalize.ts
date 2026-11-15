@@ -134,6 +134,46 @@ function ownProp(record: Record<string, unknown>, key: string): unknown {
   return Object.hasOwn(record, key) ? record[key] : undefined;
 }
 
+function stringifyJsonPreservingNonFinite(value: unknown): string {
+  return JSON.stringify(value, (_key, val: unknown) =>
+    typeof val === "number" && !Number.isFinite(val) ? String(val) : val,
+  );
+}
+
+function tryDecodeByteArray(value: unknown): Uint8Array | null {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  const byteValues: number[] = new Array(value.length);
+  for (let i = 0; i < value.length; i++) {
+    const item = value[i];
+    if (typeof item === "number" && Number.isInteger(item) && item >= 0 && item <= 255) {
+      byteValues[i] = item;
+    } else {
+      return null;
+    }
+  }
+  return Uint8Array.from(byteValues);
+}
+
+function pickOwnNonNull(
+  record: Record<string, unknown>,
+  camelKey: string,
+  snakeKey: string,
+): unknown {
+  const camelVal = ownProp(record, camelKey);
+  if (camelVal !== undefined && camelVal !== null) {
+    return camelVal;
+  }
+  if (camelKey !== snakeKey) {
+    const snakeVal = ownProp(record, snakeKey);
+    if (snakeVal !== undefined && snakeVal !== null) {
+      return snakeVal;
+    }
+  }
+  return undefined;
+}
+
 function pickOwn(
   record: Record<string, unknown>,
   camelKey: string,
@@ -163,11 +203,24 @@ function pickNonEmptyString(
 
 function parseSafeInt(value: unknown): number | null {
   if (typeof value === "number") {
-    return Number.isSafeInteger(value) ? value : null;
+    return Number.isSafeInteger(value) ? (value === 0 ? 0 : value) : null;
   }
   if (typeof value === "string" && /^-?\d+$/.test(value.trim())) {
     const parsed = Number(value.trim());
-    return Number.isSafeInteger(parsed) ? parsed : null;
+    return Number.isSafeInteger(parsed) ? (parsed === 0 ? 0 : parsed) : null;
+  }
+  return null;
+}
+
+function resolveFirstSafeInt(
+  record: Record<string, unknown>,
+  keys: readonly string[],
+): number | null {
+  for (const key of keys) {
+    const parsed = parseSafeInt(ownProp(record, key));
+    if (parsed !== null) {
+      return parsed;
+    }
   }
   return null;
 }
@@ -188,7 +241,7 @@ const PRIORITY_BY_TEXT = new Map<string, number>([
   ["debug", 7],
 ]);
 
-function parsePriority(rawPriority: unknown): number {
+function tryParsePriority(rawPriority: unknown): number | null {
   const parsed = parseSafeInt(rawPriority);
   if (parsed !== null) {
     if (parsed < 0) return 0;
@@ -201,7 +254,23 @@ function parsePriority(rawPriority: unknown): number {
       return mapped;
     }
   }
-  return 6;
+  return null;
+}
+
+function resolveValidPriority(
+  sources: readonly (Record<string, unknown> | null)[],
+  keys: readonly string[] = ["syslog.priority", "priority", "PRIORITY"],
+): number | null {
+  for (const source of sources) {
+    if (!source) continue;
+    for (const key of keys) {
+      const parsed = tryParsePriority(ownProp(source, key));
+      if (parsed !== null) {
+        return parsed;
+      }
+    }
+  }
+  return null;
 }
 
 function parseIsoTimestamp(value: unknown): string | null {
@@ -237,29 +306,19 @@ function parseMessageField(raw: unknown): { text: string; bytes: Uint8Array } {
   if (typeof raw === "string") {
     return { text: raw, bytes: textEncoder.encode(raw) };
   }
+  const decodedBytes = tryDecodeByteArray(raw);
+  if (decodedBytes !== null) {
+    return { text: textDecoder.decode(decodedBytes), bytes: decodedBytes };
+  }
   if (Array.isArray(raw)) {
-    const byteValues: number[] = [];
-    let allBytes = true;
-    for (const item of raw) {
-      if (typeof item === "number" && Number.isInteger(item) && item >= 0 && item <= 255) {
-        byteValues.push(item);
-      } else {
-        allBytes = false;
-        break;
-      }
-    }
-    if (allBytes) {
-      const bytes = Uint8Array.from(byteValues);
-      return { text: textDecoder.decode(bytes), bytes };
-    }
-    const serialized = JSON.stringify(raw);
+    const serialized = stringifyJsonPreservingNonFinite(raw);
     return { text: serialized, bytes: textEncoder.encode(serialized) };
   }
   if (raw === null || raw === undefined) {
     return { text: "", bytes: new Uint8Array(0) };
   }
   if (typeof raw === "object") {
-    const serialized = JSON.stringify(raw);
+    const serialized = stringifyJsonPreservingNonFinite(raw);
     return { text: serialized, bytes: textEncoder.encode(serialized) };
   }
   const text = String(raw);
@@ -287,28 +346,70 @@ function buildScanBuffer(
     syslog_identifier: string | null;
     systemd_unit: string | null;
   },
+  extraParts: readonly string[] = [],
 ): Uint8Array {
-  const metadataParts = [
+  const canonicalParts = [
     fields.cmdline,
     fields.exe,
     fields.syslog_identifier,
     fields.systemd_unit,
   ].filter((part): part is string => part !== null && part.length > 0);
 
-  if (metadataParts.length === 0) {
-    return messageBytes.length > MAX_SCAN_BYTES
-      ? messageBytes.subarray(0, MAX_SCAN_BYTES)
-      : messageBytes;
+  let canonicalBytes: Uint8Array = new Uint8Array(0);
+  if (canonicalParts.length > 0) {
+    const prefix = messageBytes.length > 0 ? "\n" : "";
+    const encodedCanonical = textEncoder.encode(`${prefix}${canonicalParts.join("\n")}`);
+    const canonicalCap =
+      messageBytes.length > 0 ? Math.floor(MAX_SCAN_BYTES / 2) : MAX_SCAN_BYTES;
+    canonicalBytes =
+      encodedCanonical.length > canonicalCap
+        ? encodedCanonical.subarray(0, canonicalCap)
+        : encodedCanonical;
   }
 
-  const metaBytes = textEncoder.encode(`\n${metadataParts.join("\n")}`);
-  const msgCap = Math.max(0, MAX_SCAN_BYTES - metaBytes.length);
+  const msgCap = Math.max(0, MAX_SCAN_BYTES - canonicalBytes.length);
   const slicedMsg =
     messageBytes.length > msgCap ? messageBytes.subarray(0, msgCap) : messageBytes;
 
-  const combined = new Uint8Array(slicedMsg.length + metaBytes.length);
-  combined.set(slicedMsg, 0);
-  combined.set(metaBytes, slicedMsg.length);
+  let remainingForExtra = Math.max(0, MAX_SCAN_BYTES - (slicedMsg.length + canonicalBytes.length));
+  const extraChunks: Uint8Array[] = [];
+  let extraByteLen = 0;
+  if (remainingForExtra > 0) {
+    let needSep = slicedMsg.length + canonicalBytes.length > 0;
+    for (const part of extraParts) {
+      if (part.length === 0) continue;
+      const chunkText = needSep ? `\n${part}` : part;
+      const encoded = textEncoder.encode(chunkText);
+      needSep = true;
+      if (encoded.length <= remainingForExtra) {
+        extraChunks.push(encoded);
+        extraByteLen += encoded.length;
+        remainingForExtra -= encoded.length;
+      } else {
+        extraChunks.push(encoded.subarray(0, remainingForExtra));
+        extraByteLen += remainingForExtra;
+        remainingForExtra = 0;
+        break;
+      }
+    }
+  }
+
+  if (canonicalBytes.length === 0 && extraByteLen === 0) {
+    return slicedMsg;
+  }
+
+  const combined = new Uint8Array(slicedMsg.length + canonicalBytes.length + extraByteLen);
+  let offset = 0;
+  combined.set(slicedMsg, offset);
+  offset += slicedMsg.length;
+  if (canonicalBytes.length > 0) {
+    combined.set(canonicalBytes, offset);
+    offset += canonicalBytes.length;
+  }
+  for (const chunk of extraChunks) {
+    combined.set(chunk, offset);
+    offset += chunk.length;
+  }
   return combined;
 }
 
@@ -341,13 +442,53 @@ function parseUnixNanoToIso(value: unknown): string | null {
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
 }
 
+const OTLP_ANYVALUE_KEYS = new Set([
+  "stringValue",
+  "string_value",
+  "boolValue",
+  "bool_value",
+  "intValue",
+  "int_value",
+  "doubleValue",
+  "double_value",
+  "bytesValue",
+  "bytes_value",
+  "arrayValue",
+  "array_value",
+  "kvlistValue",
+  "kvlist_value",
+]);
+
+const INT64_MIN = -9223372036854775808n;
+const INT64_MAX = 9223372036854775807n;
+
 function decodeBase64Bytes(encoded: string): number[] | null {
-  const compact = encoded.replace(/\s+/g, "");
-  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(compact)) {
+  if (encoded.length === 0) {
+    return [];
+  }
+  const isStandard = /^[A-Za-z0-9+/]*={0,2}$/.test(encoded);
+  const isUrlSafe = !isStandard && /^[A-Za-z0-9\-_]*={0,2}$/.test(encoded);
+  if (!isStandard && !isUrlSafe) {
     return null;
   }
+  const unpadded = encoded.replace(/=+$/, "");
+  const padCount = encoded.length - unpadded.length;
+  if (padCount > 2) {
+    return null;
+  }
+  const rem = unpadded.length % 4;
+  if (rem === 1) {
+    return null;
+  }
+  if (padCount > 0 && (unpadded.length + padCount) % 4 !== 0) {
+    return null;
+  }
+  const std = isUrlSafe
+    ? unpadded.replace(/-/g, "+").replace(/_/g, "/")
+    : unpadded;
+  const padded = rem === 0 ? std : std + "=".repeat(4 - rem);
   try {
-    const bin = atob(compact);
+    const bin = atob(padded);
     const out: number[] = new Array(bin.length);
     for (let i = 0; i < bin.length; i++) {
       out[i] = bin.charCodeAt(i);
@@ -355,6 +496,21 @@ function decodeBase64Bytes(encoded: string): number[] | null {
     return out;
   } catch {
     return null;
+  }
+}
+
+const OTLP_KEYVALUE_KEYS = new Set(["key", "value"]);
+const OTLP_VALUES_CONTAINER_KEYS = new Set(["values"]);
+
+function assertKnownOtlpKeys(
+  record: Record<string, unknown>,
+  allowed: ReadonlySet<string>,
+  label: string,
+): void {
+  for (const key of Object.keys(record)) {
+    if (!allowed.has(key)) {
+      throw new OtlpUnpackError(400, `Unknown OTLP ${label} field: ${key}`);
+    }
   }
 }
 
@@ -370,25 +526,44 @@ function decodeOtlpAttributes(rawAttrs: unknown): Record<string, unknown> {
     if (!isPlainObject(entry)) {
       throw new OtlpUnpackError(400, "OTLP attribute entry must be an object");
     }
+    assertKnownOtlpKeys(entry, OTLP_KEYVALUE_KEYS, "KeyValue");
     const key = ownProp(entry, "key");
     if (typeof key !== "string" || key.length === 0) {
       throw new OtlpUnpackError(400, "OTLP attribute entry requires a non-empty string key");
     }
     const rawVal = ownProp(entry, "value");
-    out[key] = rawVal === undefined ? null : decodeOtlpAnyValue(rawVal);
+    out[key] =
+      rawVal === undefined || rawVal === null
+        ? null
+        : decodeOtlpAnyValue(rawVal);
   }
   return out;
 }
 
 function decodeOtlpAnyValue(rawValue: unknown): unknown {
   if (!isPlainObject(rawValue)) {
-    if (Array.isArray(rawValue)) {
-      return rawValue.map(decodeOtlpAnyValue);
-    }
-    return rawValue;
+    throw new OtlpUnpackError(400, "OTLP AnyValue must be an object");
   }
 
-  const strVal = pickOwn(rawValue, "stringValue", "string_value");
+  let setFieldCount = 0;
+  for (const key of Object.keys(rawValue)) {
+    if (!OTLP_ANYVALUE_KEYS.has(key)) {
+      throw new OtlpUnpackError(400, `Unknown OTLP AnyValue field: ${key}`);
+    }
+    const val = rawValue[key];
+    if (val !== undefined && val !== null) {
+      setFieldCount++;
+    }
+  }
+
+  if (setFieldCount === 0) {
+    return null;
+  }
+  if (setFieldCount > 1) {
+    throw new OtlpUnpackError(400, "OTLP AnyValue must set at most one value field");
+  }
+
+  const strVal = pickOwnNonNull(rawValue, "stringValue", "string_value");
   if (strVal !== undefined) {
     if (typeof strVal !== "string") {
       throw new OtlpUnpackError(400, "OTLP stringValue must be a string");
@@ -396,7 +571,7 @@ function decodeOtlpAnyValue(rawValue: unknown): unknown {
     return strVal;
   }
 
-  const boolVal = pickOwn(rawValue, "boolValue", "bool_value");
+  const boolVal = pickOwnNonNull(rawValue, "boolValue", "bool_value");
   if (boolVal !== undefined) {
     if (typeof boolVal !== "boolean") {
       throw new OtlpUnpackError(400, "OTLP boolValue must be a boolean");
@@ -404,38 +579,48 @@ function decodeOtlpAnyValue(rawValue: unknown): unknown {
     return boolVal;
   }
 
-  const intVal = pickOwn(rawValue, "intValue", "int_value");
+  const intVal = pickOwnNonNull(rawValue, "intValue", "int_value");
   if (intVal !== undefined) {
     if (typeof intVal === "number") {
       if (!Number.isInteger(intVal)) {
         throw new OtlpUnpackError(400, "OTLP intValue must be an integer");
       }
-      return intVal;
+      const big = BigInt(intVal);
+      if (big < INT64_MIN || big > INT64_MAX) {
+        throw new OtlpUnpackError(400, "OTLP intValue is outside signed 64-bit integer range");
+      }
+      return Number.isSafeInteger(intVal) ? (intVal === 0 ? 0 : intVal) : big.toString();
     }
-    if (typeof intVal === "string" && /^-?\d+$/.test(intVal.trim())) {
-      return parseSafeInt(intVal) ?? intVal.trim();
+    if (typeof intVal === "string" && /^-?\d+$/.test(intVal)) {
+      const big = BigInt(intVal);
+      if (big < INT64_MIN || big > INT64_MAX) {
+        throw new OtlpUnpackError(400, "OTLP intValue is outside signed 64-bit integer range");
+      }
+      return parseSafeInt(intVal) ?? intVal;
     }
     throw new OtlpUnpackError(400, "OTLP intValue must be an integer or decimal integer string");
   }
 
-  const doubleVal = pickOwn(rawValue, "doubleValue", "double_value");
+  const doubleVal = pickOwnNonNull(rawValue, "doubleValue", "double_value");
   if (doubleVal !== undefined) {
     if (typeof doubleVal === "number") {
-      if (!Number.isFinite(doubleVal)) {
-        throw new OtlpUnpackError(400, "OTLP doubleValue must be a finite number");
-      }
       return doubleVal;
     }
-    if (typeof doubleVal === "string" && doubleVal.trim().length > 0) {
-      const parsed = Number(doubleVal.trim());
-      if (Number.isFinite(parsed)) {
-        return parsed;
+    if (typeof doubleVal === "string") {
+      if (doubleVal === "NaN") return Number.NaN;
+      if (doubleVal === "Infinity") return Number.POSITIVE_INFINITY;
+      if (doubleVal === "-Infinity") return Number.NEGATIVE_INFINITY;
+      if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(doubleVal)) {
+        const parsed = Number(doubleVal);
+        if (Number.isFinite(parsed)) {
+          return parsed;
+        }
       }
     }
-    throw new OtlpUnpackError(400, "OTLP doubleValue must be a finite number");
+    throw new OtlpUnpackError(400, "OTLP doubleValue must be a valid ProtoJSON double");
   }
 
-  const bytesVal = pickOwn(rawValue, "bytesValue", "bytes_value");
+  const bytesVal = pickOwnNonNull(rawValue, "bytesValue", "bytes_value");
   if (bytesVal !== undefined) {
     if (typeof bytesVal !== "string") {
       throw new OtlpUnpackError(400, "OTLP bytesValue must be a base64 string");
@@ -447,11 +632,12 @@ function decodeOtlpAnyValue(rawValue: unknown): unknown {
     return decoded;
   }
 
-  const arrayVal = pickOwn(rawValue, "arrayValue", "array_value");
+  const arrayVal = pickOwnNonNull(rawValue, "arrayValue", "array_value");
   if (arrayVal !== undefined) {
     if (!isPlainObject(arrayVal)) {
       throw new OtlpUnpackError(400, "Invalid OTLP arrayValue");
     }
+    assertKnownOtlpKeys(arrayVal, OTLP_VALUES_CONTAINER_KEYS, "ArrayValue");
     const values = ownProp(arrayVal, "values");
     if (values === undefined || values === null) {
       return [];
@@ -459,23 +645,15 @@ function decodeOtlpAnyValue(rawValue: unknown): unknown {
     if (!Array.isArray(values)) {
       throw new OtlpUnpackError(400, "OTLP arrayValue.values must be an array");
     }
-    return values.map(decodeOtlpAnyValue);
+    return values.map((item) => decodeOtlpAnyValue(item));
   }
 
-  const kvlistVal = pickOwn(rawValue, "kvlistValue", "kvlist_value");
-  if (kvlistVal !== undefined) {
-    if (!isPlainObject(kvlistVal)) {
-      throw new OtlpUnpackError(400, "Invalid OTLP kvlistValue");
-    }
-    return decodeOtlpAttributes(ownProp(kvlistVal, "values"));
+  const kvlistVal = pickOwnNonNull(rawValue, "kvlistValue", "kvlist_value");
+  if (!isPlainObject(kvlistVal)) {
+    throw new OtlpUnpackError(400, "Invalid OTLP kvlistValue");
   }
-
-  // Empty AnyValue `{}` represents unset/null rather than literal "{}" text.
-  if (Object.keys(rawValue).length === 0) {
-    return null;
-  }
-
-  return rawValue;
+  assertKnownOtlpKeys(kvlistVal, OTLP_VALUES_CONTAINER_KEYS, "KeyValueList");
+  return decodeOtlpAttributes(ownProp(kvlistVal, "values"));
 }
 
 function mergeAttributesJsonSource(
@@ -563,6 +741,22 @@ function cleanOtelHexId(raw: unknown): string | null {
   return trimmed;
 }
 
+function resolveValidHexId(
+  sources: readonly (Record<string, unknown> | null)[],
+  keys: readonly string[],
+): string | null {
+  for (const source of sources) {
+    if (!source) continue;
+    for (const key of keys) {
+      const cleaned = cleanOtelHexId(ownProp(source, key));
+      if (cleaned !== null) {
+        return cleaned;
+      }
+    }
+  }
+  return null;
+}
+
 function resolveFirstAttr(
   sources: readonly (Record<string, unknown> | null)[],
   keys: readonly string[],
@@ -603,7 +797,8 @@ function flattenOtlpLogRecord(
   const logAttrs = decodeOtlpAttributes(ownProp(logRecord, "attributes"));
 
   const rawBody = ownProp(logRecord, "body");
-  const decodedBody = rawBody !== undefined ? decodeOtlpAnyValue(rawBody) : null;
+  const decodedBody =
+    rawBody !== undefined && rawBody !== null ? decodeOtlpAnyValue(rawBody) : null;
   const bodyFields = isPlainObject(decodedBody) ? decodedBody : null;
 
   const sources: readonly (Record<string, unknown> | null)[] = [
@@ -693,12 +888,8 @@ function flattenOtlpLogRecord(
     out.severity = normalizedSeverity;
   }
 
-  const explicitPriority = resolveFirstAttr(sources, [
-    "syslog.priority",
-    "priority",
-    "PRIORITY",
-  ]);
-  if (explicitPriority !== undefined) {
+  const explicitPriority = resolveValidPriority(sources);
+  if (explicitPriority !== null) {
     out.priority = explicitPriority;
   } else {
     const sevNumPriority = otelSeverityToPriority(
@@ -707,18 +898,21 @@ function flattenOtlpLogRecord(
     if (sevNumPriority !== null) {
       out.priority = sevNumPriority;
     } else if (typeof rawSeverityText === "string" && rawSeverityText.trim().length > 0) {
-      out.priority = rawSeverityText;
+      const textPriority = tryParsePriority(rawSeverityText);
+      if (textPriority !== null) {
+        out.priority = textPriority;
+      }
     }
   }
 
   const traceId =
     cleanOtelHexId(pickOwn(logRecord, "traceId", "trace_id")) ??
-    cleanOtelHexId(resolveFirstAttr(sources, ["trace_id", "TRACE_ID", "OTEL_TRACE_ID"]));
+    resolveValidHexId(sources, ["trace_id", "TRACE_ID", "OTEL_TRACE_ID"]);
   if (traceId !== null) out.trace_id = traceId;
 
   const spanId =
     cleanOtelHexId(pickOwn(logRecord, "spanId", "span_id")) ??
-    cleanOtelHexId(resolveFirstAttr(sources, ["span_id", "SPAN_ID", "OTEL_SPAN_ID"]));
+    resolveValidHexId(sources, ["span_id", "SPAN_ID", "OTEL_SPAN_ID"]);
   if (spanId !== null) out.span_id = spanId;
 
   const yaraRules = resolveFirstAttr(sources, ["yara.rules", "yara_rules"]);
@@ -728,8 +922,15 @@ function flattenOtlpLogRecord(
   if (yaraTags !== undefined) out.yara_tags = yaraTags;
 
   if (bodyFields) {
-    const bodyMsg = ownProp(bodyFields, "message") ?? ownProp(bodyFields, "MESSAGE");
-    out.message = bodyMsg !== undefined ? bodyMsg : JSON.stringify(bodyFields);
+    const primaryBodyMsg = ownProp(bodyFields, "message");
+    const bodyMsg =
+      primaryBodyMsg !== undefined && primaryBodyMsg !== null
+        ? primaryBodyMsg
+        : ownProp(bodyFields, "MESSAGE");
+    out.message =
+      bodyMsg !== undefined
+        ? bodyMsg
+        : stringifyJsonPreservingNonFinite(bodyFields);
   } else {
     out.message = decodedBody;
   }
@@ -747,7 +948,7 @@ function flattenOtlpLogRecord(
     }
   }
   if (hasMergedOtlpAttrs) {
-    out.attributes_json = JSON.stringify(mergedOtlpAttrs);
+    out.attributes_json = stringifyJsonPreservingNonFinite(mergedOtlpAttrs);
   }
 
   const extraSources = [logAttrs, resourceAttrs, bodyFields];
@@ -851,17 +1052,96 @@ export function unpackOtlpLogsPayload(
   return records;
 }
 
-interface EmbeddedEnvelope {
-  messageText: string | null;
+const HOST_KEYS = ["host", "_HOSTNAME", "host.name"] as const;
+const SYSTEMD_UNIT_KEYS = ["systemd_unit", "_SYSTEMD_UNIT", "systemd.unit"] as const;
+const SYSLOG_IDENTIFIER_KEYS = [
+  "syslog_identifier",
+  "SYSLOG_IDENTIFIER",
+  "syslog.identifier",
+] as const;
+const TRANSPORT_KEYS = ["transport", "_TRANSPORT", "journald.transport"] as const;
+const COMM_KEYS = ["comm", "_COMM", "process.command"] as const;
+const EXE_KEYS = ["exe", "_EXE", "process.executable.path"] as const;
+const CMDLINE_KEYS = ["cmdline", "_CMDLINE", "process.command_line"] as const;
+const BOOT_ID_KEYS = ["boot_id", "_BOOT_ID", "host.boot_id"] as const;
+const MACHINE_ID_KEYS = ["machine_id", "_MACHINE_ID", "host.id"] as const;
+const PID_KEYS = ["pid", "_PID", "process.pid"] as const;
+const UID_KEYS = ["uid", "_UID", "user.id"] as const;
+const TRACE_ID_KEYS = ["trace_id", "TRACE_ID", "OTEL_TRACE_ID"] as const;
+const SPAN_ID_KEYS = ["span_id", "SPAN_ID", "OTEL_SPAN_ID"] as const;
+const EVENT_ID_KEYS = ["event_id", "event.id", "__CURSOR", "journald.cursor"] as const;
+
+const EMBEDDED_ENVELOPE_SKIP_KEYS = new Set([
+  ...KNOWN_CONSUMED_KEYS,
+  ...CONSUMED_OTEL_ATTR_KEYS,
+]);
+
+interface ExtractedTelemetryFields {
+  observedAt: string | null;
+  eventTime: string | null;
+  eventId: string | null;
   host: string | null;
   serviceName: string | null;
-  priority: unknown;
+  systemdUnit: string | null;
+  syslogIdentifier: string | null;
+  transport: string | null;
+  comm: string | null;
+  exe: string | null;
+  cmdline: string | null;
+  bootId: string | null;
+  machineId: string | null;
+  pid: number | null;
+  uid: number | null;
+  priority: number | null;
   severity: string | null;
   traceId: string | null;
   spanId: string | null;
   yaraRules: string[];
   yaraTags: string[];
-  attributesJson: unknown;
+}
+
+function extractCommonTelemetryFields(record: Record<string, unknown>): ExtractedTelemetryFields {
+  const yaraRules: string[] = [];
+  pushUniqueStrings(yaraRules, parseStringArray(ownProp(record, "yara_rules")));
+  pushUniqueStrings(yaraRules, parseStringArray(ownProp(record, "yara.rules")));
+
+  const yaraTags: string[] = [];
+  pushUniqueStrings(yaraTags, parseStringArray(ownProp(record, "yara_tags")));
+  pushUniqueStrings(yaraTags, parseStringArray(ownProp(record, "yara.tags")));
+
+  return {
+    observedAt: parseIsoTimestamp(ownProp(record, "observed_at")),
+    eventTime:
+      parseIsoTimestamp(ownProp(record, "event_time")) ??
+      parseIsoTimestamp(ownProp(record, "timestamp")) ??
+      parseIsoTimestamp(ownProp(record, "time")) ??
+      parseRealtimeTimestampUs(ownProp(record, "__REALTIME_TIMESTAMP")),
+    eventId: pickNonEmptyString(record, EVENT_ID_KEYS),
+    host: pickNonEmptyString(record, HOST_KEYS),
+    serviceName: resolveValidServiceName([record]),
+    systemdUnit: pickNonEmptyString(record, SYSTEMD_UNIT_KEYS),
+    syslogIdentifier: pickNonEmptyString(record, SYSLOG_IDENTIFIER_KEYS),
+    transport: pickNonEmptyString(record, TRANSPORT_KEYS),
+    comm: pickNonEmptyString(record, COMM_KEYS),
+    exe: pickNonEmptyString(record, EXE_KEYS),
+    cmdline: pickNonEmptyString(record, CMDLINE_KEYS),
+    bootId: pickNonEmptyString(record, BOOT_ID_KEYS),
+    machineId: pickNonEmptyString(record, MACHINE_ID_KEYS),
+    pid: resolveFirstSafeInt(record, PID_KEYS),
+    uid: resolveFirstSafeInt(record, UID_KEYS),
+    priority: resolveValidPriority([record], ["priority", "PRIORITY", "syslog.priority"]),
+    severity: pickNonEmptyString(record, ["severity"]),
+    traceId: resolveValidHexId([record], TRACE_ID_KEYS),
+    spanId: resolveValidHexId([record], SPAN_ID_KEYS),
+    yaraRules,
+    yaraTags,
+  };
+}
+
+interface EmbeddedEnvelope {
+  messageField: { text: string; bytes: Uint8Array } | null;
+  fields: ExtractedTelemetryFields;
+  rawRecord: Record<string, unknown>;
 }
 
 function parseEmbeddedMessageEnvelope(text: string): EmbeddedEnvelope | null {
@@ -877,19 +1157,32 @@ function parseEmbeddedMessageEnvelope(text: string): EmbeddedEnvelope | null {
   if (!isPlainObject(parsed)) {
     return null;
   }
-  const rawMsg = ownProp(parsed, "message");
-  const rawService = ownProp(parsed, "service_name") ?? ownProp(parsed, "service.name");
+  const primaryMsg = ownProp(parsed, "message");
+  const candidateMsg =
+    primaryMsg !== undefined && primaryMsg !== null
+      ? primaryMsg
+      : ownProp(parsed, "MESSAGE");
+
+  let messageField: { text: string; bytes: Uint8Array } | null = null;
+  if (typeof candidateMsg === "string") {
+    messageField = {
+      text: candidateMsg,
+      bytes: textEncoder.encode(candidateMsg),
+    };
+  } else {
+    const decodedBytes = tryDecodeByteArray(candidateMsg);
+    if (decodedBytes !== null) {
+      messageField = {
+        text: textDecoder.decode(decodedBytes),
+        bytes: decodedBytes,
+      };
+    }
+  }
+
   return {
-    messageText: typeof rawMsg === "string" ? rawMsg : null,
-    host: pickNonEmptyString(parsed, ["host", "_HOSTNAME"]),
-    serviceName: isValidServiceName(rawService) ? rawService : null,
-    priority: ownProp(parsed, "priority") ?? ownProp(parsed, "PRIORITY"),
-    severity: pickNonEmptyString(parsed, ["severity"]),
-    traceId: pickNonEmptyString(parsed, ["trace_id", "TRACE_ID", "OTEL_TRACE_ID"]),
-    spanId: pickNonEmptyString(parsed, ["span_id", "SPAN_ID", "OTEL_SPAN_ID"]),
-    yaraRules: parseStringArray(ownProp(parsed, "yara_rules")),
-    yaraTags: parseStringArray(ownProp(parsed, "yara_tags")),
-    attributesJson: ownProp(parsed, "attributes_json"),
+    messageField,
+    fields: extractCommonTelemetryFields(parsed),
+    rawRecord: parsed,
   };
 }
 
@@ -897,6 +1190,44 @@ function pushUniqueStrings(target: string[], additions: readonly string[]): void
   for (const item of additions) {
     if (item.length > 0 && !target.includes(item)) {
       target.push(item);
+    }
+  }
+}
+
+function collectScanStrings(
+  value: unknown,
+  parts: string[],
+  budget: { remaining: number },
+  depth: number = 0,
+  keyPrefix: string = "",
+): void {
+  if (depth > 8 || budget.remaining <= 0 || value === null || value === undefined) {
+    return;
+  }
+  if (typeof value === "string") {
+    if (value.length === 0) return;
+    const fragment = keyPrefix.length > 0 ? `${keyPrefix}=${value}` : value;
+    parts.push(fragment);
+    budget.remaining -= textEncoder.encode(fragment).length + 1;
+    return;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    const fragment = keyPrefix.length > 0 ? `${keyPrefix}=${String(value)}` : String(value);
+    parts.push(fragment);
+    budget.remaining -= textEncoder.encode(fragment).length + 1;
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      if (budget.remaining <= 0) break;
+      collectScanStrings(item, parts, budget, depth + 1, keyPrefix);
+    }
+    return;
+  }
+  if (typeof value === "object") {
+    for (const [k, v] of Object.entries(value)) {
+      if (budget.remaining <= 0) break;
+      collectScanStrings(v, parts, budget, depth + 1, k);
     }
   }
 }
@@ -912,13 +1243,15 @@ function buildAttributesJson(
     mergeAttributesJsonSource(attrs, embeddedAttributesJson);
   }
 
-  const rawAttributesJson = ownProp(raw, "attributes_json");
-  if (rawAttributesJson !== undefined && rawAttributesJson !== null && rawAttributesJson !== "") {
-    mergeAttributesJsonSource(attrs, rawAttributesJson);
+  for (const attrKey of ["attributes.json", "attributes_json"] as const) {
+    const candidate = ownProp(raw, attrKey);
+    if (candidate !== undefined && candidate !== null && candidate !== "") {
+      mergeAttributesJsonSource(attrs, candidate);
+    }
   }
 
   for (const [key, value] of Object.entries(raw)) {
-    if (!KNOWN_CONSUMED_KEYS.has(key) && value !== undefined) {
+    if (!KNOWN_CONSUMED_KEYS.has(key) && !CONSUMED_OTEL_ATTR_KEYS.has(key) && value !== undefined) {
       attrs[key] = value;
     }
   }
@@ -937,7 +1270,7 @@ function buildAttributesJson(
     return null;
   }
 
-  const json = JSON.stringify(attrs);
+  const json = stringifyJsonPreservingNonFinite(attrs);
   if (textEncoder.encode(json).length <= MAX_ATTRIBUTES_JSON_BYTES) {
     return json;
   }
@@ -961,13 +1294,7 @@ export function normalizeAndDetect(
   detector: RuleDetector,
   nowIso: string = new Date().toISOString(),
 ): TelemetryLogRecord {
-  const observed_at = parseIsoTimestamp(ownProp(raw, "observed_at")) ?? nowIso;
-  const event_time =
-    parseIsoTimestamp(ownProp(raw, "event_time")) ??
-    parseIsoTimestamp(ownProp(raw, "timestamp")) ??
-    parseIsoTimestamp(ownProp(raw, "time")) ??
-    parseRealtimeTimestampUs(ownProp(raw, "__REALTIME_TIMESTAMP")) ??
-    observed_at;
+  const outer = extractCommonTelemetryFields(raw);
 
   const rawMessage = ownProp(raw, "message");
   const initialMsg =
@@ -976,60 +1303,108 @@ export function normalizeAndDetect(
       : parseMessageField(ownProp(raw, "MESSAGE"));
 
   const embedded = parseEmbeddedMessageEnvelope(initialMsg.text);
-  const parsedMsg =
-    embedded?.messageText !== null && embedded?.messageText !== undefined
-      ? {
-          text: embedded.messageText,
-          bytes: textEncoder.encode(embedded.messageText),
-        }
-      : initialMsg;
+  const parsedMsg = embedded?.messageField ?? initialMsg;
+  const embeddedFields = embedded?.fields ?? null;
 
-  const host = pickNonEmptyString(raw, ["host", "_HOSTNAME"]) ?? embedded?.host ?? "unknown";
-  const systemd_unit = pickNonEmptyString(raw, ["systemd_unit", "_SYSTEMD_UNIT"]);
-  const syslog_identifier = pickNonEmptyString(raw, [
-    "syslog_identifier",
-    "SYSLOG_IDENTIFIER",
-  ]);
-  const transport = pickNonEmptyString(raw, ["transport", "_TRANSPORT"]);
-  const comm = pickNonEmptyString(raw, ["comm", "_COMM"]);
-  const exe = pickNonEmptyString(raw, ["exe", "_EXE"]);
-  const cmdline = pickNonEmptyString(raw, ["cmdline", "_CMDLINE"]);
-  const boot_id = pickNonEmptyString(raw, ["boot_id", "_BOOT_ID"]);
-  const machine_id = pickNonEmptyString(raw, ["machine_id", "_MACHINE_ID"]);
+  const observed_at = outer.observedAt ?? embeddedFields?.observedAt ?? nowIso;
+  const event_time = outer.eventTime ?? embeddedFields?.eventTime ?? observed_at;
 
-  const rawServiceName = ownProp(raw, "service_name");
+  const host = outer.host ?? embeddedFields?.host ?? "unknown";
+  const systemd_unit = outer.systemdUnit ?? embeddedFields?.systemdUnit ?? null;
+  const syslog_identifier =
+    outer.syslogIdentifier ?? embeddedFields?.syslogIdentifier ?? null;
+  const transport = outer.transport ?? embeddedFields?.transport ?? null;
+  const comm = outer.comm ?? embeddedFields?.comm ?? null;
+  const exe = outer.exe ?? embeddedFields?.exe ?? null;
+  const cmdline = outer.cmdline ?? embeddedFields?.cmdline ?? null;
+  const boot_id = outer.bootId ?? embeddedFields?.bootId ?? null;
+  const machine_id = outer.machineId ?? embeddedFields?.machineId ?? null;
+
   const service_name =
-    (isValidServiceName(rawServiceName) ? rawServiceName : null) ??
-    embedded?.serviceName ??
+    outer.serviceName ??
+    embeddedFields?.serviceName ??
     systemd_unit ??
     syslog_identifier ??
     comm ??
     pickNonEmptyString(raw, ["_otel_scope_service"]) ??
     "unknown";
 
-  const priority = parsePriority(
-    ownProp(raw, "priority") ?? ownProp(raw, "PRIORITY") ?? embedded?.priority,
-  );
+  const priority = outer.priority ?? embeddedFields?.priority ?? 6;
   const severity =
-    pickNonEmptyString(raw, ["severity"]) ??
-    embedded?.severity ??
+    outer.severity ??
+    embeddedFields?.severity ??
     SEVERITY_BY_PRIORITY[priority] ??
     "INFO";
 
-  const pid = parseSafeInt(ownProp(raw, "pid") ?? ownProp(raw, "_PID"));
-  const uid = parseSafeInt(ownProp(raw, "uid") ?? ownProp(raw, "_UID"));
+  const pid = outer.pid ?? embeddedFields?.pid ?? null;
+  const uid = outer.uid ?? embeddedFields?.uid ?? null;
 
-  const trace_id =
-    pickNonEmptyString(raw, ["trace_id", "TRACE_ID", "OTEL_TRACE_ID"]) ??
-    embedded?.traceId ??
-    null;
-  const span_id =
-    pickNonEmptyString(raw, ["span_id", "SPAN_ID", "OTEL_SPAN_ID"]) ??
-    embedded?.spanId ??
-    null;
+  const trace_id = outer.traceId ?? embeddedFields?.traceId ?? null;
+  const span_id = outer.spanId ?? embeddedFields?.spanId ?? null;
+  const event_id = outer.eventId ?? embeddedFields?.eventId ?? crypto.randomUUID();
 
-  const event_id =
-    pickNonEmptyString(raw, ["event_id", "__CURSOR"]) ?? crypto.randomUUID();
+  let embeddedExtraAttrs: Record<string, unknown> | undefined;
+  let hasEmbeddedExtraAttrs = false;
+  if (embedded !== null) {
+    const extra = Object.create(null) as Record<string, unknown>;
+    for (const attrKey of ["attributes.json", "attributes_json"] as const) {
+      const candidate = ownProp(embedded.rawRecord, attrKey);
+      if (candidate !== undefined && candidate !== null && candidate !== "") {
+        mergeAttributesJsonSource(extra, candidate);
+        hasEmbeddedExtraAttrs = true;
+      }
+    }
+    for (const [key, value] of Object.entries(embedded.rawRecord)) {
+      if (value !== undefined && !EMBEDDED_ENVELOPE_SKIP_KEYS.has(key)) {
+        extra[key] = value;
+        hasEmbeddedExtraAttrs = true;
+      }
+    }
+    const shadowedChecks: ReadonlyArray<[string, string | null, string | null]> = [
+      ["host", outer.host, embedded.fields.host],
+      ["systemd_unit", outer.systemdUnit, embedded.fields.systemdUnit],
+      ["syslog_identifier", outer.syslogIdentifier, embedded.fields.syslogIdentifier],
+      ["transport", outer.transport, embedded.fields.transport],
+      ["comm", outer.comm, embedded.fields.comm],
+      ["exe", outer.exe, embedded.fields.exe],
+      ["cmdline", outer.cmdline, embedded.fields.cmdline],
+    ];
+    for (const [canonicalKey, outerVal, embeddedVal] of shadowedChecks) {
+      if (outerVal !== null && embeddedVal !== null && outerVal !== embeddedVal) {
+        extra[canonicalKey] = embeddedVal;
+        hasEmbeddedExtraAttrs = true;
+      }
+    }
+    if (hasEmbeddedExtraAttrs) {
+      embeddedExtraAttrs = extra;
+    }
+  }
+
+  const embeddedScanParts: string[] = [];
+  if (embedded !== null) {
+    const budget = { remaining: MAX_SCAN_BYTES };
+    if (embeddedExtraAttrs) {
+      collectScanStrings(embeddedExtraAttrs, embeddedScanParts, budget);
+    }
+    if (embedded.messageField !== null) {
+      for (const extraVal of [
+        embedded.fields.comm,
+        embedded.fields.host,
+        embedded.fields.serviceName,
+        embedded.fields.transport,
+      ]) {
+        if (
+          extraVal !== null &&
+          extraVal.length > 0 &&
+          budget.remaining > 0 &&
+          !embeddedScanParts.includes(extraVal)
+        ) {
+          embeddedScanParts.push(extraVal);
+          budget.remaining -= textEncoder.encode(extraVal).length + 1;
+        }
+      }
+    }
+  }
 
   const symbols: EventSymbols = {
     systemd_unit: systemd_unit ?? "",
@@ -1041,19 +1416,23 @@ export function normalizeAndDetect(
     priority,
   };
 
-  const scanBuffer = buildScanBuffer(parsedMsg.bytes, {
-    cmdline,
-    exe,
-    syslog_identifier,
-    systemd_unit,
-  });
+  const scanBuffer = buildScanBuffer(
+    parsedMsg.bytes,
+    {
+      cmdline,
+      exe,
+      syslog_identifier,
+      systemd_unit,
+    },
+    embeddedScanParts,
+  );
   const matches = detector.scan(scanBuffer, symbols);
 
-  const mergedRules = parseStringArray(ownProp(raw, "yara_rules"));
-  const mergedTags = parseStringArray(ownProp(raw, "yara_tags"));
-  if (embedded) {
-    pushUniqueStrings(mergedRules, embedded.yaraRules);
-    pushUniqueStrings(mergedTags, embedded.yaraTags);
+  const mergedRules = [...outer.yaraRules];
+  const mergedTags = [...outer.yaraTags];
+  if (embeddedFields) {
+    pushUniqueStrings(mergedRules, embeddedFields.yaraRules);
+    pushUniqueStrings(mergedTags, embeddedFields.yaraTags);
   }
 
   for (const match of matches) {
@@ -1085,6 +1464,6 @@ export function normalizeAndDetect(
     yara_matched: mergedRules.length > 0,
     yara_rules: mergedRules,
     yara_tags: mergedTags,
-    attributes_json: buildAttributesJson(raw, matches, embedded?.attributesJson),
+    attributes_json: buildAttributesJson(raw, matches, embeddedExtraAttrs),
   };
 }

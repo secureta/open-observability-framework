@@ -127,11 +127,17 @@ validate_sql_ident "table" "${TABLE}"
 validate_sql_ident "stream" "${STREAM}"
 validate_sql_ident "sink" "${SINK}"
 
-if [[ ! "${ROLL_INTERVAL}" =~ ^[0-9]+$ ]] || (( 10#${ROLL_INTERVAL} < 60 )); then
-  echo "error: invalid --roll-interval '${ROLL_INTERVAL}' (expected integer >= 60 for r2-data-catalog sinks)" >&2
+if [[ ! "${ROLL_INTERVAL}" =~ ^[0-9]+$ ]]; then
+  echo "error: invalid --roll-interval '${ROLL_INTERVAL}' (expected integer between 60 and 2147483647 for r2-data-catalog sinks)" >&2
   exit 1
 fi
-ROLL_INTERVAL="$(( 10#${ROLL_INTERVAL} ))"
+ROLL_INTERVAL_NORM="${ROLL_INTERVAL#"${ROLL_INTERVAL%%[!0]*}"}"
+ROLL_INTERVAL_NORM="${ROLL_INTERVAL_NORM:-0}"
+if (( ${#ROLL_INTERVAL_NORM} > 10 )) || (( 10#${ROLL_INTERVAL_NORM} < 60 || 10#${ROLL_INTERVAL_NORM} > 2147483647 )); then
+  echo "error: invalid --roll-interval '${ROLL_INTERVAL}' (expected integer between 60 and 2147483647 for r2-data-catalog sinks)" >&2
+  exit 1
+fi
+ROLL_INTERVAL="${ROLL_INTERVAL_NORM}"
 
 if [[ ! -f "${SCHEMA_FILE}" ]]; then
   echo "error: missing schema file at ${SCHEMA_FILE}" >&2
