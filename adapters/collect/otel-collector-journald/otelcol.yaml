@@ -1,74 +1,53 @@
-# Open Observability Framework - OpenTelemetry Collector (SIEM + APM Reference)
+# Open Observability Framework — OpenTelemetry Collector Bridge (OTLP -> Vector / Fluent Bit OCSF -> Basin)
 #
-# Alternative collector adapter when unifying systemd-journald SIEM logs with
-# OTLP application traces and metrics under a single host agent.
+# Use this adapter when applications emit OTLP traces/metrics/logs to OpenTelemetry Collector
+# (`127.0.0.1:4317` / `127.0.0.1:4318`) and you want to forward OTLP logs to a local or remote
+# Vector / Fluent Bit OCSF collector, which normalizes events into OCSF v1.3.0 (class 1008)
+# and ships them to Cloudflare Basin HTTP with a Basin Account API Token.
 #
-# Required environment variables:
-#   OOF_INGEST_URL   (e.g. https://oof-ingest-worker.<subdomain>.workers.dev/v1/logs)
-#   OOF_INGEST_TOKEN (must match INGEST_AUTH_TOKEN secret on the Worker)
-# Optional APM endpoints (enable in pipelines when apm.enabled = true):
-#   OOF_TRACES_URL   (e.g. https://<otlp-traces-endpoint>)
-#   OOF_METRICS_URL  (e.g. https://<prometheus-remote-write-or-otlp-endpoint>)
+# Anti-loop & port-isolation note:
+#   Default exporter endpoint is `http://127.0.0.1:4320` (distinct from this collector's
+#   `4317`/`4318` receiver ports so running `otelcol` locally never self-loops).
+#   - Co-located on same host as Vector: run Vector with `OOF_OTLP_HTTP_LISTEN=127.0.0.1:4320`.
+#   - Co-located on same host as Fluent Bit: set `opentelemetry` input `Port 4320`.
+#   - Forwarding to a central Vector/Fluent Bit gateway: set `OOF_OTLP_BRIDGE_ENDPOINT=http://ocsf-gateway.internal:4318`.
+#
+# IMPORTANT — Prevent duplicate journald ingestion:
+#   Leave the `journald` receiver commented out below whenever Vector (`systemd_journal` / `journald`)
+#   or Fluent Bit (`systemd`) is already collecting journald on the same host.
 
 receivers:
-  journald:
-    directory: /var/log/journal
-    operators:
-      - type: move
-        from: body._HOSTNAME
-        to: resource["host.name"]
-        if: 'body._HOSTNAME != nil'
-      - type: move
-        from: body._SYSTEMD_UNIT
-        to: attributes["systemd.unit"]
-        if: 'body._SYSTEMD_UNIT != nil'
-      - type: move
-        from: body.SYSLOG_IDENTIFIER
-        to: attributes["syslog.identifier"]
-        if: 'body.SYSLOG_IDENTIFIER != nil'
-      - type: move
-        from: body._CMDLINE
-        to: attributes["process.command_line"]
-        if: 'body._CMDLINE != nil'
-      - type: move
-        from: body._EXE
-        to: attributes["process.executable.path"]
-        if: 'body._EXE != nil'
-      - type: move
-        from: body._PID
-        to: attributes["process.pid"]
-        if: 'body._PID != nil'
-      - type: move
-        from: body._UID
-        to: attributes["user.id"]
-        if: 'body._UID != nil'
-      - type: move
-        from: body._COMM
-        to: attributes["process.command"]
-        if: 'body._COMM != nil'
-      - type: move
-        from: body._TRANSPORT
-        to: attributes["journald.transport"]
-        if: 'body._TRANSPORT != nil'
-      - type: move
-        from: body._BOOT_ID
-        to: resource["host.boot_id"]
-        if: 'body._BOOT_ID != nil'
-      - type: move
-        from: body._MACHINE_ID
-        to: resource["host.id"]
-        if: 'body._MACHINE_ID != nil'
-      - type: move
-        from: body.__CURSOR
-        to: attributes["event.id"]
-        if: 'body.__CURSOR != nil'
-
   otlp:
     protocols:
       grpc:
-        endpoint: 127.0.0.1:4317
+        endpoint: "${env:OOF_OTEL_GRPC_LISTEN:-127.0.0.1:4317}"
       http:
-        endpoint: 127.0.0.1:4318
+        endpoint: "${env:OOF_OTEL_HTTP_LISTEN:-127.0.0.1:4318}"
+
+  # Enable ONLY if `otelcol` is the sole journald collector on the host (never alongside Vector/Fluent Bit journald):
+  # journald:
+  #   directory: /var/log/journal
+  #   operators:
+  #     - type: move
+  #       from: body._HOSTNAME
+  #       to: resource["host.name"]
+  #       if: 'body._HOSTNAME != nil'
+  #     - type: move
+  #       from: body._MACHINE_ID
+  #       to: resource["host.id"]
+  #       if: 'body._MACHINE_ID != nil'
+  #     - type: move
+  #       from: body.__CURSOR
+  #       to: attributes["event.id"]
+  #       if: 'body.__CURSOR != nil'
+  #     - type: move
+  #       from: body._PID
+  #       to: attributes["process.pid"]
+  #       if: 'body._PID != nil'
+  #     - type: move
+  #       from: body._UID
+  #       to: attributes["user.id"]
+  #       if: 'body._UID != nil'
 
 processors:
   memory_limiter:
@@ -83,14 +62,13 @@ processors:
     timeout: 2s
 
 exporters:
-  otlphttp/oof_logs:
-    logs_endpoint: "${env:OOF_INGEST_URL}"
-    encoding: json
+  # Use `encoding: proto` (protobuf over HTTP), accepted by both Vector (>= 0.60) and Fluent Bit (>= 3.x/5.x).
+  otlphttp/ocsf_bridge:
+    endpoint: "${env:OOF_OTLP_BRIDGE_ENDPOINT:-http://127.0.0.1:4320}"
+    encoding: proto
     compression: gzip
-    headers:
-      Authorization: "Bearer ${env:OOF_INGEST_TOKEN}"
 
-  # Future APM extension exporters:
+  # Optional future APM extension exporters (enable in pipelines when apm.enabled = true):
   # otlphttp/apm_traces:
   #   traces_endpoint: "${env:OOF_TRACES_URL}"
   # otlphttp/apm_metrics:
@@ -99,9 +77,9 @@ exporters:
 service:
   pipelines:
     logs:
-      receivers: [journald, otlp]
+      receivers: [otlp]
       processors: [memory_limiter, resourcedetection, batch]
-      exporters: [otlphttp/oof_logs]
+      exporters: [otlphttp/ocsf_bridge]
     # traces:
     #   receivers: [otlp]
     #   processors: [memory_limiter, resourcedetection, batch]

@@ -1,0 +1,279 @@
+{
+  "fields": [
+    {
+      "name": "category_uid",
+      "type": "int32",
+      "required": true
+    },
+    {
+      "name": "category_name",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "class_uid",
+      "type": "int32",
+      "required": true
+    },
+    {
+      "name": "class_name",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "type_uid",
+      "type": "int64",
+      "required": true
+    },
+    {
+      "name": "type_name",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "activity_id",
+      "type": "int32",
+      "required": true
+    },
+    {
+      "name": "activity_name",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "severity_id",
+      "type": "int32",
+      "required": true
+    },
+    {
+      "name": "severity",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "time",
+      "type": "int64",
+      "required": true
+    },
+    {
+      "name": "time_dt",
+      "type": "timestamp",
+      "unit": "millisecond",
+      "required": false
+    },
+    {
+      "name": "message",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "log_name",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "log_provider",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "metadata",
+      "type": "struct",
+      "required": true,
+      "fields": [
+        {
+          "name": "version",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "product",
+          "type": "struct",
+          "required": true,
+          "fields": [
+            {
+              "name": "name",
+              "type": "string",
+              "required": false
+            },
+            {
+              "name": "vendor_name",
+              "type": "string",
+              "required": false
+            },
+            {
+              "name": "version",
+              "type": "string",
+              "required": false
+            }
+          ]
+        },
+        {
+          "name": "uid",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "original_event_uid",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "correlation_uid",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "logged_time",
+          "type": "int64",
+          "required": false
+        },
+        {
+          "name": "original_time",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "log_name",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "log_provider",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "log_level",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "log_facility",
+          "type": "string",
+          "required": false
+        }
+      ]
+    },
+    {
+      "name": "device",
+      "type": "struct",
+      "required": true,
+      "fields": [
+        {
+          "name": "type_id",
+          "type": "int32",
+          "required": true
+        },
+        {
+          "name": "type",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "hostname",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "uid",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "os_machine_uuid",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "boot_uid",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "os",
+          "type": "struct",
+          "required": false,
+          "fields": [
+            {
+              "name": "name",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "type_id",
+              "type": "int32",
+              "required": true
+            },
+            {
+              "name": "type",
+              "type": "string",
+              "required": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "actor",
+      "type": "struct",
+      "required": false,
+      "fields": [
+        {
+          "name": "process",
+          "type": "struct",
+          "required": false,
+          "fields": [
+            {
+              "name": "pid",
+              "type": "int64",
+              "required": false
+            },
+            {
+              "name": "name",
+              "type": "string",
+              "required": false
+            },
+            {
+              "name": "path",
+              "type": "string",
+              "required": false
+            },
+            {
+              "name": "cmd_line",
+              "type": "string",
+              "required": false
+            }
+          ]
+        },
+        {
+          "name": "user",
+          "type": "struct",
+          "required": false,
+          "fields": [
+            {
+              "name": "uid",
+              "type": "string",
+              "required": false
+            },
+            {
+              "name": "uid_numeric",
+              "type": "int64",
+              "required": false
+            },
+            {
+              "name": "name",
+              "type": "string",
+              "required": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "unmapped",
+      "type": "json",
+      "required": false
+    }
+  ]
+}

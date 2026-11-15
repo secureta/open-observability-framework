@@ -1,226 +1,759 @@
-# Open Observability Framework - Vector systemd-journald Collector
+# Open Observability Framework — Vector Collector (OCSF v1.3.0 -> Direct Basin HTTP)
 #
-# Collects host systemd-journald records, normalizes them into the 24-field
-# canonical OOF SIEM+APM envelope, and ships NDJSON batches over HTTPS to the
-# Cloudflare Worker ingest gateway.
+# Collects Linux host `systemd-journald` events AND local OTLP logs (`127.0.0.1:4317` gRPC,
+# `127.0.0.1:4318` HTTP protobuf), normalizes both into official OCSF v1.3.0
+# `Event Log Activity` (`category_uid: 1`, `class_uid: 1008`, `activity_id: 99`),
+# and ships gzipped JSON arrays directly to Cloudflare Basin HTTP (`direct-basin-http`).
 #
 # Required environment variables:
-#   OOF_INGEST_URL   (e.g. https://oof-ingest-worker.<subdomain>.workers.dev/v1/logs)
-#   OOF_INGEST_TOKEN (must match INGEST_AUTH_TOKEN secret on the Worker)
+#   OOF_BASIN_ENDPOINT   (e.g. https://<STREAM_ID>.ingest.cloudflare.com)
+#   OOF_INGEST_TOKEN     (Cloudflare Account API Token with `Basin Pipelines Send`)
+#
+# Optional environment variables:
+#   OOF_VECTOR_DATA_DIR    (default: /var/lib/vector)
+#   OOF_OTLP_GRPC_LISTEN   (default: 127.0.0.1:4317)
+#   OOF_OTLP_HTTP_LISTEN   (default: 127.0.0.1:4318; set to 127.0.0.1:4320 if bridging behind otelcol)
 #
 # Vector >= 0.60 note:
-#   Because this template interpolates ${OOF_INGEST_URL} and ${OOF_INGEST_TOKEN},
-#   validate and run with `--dangerously-allow-env-var-interpolation` (or set
-#   `VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true`):
+#   Interpolating environment variables (e.g. `$OOF_BASIN_ENDPOINT` with braces) requires `--dangerously-allow-env-var-interpolation`
+#   (or `VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true`):
 #     vector validate --no-environment --dangerously-allow-env-var-interpolation adapters/collect/vector-journald/vector.yaml
-#     vector --dangerously-allow-env-var-interpolation --config adapters/collect/vector-journald/vector.yaml
+#     vector test --no-environment --dangerously-allow-env-var-interpolation adapters/collect/vector-journald/vector.yaml
+
+data_dir: "${OOF_VECTOR_DATA_DIR:-/var/lib/vector}"
 
 sources:
-  systemd_journal:
+  journald:
     type: journald
     current_boot_only: false
 
+  otlp:
+    type: opentelemetry
+    grpc:
+      address: "${OOF_OTLP_GRPC_LISTEN:-127.0.0.1:4317}"
+    http:
+      address: "${OOF_OTLP_HTTP_LISTEN:-127.0.0.1:4318}"
+
 transforms:
-  normalize_journal:
+  ocsf_journald:
     type: remap
     inputs:
-      - systemd_journal
+      - journald
     source: |
-      observed_at = format_timestamp!(now(), "%+")
+      orig = .
+      now_ts = now()
 
-      event_time = observed_at
-      if exists(.__REALTIME_TIMESTAMP) {
-        us, us_err = to_int(.__REALTIME_TIMESTAMP)
-        if us_err == null {
-          ts, ts_err = from_unix_timestamp(us, unit: "microseconds")
-          if ts_err == null {
-            event_time = format_timestamp!(ts, "%+")
+      # Resolve primary event timestamp: _SOURCE_REALTIME_TIMESTAMP (us) -> .timestamp -> __REALTIME_TIMESTAMP (us) -> now()
+      event_ts = now_ts
+      ts_resolved = false
+
+      if exists(orig._SOURCE_REALTIME_TIMESTAMP) && is_string(orig._SOURCE_REALTIME_TIMESTAMP) {
+        s_us = string!(orig._SOURCE_REALTIME_TIMESTAMP)
+        if match(s_us, r'^[0-9]{1,18}$') {
+          us_val, us_err = to_int(s_us)
+          if us_err == null && us_val > 0 {
+            parsed_ts, p_err = from_unix_timestamp(us_val, unit: "microseconds")
+            if p_err == null {
+              event_ts = parsed_ts
+              ts_resolved = true
+            }
           }
         }
-      } else if exists(.timestamp) {
-        if is_timestamp(.timestamp) {
-          event_time = format_timestamp!(.timestamp, "%+")
+      }
+
+      if !ts_resolved && exists(orig.timestamp) && orig.timestamp != null {
+        if is_timestamp(orig.timestamp) {
+          cand_ms, cand_err = to_unix_timestamp(orig.timestamp, unit: "milliseconds")
+          if cand_err == null && cand_ms > 0 {
+            event_ts = orig.timestamp
+            ts_resolved = true
+          }
         } else {
-          ts, ts_err = parse_timestamp(string(.timestamp) ?? "", "%+")
-          if ts_err == null {
-            event_time = format_timestamp!(ts, "%+")
+          ts_str = to_string(orig.timestamp) ?? ""
+          if ts_str != "" {
+            parsed_ts, p_err = parse_timestamp(ts_str, "%+")
+            if p_err == null {
+              cand_ms = to_unix_timestamp(parsed_ts, unit: "milliseconds")
+              if cand_ms > 0 {
+                event_ts = parsed_ts
+                ts_resolved = true
+              }
+            }
           }
         }
       }
 
-      raw_priority = if exists(.PRIORITY) && .PRIORITY != null { to_int(.PRIORITY) ?? 6 } else { 6 }
-      priority = if raw_priority < 0 { 0 } else if raw_priority > 7 { 7 } else { raw_priority }
-
-      severity = "INFO"
-      if priority == 0 { severity = "EMERG" }
-      if priority == 1 { severity = "ALERT" }
-      if priority == 2 { severity = "CRIT" }
-      if priority == 3 { severity = "ERR" }
-      if priority == 4 { severity = "WARN" }
-      if priority == 5 { severity = "NOTICE" }
-      if priority == 6 { severity = "INFO" }
-      if priority == 7 { severity = "DEBUG" }
-
-      systemd_unit = string(._SYSTEMD_UNIT) ?? null
-      if systemd_unit == "" { systemd_unit = null }
-
-      syslog_identifier = string(.SYSLOG_IDENTIFIER) ?? null
-      if syslog_identifier == "" { syslog_identifier = null }
-
-      transport = string(._TRANSPORT) ?? null
-      if transport == "" { transport = null }
-
-      comm = string(._COMM) ?? null
-      if comm == "" { comm = null }
-
-      exe = string(._EXE) ?? null
-      if exe == "" { exe = null }
-
-      cmdline = string(._CMDLINE) ?? null
-      if cmdline == "" { cmdline = null }
-
-      boot_id = string(._BOOT_ID) ?? null
-      if boot_id == "" { boot_id = null }
-
-      machine_id = string(._MACHINE_ID) ?? null
-      if machine_id == "" { machine_id = null }
-
-      pid = null
-      if exists(._PID) { pid = to_int(._PID) ?? null }
-
-      uid = null
-      if exists(._UID) { uid = to_int(._UID) ?? null }
-
-      host_candidate = string(._HOSTNAME) ?? ""
-      if host_candidate == "" { host_candidate = string(.host) ?? "" }
-      if host_candidate == "" { host_candidate = get_hostname() ?? "" }
-      host = if host_candidate != "" { host_candidate } else { "unknown" }
-
-      raw_msg = ""
-      if exists(.MESSAGE) && .MESSAGE != null {
-        raw_msg = if is_string(.MESSAGE) { string!(.MESSAGE) } else { encode_json(.MESSAGE) }
-      } else if exists(.message) && .message != null {
-        raw_msg = if is_string(.message) { string!(.message) } else { encode_json(.message) }
-      }
-
-      trace_id = string(.TRACE_ID) ?? null
-      if trace_id == "" { trace_id = null }
-      if trace_id == null {
-        trace_id = string(.OTEL_TRACE_ID) ?? null
-        if trace_id == "" { trace_id = null }
-      }
-
-      span_id = string(.SPAN_ID) ?? null
-      if span_id == "" { span_id = null }
-      if span_id == null {
-        span_id = string(.OTEL_SPAN_ID) ?? null
-        if span_id == "" { span_id = null }
-      }
-
-      service_name = "unknown"
-      if systemd_unit != null {
-        service_name = systemd_unit
-      } else if syslog_identifier != null {
-        service_name = syslog_identifier
-      } else if comm != null {
-        service_name = comm
-      }
-
-      yara_matched = false
-      yara_rules = []
-      yara_tags = []
-      message = raw_msg
-      extra_attrs = {}
-
-      # Support structured JSON logs emitted by host-side YARA-X / Kunai / APM apps.
-      if starts_with(raw_msg, "{") {
-        parsed, parse_err = parse_json(raw_msg)
-        if parse_err == null && is_object(parsed) {
-          if exists(parsed.service_name) && is_string(parsed.service_name) && string!(parsed.service_name) != "" {
-            service_name = string!(parsed.service_name)
-          }
-          if exists(parsed.trace_id) && is_string(parsed.trace_id) && string!(parsed.trace_id) != "" {
-            trace_id = string!(parsed.trace_id)
-          }
-          if exists(parsed.span_id) && is_string(parsed.span_id) && string!(parsed.span_id) != "" {
-            span_id = string!(parsed.span_id)
-          }
-          if exists(parsed.yara_rules) && is_array(parsed.yara_rules) {
-            yara_rules = filter(array!(parsed.yara_rules)) -> |_idx, v| { is_string(v) }
-            yara_matched = length(yara_rules) > 0
-          }
-          if exists(parsed.yara_tags) && is_array(parsed.yara_tags) {
-            yara_tags = filter(array!(parsed.yara_tags)) -> |_idx, v| { is_string(v) }
-          }
-          if exists(parsed.message) && is_string(parsed.message) {
-            message = string!(parsed.message)
-          }
-          if exists(parsed.attributes_json) && is_string(parsed.attributes_json) {
-            extra_attrs.upstream_attributes = string!(parsed.attributes_json)
+      if !ts_resolved && exists(orig.__REALTIME_TIMESTAMP) && is_string(orig.__REALTIME_TIMESTAMP) {
+        r_us = string!(orig.__REALTIME_TIMESTAMP)
+        if match(r_us, r'^[0-9]{1,18}$') {
+          us_val, us_err = to_int(r_us)
+          if us_err == null && us_val > 0 {
+            parsed_ts, p_err = from_unix_timestamp(us_val, unit: "microseconds")
+            if p_err == null {
+              event_ts = parsed_ts
+              ts_resolved = true
+            }
           }
         }
       }
 
-      event_id = uuid_v4()
-      if exists(.__CURSOR) {
-        cursor_str = string(.__CURSOR) ?? ""
-        if cursor_str != "" {
-          event_id = cursor_str
+      time_ms = to_unix_timestamp!(event_ts, unit: "milliseconds")
+      time_dt = format_timestamp!(event_ts, "%Y-%m-%dT%H:%M:%S%.3fZ")
+
+      logged_ms = to_unix_timestamp(now_ts, unit: "milliseconds")
+      if exists(orig.__REALTIME_TIMESTAMP) && is_string(orig.__REALTIME_TIMESTAMP) {
+        rt_str = string!(orig.__REALTIME_TIMESTAMP)
+        if match(rt_str, r'^[0-9]{1,18}$') {
+          rt_us, rt_err = to_int(rt_str)
+          if rt_err == null && rt_us > 0 {
+            rt_ts, l_err = from_unix_timestamp(rt_us, unit: "microseconds")
+            if l_err == null {
+              logged_ms = to_unix_timestamp(rt_ts, unit: "milliseconds")
+            }
+          }
         }
       }
 
-      attrs_json = null
-      if length(extra_attrs) > 0 {
-        attrs_json = encode_json(extra_attrs)
+      # Map syslog PRIORITY (0..7) strictly to OCSF v1.3.0 severity_id / severity
+      prio_val = null
+      raw_prio = null
+      if exists(orig.PRIORITY) && orig.PRIORITY != null {
+        if is_integer(orig.PRIORITY) {
+          pi = int!(orig.PRIORITY)
+          raw_prio = to_string(pi)
+          if pi >= 0 && pi <= 7 { prio_val = pi }
+        } else if is_string(orig.PRIORITY) {
+          ps = string!(orig.PRIORITY)
+          if ps != "" { raw_prio = ps }
+          if match(ps, r'^[0-7]$') { prio_val = to_int!(ps) }
+        }
       }
 
-      . = {
-        "event_id": event_id,
-        "observed_at": observed_at,
-        "event_time": event_time,
-        "host": host,
-        "service_name": service_name,
-        "systemd_unit": systemd_unit,
-        "syslog_identifier": syslog_identifier,
-        "transport": transport,
-        "priority": priority,
+      severity_id = 0
+      severity = "Unknown"
+      if prio_val == 0 {
+        severity_id = 6
+        severity = "Fatal"
+      } else if prio_val == 1 || prio_val == 2 {
+        severity_id = 5
+        severity = "Critical"
+      } else if prio_val == 3 {
+        severity_id = 4
+        severity = "High"
+      } else if prio_val == 4 {
+        severity_id = 3
+        severity = "Medium"
+      } else if prio_val == 5 {
+        severity_id = 2
+        severity = "Low"
+      } else if prio_val == 6 || prio_val == 7 {
+        severity_id = 1
+        severity = "Informational"
+      }
+
+      msg = null
+      if exists(orig.MESSAGE) && orig.MESSAGE != null {
+        msg = if is_string(orig.MESSAGE) { string!(orig.MESSAGE) } else { encode_json(orig.MESSAGE) }
+      } else if exists(orig.message) && orig.message != null {
+        msg = if is_string(orig.message) { string!(orig.message) } else { encode_json(orig.message) }
+      }
+
+      systemd_unit = if exists(orig._SYSTEMD_UNIT) && is_string(orig._SYSTEMD_UNIT) && string!(orig._SYSTEMD_UNIT) != "" { string!(orig._SYSTEMD_UNIT) } else { null }
+      syslog_identifier = if exists(orig.SYSLOG_IDENTIFIER) && is_string(orig.SYSLOG_IDENTIFIER) && string!(orig.SYSLOG_IDENTIFIER) != "" { string!(orig.SYSLOG_IDENTIFIER) } else { null }
+      transport = if exists(orig._TRANSPORT) && is_string(orig._TRANSPORT) && string!(orig._TRANSPORT) != "" { string!(orig._TRANSPORT) } else { null }
+      comm = if exists(orig._COMM) && is_string(orig._COMM) && string!(orig._COMM) != "" { string!(orig._COMM) } else { null }
+      exe = if exists(orig._EXE) && is_string(orig._EXE) && string!(orig._EXE) != "" { string!(orig._EXE) } else { null }
+      cmdline = if exists(orig._CMDLINE) && is_string(orig._CMDLINE) && string!(orig._CMDLINE) != "" { string!(orig._CMDLINE) } else { null }
+      boot_id = if exists(orig._BOOT_ID) && is_string(orig._BOOT_ID) && string!(orig._BOOT_ID) != "" { string!(orig._BOOT_ID) } else { null }
+      machine_id = if exists(orig._MACHINE_ID) && is_string(orig._MACHINE_ID) && string!(orig._MACHINE_ID) != "" { string!(orig._MACHINE_ID) } else { null }
+      cursor = if exists(orig.__CURSOR) && is_string(orig.__CURSOR) && string!(orig.__CURSOR) != "" { string!(orig.__CURSOR) } else { null }
+      facility = if exists(orig.SYSLOG_FACILITY) && orig.SYSLOG_FACILITY != null {
+        f_s = to_string(orig.SYSLOG_FACILITY) ?? ""
+        if f_s != "" { f_s } else { null }
+      } else { null }
+
+      hostname = null
+      if exists(orig._HOSTNAME) && is_string(orig._HOSTNAME) && string!(orig._HOSTNAME) != "" {
+        hostname = string!(orig._HOSTNAME)
+      } else if exists(orig.host) && is_string(orig.host) && string!(orig.host) != "" {
+        hostname = string!(orig.host)
+      } else {
+        sys_host = get_hostname() ?? ""
+        if sys_host != "" { hostname = sys_host }
+      }
+
+      log_name = if systemd_unit != null { systemd_unit } else if syslog_identifier != null { syslog_identifier } else { comm }
+      log_provider = if transport != null { transport } else { "systemd-journald" }
+
+      # Extract optional correlation trace_id / span_id
+      raw_trace = ""
+      if exists(orig.TRACE_ID) && is_string(orig.TRACE_ID) {
+        raw_trace = string!(orig.TRACE_ID)
+      } else if exists(orig.OTEL_TRACE_ID) && is_string(orig.OTEL_TRACE_ID) {
+        raw_trace = string!(orig.OTEL_TRACE_ID)
+      } else if exists(orig.trace_id) && is_string(orig.trace_id) {
+        raw_trace = string!(orig.trace_id)
+      }
+      correlation_uid = null
+      if raw_trace != "" {
+        t_clean = if match(raw_trace, r'^[0-9A-Fa-f]+$') { downcase(raw_trace) } else { raw_trace }
+        if !match(t_clean, r'^0+$') {
+          correlation_uid = t_clean
+        }
+      }
+
+      raw_span = ""
+      if exists(orig.SPAN_ID) && is_string(orig.SPAN_ID) {
+        raw_span = string!(orig.SPAN_ID)
+      } else if exists(orig.OTEL_SPAN_ID) && is_string(orig.OTEL_SPAN_ID) {
+        raw_span = string!(orig.OTEL_SPAN_ID)
+      } else if exists(orig.span_id) && is_string(orig.span_id) {
+        raw_span = string!(orig.span_id)
+      }
+      span_clean = null
+      if raw_span != "" {
+        s_clean = if match(raw_span, r'^[0-9A-Fa-f]+$') { downcase(raw_span) } else { raw_span }
+        if !match(s_clean, r'^0+$') {
+          span_clean = s_clean
+        }
+      }
+
+      # Actor process & user (strict integer parsing; actor.user.uid is always string_t in OCSF)
+      pid_val = null
+      raw_pid = if exists(orig._PID) && orig._PID != null { orig._PID } else if exists(orig.SYSLOG_PID) && orig.SYSLOG_PID != null { orig.SYSLOG_PID } else { null }
+      if raw_pid != null {
+        if is_integer(raw_pid) {
+          pv = int!(raw_pid)
+          if pv >= 0 { pid_val = pv }
+        } else if is_string(raw_pid) {
+          ps = string!(raw_pid)
+          if match(ps, r'^[0-9]{1,15}$') { pid_val = to_int!(ps) }
+        }
+      }
+
+      uid_str = null
+      uid_num = null
+      if exists(orig._UID) && orig._UID != null {
+        if is_integer(orig._UID) {
+          uv = int!(orig._UID)
+          if uv >= 0 {
+            uid_str = to_string(uv)
+            uid_num = uv
+          }
+        } else if is_string(orig._UID) {
+          us = string!(orig._UID)
+          if us != "" {
+            uid_str = us
+            if match(us, r'^[0-9]{1,15}$') { uid_num = to_int!(us) }
+          }
+        }
+      }
+
+      proc = {}
+      if pid_val != null { proc.pid = pid_val }
+      proc_name = if comm != null { comm } else { syslog_identifier }
+      if proc_name != null { proc.name = proc_name }
+      if exe != null { proc.path = exe }
+      if cmdline != null { proc.cmd_line = cmdline }
+
+      usr = {}
+      if uid_str != null { usr.uid = uid_str }
+      if uid_num != null { usr.uid_numeric = uid_num }
+
+      act = {}
+      if length(proc) > 0 { act.process = proc }
+      if length(usr) > 0 { act.user = usr }
+
+      meta = {
+        "version": "1.3.0",
+        "product": {
+          "name": "Vector",
+          "vendor_name": "Datadog"
+        },
+        "logged_time": logged_ms
+      }
+      if cursor != null { meta.original_event_uid = cursor }
+      if correlation_uid != null { meta.correlation_uid = correlation_uid }
+      if log_name != null { meta.log_name = log_name }
+      if log_provider != null { meta.log_provider = log_provider }
+      if raw_prio != null { meta.log_level = raw_prio }
+      if facility != null { meta.log_facility = facility }
+
+      dev = {
+        "type_id": 1,
+        "type": "Server",
+        "os": {
+          "name": "Linux",
+          "type_id": 200
+        }
+      }
+      if hostname != null { dev.hostname = hostname }
+      if machine_id != null {
+        dev.uid = machine_id
+        dev.os_machine_uuid = machine_id
+      }
+      if boot_id != null { dev.boot_uid = boot_id }
+
+      # Collect unmapped fields (excluding consumed canonical and Vector internal fields)
+      unmapped = orig
+      del(unmapped.MESSAGE)
+      del(unmapped.message)
+      del(unmapped.timestamp)
+      del(unmapped.host)
+      del(unmapped.source_type)
+      del(unmapped.PRIORITY)
+      del(unmapped.SYSLOG_FACILITY)
+      del(unmapped.SYSLOG_IDENTIFIER)
+      del(unmapped.SYSLOG_PID)
+      del(unmapped._HOSTNAME)
+      del(unmapped._MACHINE_ID)
+      del(unmapped._BOOT_ID)
+      del(unmapped._SYSTEMD_UNIT)
+      del(unmapped._TRANSPORT)
+      del(unmapped._PID)
+      del(unmapped._UID)
+      del(unmapped._COMM)
+      del(unmapped._EXE)
+      del(unmapped._CMDLINE)
+      del(unmapped.__CURSOR)
+      del(unmapped.__REALTIME_TIMESTAMP)
+      del(unmapped.__MONOTONIC_TIMESTAMP)
+      del(unmapped._SOURCE_REALTIME_TIMESTAMP)
+      del(unmapped.__SOURCE_REALTIME_TIMESTAMP)
+      del(unmapped.TRACE_ID)
+      del(unmapped.OTEL_TRACE_ID)
+      del(unmapped.trace_id)
+      del(unmapped.SPAN_ID)
+      del(unmapped.OTEL_SPAN_ID)
+      del(unmapped.span_id)
+      if span_clean != null { unmapped.span_id = span_clean }
+
+      out = {
+        "category_uid": 1,
+        "category_name": "System Activity",
+        "class_uid": 1008,
+        "class_name": "Event Log Activity",
+        "type_uid": 100899,
+        "type_name": "Event Log Activity: Other",
+        "activity_id": 99,
+        "activity_name": "Other",
+        "severity_id": severity_id,
         "severity": severity,
-        "pid": pid,
-        "uid": uid,
-        "comm": comm,
-        "exe": exe,
-        "cmdline": cmdline,
-        "boot_id": boot_id,
-        "machine_id": machine_id,
-        "message": message,
-        "trace_id": trace_id,
-        "span_id": span_id,
-        "yara_matched": yara_matched,
-        "yara_rules": yara_rules,
-        "yara_tags": yara_tags,
-        "attributes_json": attrs_json
+        "time": time_ms,
+        "time_dt": time_dt,
+        "metadata": meta,
+        "device": dev
       }
+      if msg != null { out.message = msg }
+      if log_name != null { out.log_name = log_name }
+      if log_provider != null { out.log_provider = log_provider }
+      if length(act) > 0 { out.actor = act }
+      if length(unmapped) > 0 { out.unmapped = unmapped }
+
+      . = out
+
+  ocsf_otlp_logs:
+    type: remap
+    inputs:
+      - otlp.logs
+    source: |
+      now_ts = now()
+
+      # Resolve event_ts (fallback to observed_timestamp if timestamp <= 0, then now())
+      obs_ts = now_ts
+      obs_valid = false
+      if exists(.observed_timestamp) && .observed_timestamp != null {
+        if is_timestamp(.observed_timestamp) {
+          oms, oms_err = to_unix_timestamp(.observed_timestamp, unit: "milliseconds")
+          if oms_err == null && oms > 0 {
+            obs_ts = .observed_timestamp
+            obs_valid = true
+          }
+        } else {
+          obs_str = to_string(.observed_timestamp) ?? ""
+          if obs_str != "" {
+            parsed_obs, o_err = parse_timestamp(obs_str, "%+")
+            if o_err == null && to_unix_timestamp(parsed_obs, unit: "milliseconds") > 0 {
+              obs_ts = parsed_obs
+              obs_valid = true
+            }
+          }
+        }
+      }
+
+      event_ts = if obs_valid { obs_ts } else { now_ts }
+      if exists(.timestamp) && .timestamp != null {
+        if is_timestamp(.timestamp) {
+          tms, tms_err = to_unix_timestamp(.timestamp, unit: "milliseconds")
+          if tms_err == null && tms > 0 {
+            event_ts = .timestamp
+          }
+        } else {
+          ts_str = to_string(.timestamp) ?? ""
+          if ts_str != "" {
+            parsed_ev, t_err = parse_timestamp(ts_str, "%+")
+            if t_err == null && to_unix_timestamp(parsed_ev, unit: "milliseconds") > 0 {
+              event_ts = parsed_ev
+            }
+          }
+        }
+      }
+
+      time_ms = to_unix_timestamp!(event_ts, unit: "milliseconds")
+      time_dt = format_timestamp!(event_ts, "%Y-%m-%dT%H:%M:%S%.3fZ")
+      logged_ms = to_unix_timestamp!(obs_ts, unit: "milliseconds")
+
+      # Map OTLP severity_number (1..24) strictly to OCSF v1.3.0 severity_id / severity
+      sev_num = 0
+      if exists(.severity_number) && .severity_number != null {
+        if is_integer(.severity_number) {
+          sev_num = int!(.severity_number)
+        } else if is_string(.severity_number) {
+          ss = string!(.severity_number)
+          if match(ss, r'^[0-9]{1,3}$') { sev_num = to_int!(ss) }
+        }
+      }
+
+      severity_id = 0
+      severity = "Unknown"
+      if sev_num >= 1 && sev_num <= 12 {
+        severity_id = 1
+        severity = "Informational"
+      } else if sev_num >= 13 && sev_num <= 16 {
+        severity_id = 3
+        severity = "Medium"
+      } else if sev_num >= 17 && sev_num <= 20 {
+        severity_id = 4
+        severity = "High"
+      } else if sev_num >= 21 && sev_num <= 24 {
+        severity_id = 6
+        severity = "Fatal"
+      }
+
+      sev_text = if exists(.severity_text) && is_string(.severity_text) && string!(.severity_text) != "" { string!(.severity_text) } else { null }
+
+      res = if exists(.resources) && is_object(.resources) { object!(.resources) } else { {} }
+      attrs = if exists(.attributes) && is_object(.attributes) { object!(.attributes) } else { {} }
+      scope_name = if exists(.scope.name) && is_string(.scope.name) && string!(.scope.name) != "" { string!(.scope.name) } else { null }
+      service_name = if exists(res."service.name") && is_string(res."service.name") && string!(res."service.name") != "" { string!(res."service.name") } else { null }
+
+      log_name = if scope_name != null { scope_name } else { service_name }
+      log_provider = "opentelemetry"
+
+      msg = null
+      if exists(.message) && .message != null {
+        msg = if is_string(.message) { string!(.message) } else { encode_json(.message) }
+      }
+
+      correlation_uid = null
+      if exists(.trace_id) && is_string(.trace_id) {
+        rt = string!(.trace_id)
+        if rt != "" {
+          tc = if match(rt, r'^[0-9A-Fa-f]+$') { downcase(rt) } else { rt }
+          if !match(tc, r'^0+$') { correlation_uid = tc }
+        }
+      }
+
+      span_clean = null
+      if exists(.span_id) && is_string(.span_id) {
+        rs = string!(.span_id)
+        if rs != "" {
+          sc = if match(rs, r'^[0-9A-Fa-f]+$') { downcase(rs) } else { rs }
+          if !match(sc, r'^0+$') { span_clean = sc }
+        }
+      }
+
+      event_uid = null
+      if exists(attrs."event.id") && is_string(attrs."event.id") && string!(attrs."event.id") != "" {
+        event_uid = string!(attrs."event.id")
+      } else if span_clean != null {
+        event_uid = span_clean
+      }
+
+      hostname = null
+      if exists(res."host.name") && is_string(res."host.name") && string!(res."host.name") != "" {
+        hostname = string!(res."host.name")
+      } else if exists(res."service.instance.id") && is_string(res."service.instance.id") && string!(res."service.instance.id") != "" {
+        hostname = string!(res."service.instance.id")
+      }
+
+      host_id = if exists(res."host.id") && is_string(res."host.id") && string!(res."host.id") != "" { string!(res."host.id") } else { null }
+
+      # OCSF device.os requires both name and type_id; omit device.os completely if os.type is unknown
+      os_obj = null
+      if exists(res."os.type") && is_string(res."os.type") {
+        os_lc = downcase(string!(res."os.type"))
+        if os_lc == "linux" {
+          os_obj = { "name": "Linux", "type_id": 200 }
+        } else if os_lc == "windows" {
+          os_obj = { "name": "Windows", "type_id": 100 }
+        } else if os_lc == "darwin" || os_lc == "macos" {
+          os_obj = { "name": "macOS", "type_id": 300 }
+        }
+      }
+
+      pid_val = null
+      raw_pid = if exists(res."process.pid") && res."process.pid" != null {
+        res."process.pid"
+      } else if exists(attrs."process.pid") && attrs."process.pid" != null {
+        attrs."process.pid"
+      } else { null }
+      if raw_pid != null {
+        if is_integer(raw_pid) {
+          pv = int!(raw_pid)
+          if pv >= 0 { pid_val = pv }
+        } else if is_string(raw_pid) {
+          ps = string!(raw_pid)
+          if match(ps, r'^[0-9]{1,15}$') { pid_val = to_int!(ps) }
+        }
+      }
+
+      proc_name = if exists(res."process.executable.name") && is_string(res."process.executable.name") && string!(res."process.executable.name") != "" {
+        string!(res."process.executable.name")
+      } else {
+        service_name
+      }
+      proc_path = if exists(res."process.executable.path") && is_string(res."process.executable.path") && string!(res."process.executable.path") != "" {
+        string!(res."process.executable.path")
+      } else { null }
+      proc_cmd = if exists(res."process.command_line") && is_string(res."process.command_line") && string!(res."process.command_line") != "" {
+        string!(res."process.command_line")
+      } else { null }
+
+      uid_str = null
+      uid_num = null
+      raw_uid = if exists(attrs."user.id") && attrs."user.id" != null {
+        attrs."user.id"
+      } else if exists(attrs."enduser.id") && attrs."enduser.id" != null {
+        attrs."enduser.id"
+      } else { null }
+      if raw_uid != null {
+        if is_integer(raw_uid) {
+          uv = int!(raw_uid)
+          if uv >= 0 {
+            uid_str = to_string(uv)
+            uid_num = uv
+          }
+        } else if is_string(raw_uid) {
+          us = string!(raw_uid)
+          if us != "" {
+            uid_str = us
+            if match(us, r'^[0-9]{1,15}$') { uid_num = to_int!(us) }
+          }
+        }
+      }
+
+      user_name = if exists(attrs."user.name") && is_string(attrs."user.name") && string!(attrs."user.name") != "" {
+        string!(attrs."user.name")
+      } else if exists(attrs."user.full_name") && is_string(attrs."user.full_name") && string!(attrs."user.full_name") != "" {
+        string!(attrs."user.full_name")
+      } else { null }
+
+      proc = {}
+      if pid_val != null { proc.pid = pid_val }
+      if proc_name != null { proc.name = proc_name }
+      if proc_path != null { proc.path = proc_path }
+      if proc_cmd != null { proc.cmd_line = proc_cmd }
+
+      usr = {}
+      if uid_str != null { usr.uid = uid_str }
+      if uid_num != null { usr.uid_numeric = uid_num }
+      if user_name != null { usr.name = user_name }
+
+      act = {}
+      if length(proc) > 0 { act.process = proc }
+      if length(usr) > 0 { act.user = usr }
+
+      meta = {
+        "version": "1.3.0",
+        "product": {
+          "name": "Vector",
+          "vendor_name": "Datadog"
+        },
+        "logged_time": logged_ms
+      }
+      if event_uid != null { meta.original_event_uid = event_uid }
+      if correlation_uid != null { meta.correlation_uid = correlation_uid }
+      if log_name != null { meta.log_name = log_name }
+      meta.log_provider = log_provider
+      if sev_text != null { meta.log_level = sev_text }
+
+      dev = {
+        "type_id": 0,
+        "type": "Unknown"
+      }
+      if hostname != null { dev.hostname = hostname }
+      if host_id != null { dev.uid = host_id }
+      if os_obj != null { dev.os = os_obj }
+
+      del(attrs."event.id")
+      del(attrs."process.pid")
+      del(attrs."user.id")
+      del(attrs."enduser.id")
+      del(attrs."user.name")
+      del(attrs."user.full_name")
+
+      del(res."host.name")
+      del(res."service.instance.id")
+      del(res."host.id")
+      del(res."os.type")
+      del(res."process.pid")
+      del(res."process.executable.name")
+      del(res."service.name")
+      del(res."process.executable.path")
+      del(res."process.command_line")
+
+      unmapped = {}
+      if length(attrs) > 0 { unmapped.attributes = attrs }
+      if length(res) > 0 { unmapped.resource = res }
+      if span_clean != null { unmapped.span_id = span_clean }
+      if exists(.dropped_attributes_count) && is_integer(.dropped_attributes_count) && int!(.dropped_attributes_count) > 0 {
+        unmapped.dropped_attributes_count = int!(.dropped_attributes_count)
+      }
+
+      out = {
+        "category_uid": 1,
+        "category_name": "System Activity",
+        "class_uid": 1008,
+        "class_name": "Event Log Activity",
+        "type_uid": 100899,
+        "type_name": "Event Log Activity: Other",
+        "activity_id": 99,
+        "activity_name": "Other",
+        "severity_id": severity_id,
+        "severity": severity,
+        "time": time_ms,
+        "time_dt": time_dt,
+        "metadata": meta,
+        "device": dev
+      }
+      if msg != null { out.message = msg }
+      if log_name != null { out.log_name = log_name }
+      out.log_provider = log_provider
+      if length(act) > 0 { out.actor = act }
+      if length(unmapped) > 0 { out.unmapped = unmapped }
+
+      . = out
 
 sinks:
-  cloudflare_ingest:
+  basin_http:
     type: http
     inputs:
-      - normalize_journal
-    uri: "${OOF_INGEST_URL}"
+      - ocsf_journald
+      - ocsf_otlp_logs
+    uri: "${OOF_BASIN_ENDPOINT}"
     method: post
     compression: gzip
     encoding:
       codec: json
-    framing:
-      method: newline_delimited
     auth:
       strategy: bearer
       token: "${OOF_INGEST_TOKEN}"
     batch:
-      max_events: 250
-      max_bytes: 524288
-      timeout_secs: 2
+      max_events: 500
+      max_bytes: 5000000
+      timeout_secs: 5
+    buffer:
+      type: disk
+      max_size: 268435488
+      when_full: block
     request:
       retry_attempts: 5
       retry_initial_backoff_secs: 1
       retry_max_duration_secs: 30
+
+  unused_otlp_apm:
+    type: blackhole
+    inputs:
+      - otlp.metrics
+      - otlp.traces
+    print_interval_secs: 0
+
+tests:
+  - name: ocsf_journald_sshd_failure
+    inputs:
+      - insert_at: ocsf_journald
+        type: log
+        log_fields:
+          MESSAGE: "Failed password for root from 198.51.100.10 port 51234 ssh2"
+          PRIORITY: "3"
+          SYSLOG_FACILITY: "10"
+          SYSLOG_IDENTIFIER: "sshd"
+          _SYSTEMD_UNIT: "sshd.service"
+          _TRANSPORT: "syslog"
+          _HOSTNAME: "edge-01"
+          _MACHINE_ID: "mach-001"
+          _BOOT_ID: "boot-001"
+          _PID: "4242"
+          _UID: "0"
+          _COMM: "sshd"
+          _EXE: "/usr/sbin/sshd"
+          _CMDLINE: "sshd: root [priv]"
+          _SOURCE_REALTIME_TIMESTAMP: "1731676800123456"
+          __REALTIME_TIMESTAMP: "1731676800125000"
+          __CURSOR: "cursor-123"
+          CUSTOM_TAG: "auth-audit"
+    outputs:
+      - extract_from: ocsf_journald
+        conditions:
+          - type: vrl
+            source: |
+              .category_uid == 1 &&
+              .class_uid == 1008 &&
+              .activity_id == 99 &&
+              .type_uid == 100899 &&
+              .severity_id == 4 &&
+              .severity == "High" &&
+              .time == 1731676800123 &&
+              .time_dt == "2024-11-15T13:20:00.123Z" &&
+              .device.os.type_id == 200 &&
+              .actor.process.pid == 4242 &&
+              .actor.user.uid == "0" &&
+              .actor.user.uid_numeric == 0 &&
+              .metadata.version == "1.3.0" &&
+              .unmapped.CUSTOM_TAG == "auth-audit"
+
+  - name: ocsf_otlp_error_with_trace
+    inputs:
+      - insert_at: ocsf_otlp_logs
+        type: log
+        log_fields:
+          timestamp: "2025-01-10T08:00:00.250Z"
+          observed_timestamp: "2025-01-10T08:00:00.300Z"
+          severity_number: 17
+          severity_text: "ERROR"
+          message: "upstream payment timeout"
+          trace_id: "0af7651916cd43dd8448eb211c80319c"
+          span_id: "b7ad6b7169203331"
+          scope:
+            name: "checkout-logger"
+          resources:
+            service.name: "checkout-api"
+            host.name: "app-02"
+            os.type: "linux"
+            deployment.environment: "prod"
+          attributes:
+            user.id: "1001"
+            order.id: "ord-99"
+    outputs:
+      - extract_from: ocsf_otlp_logs
+        conditions:
+          - type: vrl
+            source: |
+              .category_uid == 1 &&
+              .class_uid == 1008 &&
+              .activity_id == 99 &&
+              .type_uid == 100899 &&
+              .severity_id == 4 &&
+              .severity == "High" &&
+              .log_name == "checkout-logger" &&
+              .log_provider == "opentelemetry" &&
+              .metadata.correlation_uid == "0af7651916cd43dd8448eb211c80319c" &&
+              .metadata.original_event_uid == "b7ad6b7169203331" &&
+              .device.os.name == "Linux" &&
+              .device.os.type_id == 200 &&
+              .actor.user.uid == "1001" &&
+              .actor.user.uid_numeric == 1001 &&
+              .unmapped.span_id == "b7ad6b7169203331" &&
+              .unmapped.attributes."order.id" == "ord-99" &&
+              .unmapped.resource."deployment.environment" == "prod"

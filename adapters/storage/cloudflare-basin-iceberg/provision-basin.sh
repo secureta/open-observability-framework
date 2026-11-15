@@ -3,15 +3,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-SCHEMA_FILE="${REPO_ROOT}/contracts/schemas/journal-logs.basin.json"
+SCHEMA_FILE="${REPO_ROOT}/contracts/ocsf/event-log-activity.basin.json"
 SQL_TEMPLATE="${SCRIPT_DIR}/pipeline.sql"
 
 BUCKET="oof-telemetry"
 NAMESPACE="siem"
-TABLE="journal_logs"
-STREAM="journal_stream"
-SINK="journal_iceberg_sink"
-PIPELINE="journal_to_iceberg"
+TABLE="ocsf_event_log_activity"
+STREAM="ocsf_event_log_stream"
+SINK="ocsf_event_log_sink"
+PIPELINE="ocsf_event_log_to_iceberg"
 ROLL_INTERVAL="60"
 CATALOG_TOKEN="${BASIN_CATALOG_TOKEN:-}"
 DRY_RUN=false
@@ -20,15 +20,16 @@ usage() {
   cat <<'EOF'
 Usage: provision-basin.sh [options]
 
-Provision Cloudflare R2 Bucket + Basin Catalog + Basin Stream + Iceberg Sink + Pipeline.
+Provision Cloudflare R2 Bucket + Basin Catalog + Authenticated OCSF Basin Stream + Iceberg Sink + Pipeline.
 
 Options:
+  --schema-file <path>     Basin stream JSON schema (default: contracts/ocsf/event-log-activity.basin.json)
   --bucket <name>          R2 bucket name (default: oof-telemetry)
   --namespace <name>       Iceberg catalog namespace (default: siem)
-  --table <name>           Iceberg table name (default: journal_logs)
-  --stream <name>          Basin stream name (default: journal_stream)
-  --sink <name>            Basin sink name (default: journal_iceberg_sink)
-  --pipeline <name>        Basin pipeline name (default: journal_to_iceberg)
+  --table <name>           Iceberg table name (default: ocsf_event_log_activity)
+  --stream <name>          Basin stream name (default: ocsf_event_log_stream)
+  --sink <name>            Basin sink name (default: ocsf_event_log_sink)
+  --pipeline <name>        Basin pipeline name (default: ocsf_event_log_to_iceberg)
   --roll-interval <secs>   Sink commit interval in seconds (default: 60, min: 60)
   --catalog-token <token>  Basin catalog API token (or set BASIN_CATALOG_TOKEN env var)
   --dry-run                Validate inputs and print Wrangler commands without executing
@@ -64,6 +65,11 @@ validate_entity_name() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --schema-file)
+      [[ $# -ge 2 ]] || { echo "error: --schema-file requires a value" >&2; exit 1; }
+      SCHEMA_FILE="$2"
+      shift 2
+      ;;
     --bucket)
       [[ $# -ge 2 ]] || { echo "error: --bucket requires a value" >&2; exit 1; }
       BUCKET="$2"
@@ -154,11 +160,9 @@ if [[ "${DRY_RUN}" == false ]] && [[ -z "${CATALOG_TOKEN}" ]]; then
   exit 1
 fi
 
-LOCAL_WRANGLER="${REPO_ROOT}/adapters/ingest/cloudflare-worker-basin/node_modules/.bin/wrangler"
-
 run_wrangler() {
-  if [[ -x "${LOCAL_WRANGLER}" ]]; then
-    "${LOCAL_WRANGLER}" "$@"
+  if command -v wrangler >/dev/null 2>&1; then
+    wrangler "$@"
   else
     npx wrangler "$@"
   fi
@@ -194,7 +198,8 @@ sed -e "s/__SINK_NAME__/${SINK}/g" -e "s/__STREAM_NAME__/${STREAM}/g" "${SQL_TEM
 
 if [[ "${DRY_RUN}" == true ]]; then
   cat <<EOF
-# [dry-run] Cloudflare Basin Iceberg Provisioning Plan
+# [dry-run] Cloudflare Basin Iceberg Provisioning Plan (Direct Basin HTTP + OCSF)
+# Schema:    ${SCHEMA_FILE}
 # Bucket:    ${BUCKET}
 # Namespace: ${NAMESPACE}
 # Table:     ${TABLE}
@@ -202,21 +207,28 @@ if [[ "${DRY_RUN}" == true ]]; then
 # Sink:      ${SINK}
 # Pipeline:  ${PIPELINE}
 
-npx --prefix adapters/ingest/cloudflare-worker-basin wrangler r2 bucket create "${BUCKET}"
-npx --prefix adapters/ingest/cloudflare-worker-basin wrangler basin catalog enable "${BUCKET}"
-# Note: \`streams create\` prints a Stream ID (<STREAM_ID>); copy that Stream ID
-# (not the stream name) into adapters/ingest/cloudflare-worker-basin/wrangler.jsonc (pipelines[0].stream).
-npx --prefix adapters/ingest/cloudflare-worker-basin wrangler basin pipelines streams create "${STREAM}" \\
-  --schema-file "${SCHEMA_FILE}"
-npx --prefix adapters/ingest/cloudflare-worker-basin wrangler basin pipelines sinks create "${SINK}" \\
+npx wrangler r2 bucket create "${BUCKET}"
+npx wrangler basin catalog enable "${BUCKET}"
+# Direct Basin HTTP ingest enabled with native API token auth (--http-enabled true --http-auth true).
+# streams create outputs an Endpoint URL (https://<STREAM_ID>.ingest.cloudflare.com).
+npx wrangler basin pipelines streams create "${STREAM}" \\
+  --schema-file "${SCHEMA_FILE}" \\
+  --http-enabled true \\
+  --http-auth true
+npx wrangler basin pipelines sinks create "${SINK}" \\
   --type r2-data-catalog \\
   --bucket "${BUCKET}" \\
   --namespace "${NAMESPACE}" \\
   --table "${TABLE}" \\
   --roll-interval "${ROLL_INTERVAL}" \\
   --catalog-token "<BASIN_CATALOG_TOKEN>"
-npx --prefix adapters/ingest/cloudflare-worker-basin wrangler basin pipelines create "${PIPELINE}" \\
+npx wrangler basin pipelines create "${PIPELINE}" \\
   --sql-file "${RENDERED_SQL}"
+
+# Post-provisioning sender auth setup:
+# 1. Create a Cloudflare Account API Token scoped to Account -> Basin Pipelines -> Send.
+# 2. For Vector:     OOF_BASIN_ENDPOINT="https://<STREAM_ID>.ingest.cloudflare.com" OOF_INGEST_TOKEN="<API_TOKEN>"
+# 3. For Fluent Bit: OOF_BASIN_HOST="<STREAM_ID>.ingest.cloudflare.com" OOF_INGEST_TOKEN="<API_TOKEN>"
 
 # Rendered Pipeline SQL (${RENDERED_SQL}):
 EOF
@@ -224,8 +236,8 @@ EOF
   exit 0
 fi
 
-if [[ ! -x "${LOCAL_WRANGLER}" ]] && ! command -v npx >/dev/null 2>&1; then
-  echo "error: local wrangler binary or npx (Node.js) is required to run wrangler" >&2
+if ! command -v wrangler >/dev/null 2>&1 && ! command -v npx >/dev/null 2>&1; then
+  echo "error: wrangler or npx (Node.js) is required to run Cloudflare Wrangler" >&2
   exit 1
 fi
 
@@ -235,17 +247,26 @@ run_wrangler_idempotent r2 bucket create "${BUCKET}"
 echo "[oof] Enabling Basin Catalog on '${BUCKET}'..."
 run_wrangler_idempotent basin catalog enable "${BUCKET}"
 
-echo "[oof] Creating Basin stream '${STREAM}'..."
+echo "[oof] Creating authenticated HTTP Basin stream '${STREAM}'..."
 STREAM_CREATE_OUT="$(NO_COLOR=1 run_wrangler basin pipelines streams create "${STREAM}" \
-  --schema-file "${SCHEMA_FILE}")"
+  --schema-file "${SCHEMA_FILE}" \
+  --http-enabled true \
+  --http-auth true)"
 printf '%s\n' "${STREAM_CREATE_OUT}"
 
 ANSI_ESC=$'\033'
 STREAM_CREATE_CLEAN="$(printf '%s\n' "${STREAM_CREATE_OUT}" | sed "s/${ANSI_ESC}\\[[0-9;]*m//g")"
 STREAM_ID=""
+STREAM_ENDPOINT=""
 id_pattern="with id '([^']+)'"
+endpoint_pattern="Endpoint:[[:space:]]+(https://[^[:space:]]+)"
 if [[ "${STREAM_CREATE_CLEAN}" =~ ${id_pattern} ]]; then
   STREAM_ID="${BASH_REMATCH[1]}"
+fi
+if [[ "${STREAM_CREATE_CLEAN}" =~ ${endpoint_pattern} ]]; then
+  STREAM_ENDPOINT="${BASH_REMATCH[1]}"
+elif [[ -n "${STREAM_ID}" ]]; then
+  STREAM_ENDPOINT="https://${STREAM_ID}.ingest.cloudflare.com"
 fi
 
 echo "[oof] Creating Basin Iceberg sink '${SINK}' -> ${NAMESPACE}.${TABLE}..."
@@ -261,8 +282,13 @@ echo "[oof] Creating Basin pipeline '${PIPELINE}'..."
 run_wrangler basin pipelines create "${PIPELINE}" \
   --sql-file "${RENDERED_SQL}"
 
-if [[ -n "${STREAM_ID}" ]]; then
-  echo "[oof] Provisioning complete. Set pipelines[0].stream in adapters/ingest/cloudflare-worker-basin/wrangler.jsonc to Stream ID '${STREAM_ID}' and deploy the Worker."
+echo "[oof] Provisioning complete."
+echo "[oof] Next: create a Cloudflare Account API Token with 'Account -> Basin Pipelines -> Send' permission."
+if [[ -n "${STREAM_ENDPOINT}" ]]; then
+  STREAM_HOST="${STREAM_ENDPOINT#https://}"
+  STREAM_HOST="${STREAM_HOST%%/*}"
+  echo "[oof]   Vector:     export OOF_BASIN_ENDPOINT='${STREAM_ENDPOINT}' OOF_INGEST_TOKEN='<API_TOKEN>'"
+  echo "[oof]   Fluent Bit: export OOF_BASIN_HOST='${STREAM_HOST}' OOF_INGEST_TOKEN='<API_TOKEN>'"
 else
-  echo "[oof] Provisioning complete. Run 'npm exec --prefix adapters/ingest/cloudflare-worker-basin -- wrangler basin pipelines streams list' to retrieve the Stream ID for '${STREAM}', set it as pipelines[0].stream in wrangler.jsonc, and deploy the Worker."
+  echo "[oof]   Run 'npx wrangler basin pipelines streams get ${STREAM}' to inspect your HTTPS Endpoint for Vector/Fluent Bit."
 fi
