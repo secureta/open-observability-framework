@@ -1,0 +1,47 @@
+version: "0.1"
+platform_name: cloudflare-basin-ocsf
+
+schema:
+  profile: ocsf
+  version: "1.3.0"
+  class_uid: 1008
+  contract_path: contracts/ocsf/event-log-activity.basin.json
+
+collect:
+  adapter: vector-journald
+  sources:
+    - systemd-journald
+    - otlp-logs
+  options:
+    config_path: adapters/collect/vector-journald/vector.yaml
+    fluent_bit_adapter: fluent-bit-journald
+    fluent_bit_config_path: adapters/collect/fluent-bit-journald/fluent-bit.conf
+    otel_collector_bridge: otel-collector-journald
+    otel_collector_config_path: adapters/collect/otel-collector-journald/otelcol.yaml
+
+detect:
+  enabled: false
+
+ingest:
+  adapter: direct-basin-http
+  endpoint: https://<STREAM_ID>.ingest.cloudflare.com
+  auth: basin-api-token
+
+storage:
+  adapter: cloudflare-basin-iceberg
+  format: iceberg
+  catalog: basin-catalog
+  bucket: oof-telemetry
+  namespace: siem
+  tables:
+    logs_table: ocsf_event_log_activity
+
+apm:
+  enabled: false
+  traces_adapter: otlp-basin-iceberg
+  metrics_adapter: otlp-prometheus-remote-write
+
+query:
+  adapters:
+    - basin-sql
+    - duckdb

@@ -1,14 +1,15 @@
 # Component Catalog by Framework Slot
 
-Each slot can swap services independently because adapters speak the 24-field canonical envelope ([journal-logs.basin.json](../../../contracts/schemas/journal-logs.basin.json)).
+Each slot can swap services independently because adapters speak standard open schemas starting with OCSF v1.3.0 `Event Log Activity` (`1008`, [event-log-activity.basin.json](../../../contracts/ocsf/event-log-activity.basin.json)).
 
 | Slot | Adapter ID | Path / Reference | Best For |
 | :--- | :--- | :--- | :--- |
-| `collect` | `vector-journald` | `adapters/collect/vector-journald/vector.yaml` | Production `systemd-journald` shipping with VRL normalization & gzipped NDJSON |
-| `collect` | `otel-collector-journald` | `adapters/collect/otel-collector-journald/otelcol.yaml` | Unified SIEM (`journald`) + APM (`otlp` traces/metrics) host agent |
-| `detect` | `yara-wasm` (`edge-ingest`) | `adapters/detect/yara-wasm/` | Zero-host-dependency inline YARA inspection inside Cloudflare Workers |
-| `detect` | `host-yara-x` (`host-agent`) | `adapters/detect/host-yara-x/README.md` | File/memory scanning via `yr` (YARA-X) or Kunai, logged to `journald` |
-| `ingest` | `cloudflare-worker-basin` | `adapters/ingest/cloudflare-worker-basin/` | Auth, schema normalization, WASM YARA scan, `TELEMETRY_STREAM.send()` |
-| `storage` | `cloudflare-basin-iceberg` | `adapters/storage/cloudflare-basin-iceberg/` | Serverless R2 + Basin Catalog Apache Iceberg lakehouse |
-| `apm` | `otlp-basin-iceberg` (extension) | `otelcol.yaml` + `trace_id`/`span_id` fields | Correlating application traces/metrics with host security logs |
+| `schema` | `ocsf` (`v1.3.0`, `1008`) | `contracts/ocsf/event-log-activity.basin.json` | Vendor-neutral SIEM + APM log standardization (`ecs`/`cim` extensible later) |
+| `collect` | `vector-journald` | `adapters/collect/vector-journald/vector.yaml` | Host `systemd-journald` + OTLP (`4317`/`4318`) -> VRL OCSF v1.3.0 -> gzipped JSON array |
+| `collect` | `fluent-bit-journald` | `adapters/collect/fluent-bit-journald/fluent-bit.conf` | Ultra-lightweight `systemd` + `opentelemetry` -> Lua OCSF v1.3.0 -> gzipped JSON array |
+| `collect` | `otel-collector-journald` | `adapters/collect/otel-collector-journald/otelcol.yaml` | OTLP agent/gateway forwarding protobuf logs (`encoding: proto`) to Vector or Fluent Bit |
+| `detect` | `disabled` (default) / optional | `manifest/stack.schema.json` (`detect.enabled`) | Lean ingestion without custom runtime compute; add host `yara-x`/lakehouse SQL if needed |
+| `ingest` | `direct-basin-http` | `adapters/storage/cloudflare-basin-iceberg/provision-basin.sh` | Zero-Worker direct HTTPS ingestion (`--http-enabled true --http-auth true`) |
+| `storage` | `cloudflare-basin-iceberg` | `adapters/storage/cloudflare-basin-iceberg/` | Serverless R2 + Basin Catalog Apache Iceberg lakehouse (`siem.ocsf_event_log_activity`) |
+| `apm` | `otlp-basin-iceberg` (extension) | `otelcol.yaml` + `metadata.correlation_uid` | Correlating application traces/metrics (`trace_id`) with OCSF system logs |
 | `query` | `basin-sql`, `duckdb` | `adapters/storage/cloudflare-basin-iceberg/queries/siem_hunting.sql` | Ad-hoc SQL threat hunting & APM-SIEM correlation over Iceberg |

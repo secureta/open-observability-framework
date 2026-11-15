@@ -1,31 +1,26 @@
--- Cloudflare Basin Pipeline SQL: Canonical Journal Logs -> Iceberg Sink
+-- Cloudflare Basin Pipeline SQL: OCSF v1.3.0 Event Log Activity (1008) -> Iceberg Sink
 -- Placeholders `__SINK_NAME__` and `__STREAM_NAME__` are rendered by provision-basin.sh
--- (defaults: sink = journal_iceberg_sink, stream = journal_stream).
+-- (defaults: sink = ocsf_event_log_sink, stream = ocsf_event_log_stream).
 
 INSERT INTO __SINK_NAME__
 SELECT
-  event_id,
-  observed_at,
-  event_time,
-  host,
-  service_name,
-  systemd_unit,
-  syslog_identifier,
-  transport,
-  priority,
+  category_uid,
+  category_name,
+  class_uid,
+  class_name,
+  type_uid,
+  type_name,
+  activity_id,
+  activity_name,
+  severity_id,
   severity,
-  pid,
-  uid,
-  comm,
-  exe,
-  cmdline,
-  boot_id,
-  machine_id,
+  time,
+  time_dt,
   message,
-  trace_id,
-  span_id,
-  yara_matched,
-  yara_rules,
-  yara_tags,
-  attributes_json
+  log_name,
+  log_provider,
+  metadata,
+  device,
+  actor,
+  unmapped
 FROM __STREAM_NAME__;

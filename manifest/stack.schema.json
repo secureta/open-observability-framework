@@ -2,12 +2,13 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://open-observability-framework.dev/schemas/stack/v0.1.json",
   "title": "Open Observability Framework Stack Manifest",
-  "description": "Declarative manifest binding interchangeable SIEM + APM service adapters across the 6 framework slots.",
+  "description": "Declarative manifest binding interchangeable SIEM + APM service adapters across framework slots with standard telemetry schemas.",
   "type": "object",
   "additionalProperties": false,
   "required": [
     "version",
     "platform_name",
+    "schema",
     "collect",
     "detect",
     "ingest",
@@ -25,6 +26,40 @@
       "minLength": 1,
       "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
     },
+    "schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile", "version"],
+      "properties": {
+        "profile": {
+          "type": "string",
+          "enum": ["ocsf", "ecs", "cim"],
+          "description": "Open telemetry schema standard (no proprietary custom schemas)."
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "class_uid": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "OCSF event class UID (e.g. 1008 for Event Log Activity)."
+        },
+        "contract_path": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "if": {
+        "properties": {
+          "profile": { "const": "ocsf" }
+        },
+        "required": ["profile"]
+      },
+      "then": {
+        "required": ["class_uid"]
+      }
+    },
     "collect": {
       "type": "object",
       "additionalProperties": false,
@@ -33,7 +68,7 @@
         "adapter": {
           "type": "string",
           "minLength": 1,
-          "description": "Collector service adapter (e.g. vector-journald, otel-collector-journald, fluent-bit)."
+          "description": "Collector service adapter (e.g. vector-journald, fluent-bit-journald, otel-collector-journald)."
         },
         "sources": {
           "type": "array",
@@ -52,16 +87,19 @@
     "detect": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["placement", "engine", "rule_paths"],
+      "required": ["enabled"],
       "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
         "placement": {
           "type": "string",
-          "enum": ["edge-ingest", "host-agent", "lakehouse-batch", "hybrid"]
+          "enum": ["host-agent", "lakehouse-batch", "edge-ingest", "hybrid"]
         },
         "engine": {
           "type": "string",
           "minLength": 1,
-          "description": "Detection engine identifier (e.g. yara-wasm, yara-x, kunai-yara)."
+          "description": "Optional detection engine identifier (e.g. yara-x, kunai, sigma-sql)."
         },
         "rule_paths": {
           "type": "array",
@@ -71,6 +109,15 @@
             "minLength": 1
           }
         }
+      },
+      "if": {
+        "properties": {
+          "enabled": { "const": true }
+        },
+        "required": ["enabled"]
+      },
+      "then": {
+        "required": ["placement", "engine"]
       }
     },
     "ingest": {
@@ -81,7 +128,7 @@
         "adapter": {
           "type": "string",
           "minLength": 1,
-          "description": "Ingestion gateway adapter (e.g. cloudflare-worker-basin, direct-basin-http)."
+          "description": "Ingestion transport adapter (default: direct-basin-http)."
         },
         "endpoint": {
           "type": "string",
@@ -89,7 +136,7 @@
         },
         "auth": {
           "type": "string",
-          "enum": ["bearer", "mtls", "access"]
+          "enum": ["basin-api-token", "access", "mtls"]
         }
       }
     },
