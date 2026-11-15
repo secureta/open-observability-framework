@@ -391,7 +391,9 @@ function buildScanBuffer(
     let needSep = slicedMsg.length + canonicalBytes.length > 0;
     for (const part of extraParts) {
       if (part.length === 0) continue;
-      const chunkText = needSep ? `\n${part}` : part;
+      const maxPartUnits = remainingForExtra + 1;
+      const boundedPart = part.length > maxPartUnits ? part.slice(0, maxPartUnits) : part;
+      const chunkText = needSep ? `\n${boundedPart}` : boundedPart;
       const encoded = textEncoder.encode(chunkText);
       needSep = true;
       if (encoded.length <= remainingForExtra) {
@@ -1135,6 +1137,7 @@ function extractCommonTelemetryFields(record: Record<string, unknown>): Extracte
 
 interface EmbeddedEnvelope {
   messageField: { text: string; bytes: Uint8Array } | null;
+  consumedMessageKey: "message" | "MESSAGE" | null;
   fields: ExtractedTelemetryFields;
   rawRecord: Record<string, unknown>;
 }
@@ -1153,10 +1156,8 @@ function parseEmbeddedMessageEnvelope(text: string): EmbeddedEnvelope | null {
     return null;
   }
   const primaryMsg = ownProp(parsed, "message");
-  const candidateMsg =
-    primaryMsg !== undefined && primaryMsg !== null
-      ? primaryMsg
-      : ownProp(parsed, "MESSAGE");
+  const usePrimaryMsg = primaryMsg !== undefined && primaryMsg !== null;
+  const candidateMsg = usePrimaryMsg ? primaryMsg : ownProp(parsed, "MESSAGE");
 
   let messageField: { text: string; bytes: Uint8Array } | null = null;
   if (typeof candidateMsg === "string") {
@@ -1176,6 +1177,7 @@ function parseEmbeddedMessageEnvelope(text: string): EmbeddedEnvelope | null {
 
   return {
     messageField,
+    consumedMessageKey: messageField === null ? null : usePrimaryMsg ? "message" : "MESSAGE",
     fields: extractCommonTelemetryFields(parsed),
     rawRecord: parsed,
   };
@@ -1189,7 +1191,7 @@ function pushUniqueStrings(target: string[], additions: readonly string[]): void
   }
 }
 
-const MAX_WALK_NODES = 8192;
+const MAX_WALK_NODES = MAX_SCAN_BYTES / 2 + 16;
 
 const YARA_META_SKIP_KEYS = new Set([
   "yara_matched",
@@ -1199,13 +1201,71 @@ const YARA_META_SKIP_KEYS = new Set([
   "yara.tags",
 ]);
 
+function* iterateOwnKeys(
+  obj: Record<string, unknown>,
+): Generator<string, void, undefined> {
+  for (const k in obj) {
+    if (Object.hasOwn(obj, k)) {
+      yield k;
+    }
+  }
+}
+
+type WalkFrame =
+  | {
+      readonly kind: "array";
+      readonly items: readonly unknown[];
+      index: number;
+    }
+  | {
+      readonly kind: "object";
+      readonly obj: Record<string, unknown>;
+      readonly iter: Generator<string, void, undefined>;
+    };
+
 function collectScanStrings(
-  root: unknown,
+  root: Record<string, unknown>,
   parts: string[],
   budget: { remaining: number },
 ): boolean {
-  const stack: Array<{ value: unknown; keyPrefix: string }> = [
-    { value: root, keyPrefix: "" },
+  if (budget.remaining <= 0) {
+    return false;
+  }
+
+  const emitFragment = (text: string): void => {
+    if (text.length === 0 || budget.remaining <= 0) {
+      return;
+    }
+    const maxUnits = budget.remaining + 1;
+    const bounded = text.length > maxUnits ? text.slice(0, maxUnits) : text;
+    parts.push(bounded);
+    budget.remaining -= textEncoder.encode(bounded).length + 1;
+  };
+
+  const emitKeyValue = (key: string, val: string): void => {
+    if (key.length === 0) {
+      emitFragment(val);
+      return;
+    }
+    if (budget.remaining <= 0) {
+      return;
+    }
+    const maxUnits = budget.remaining + 1;
+    if (key.length >= maxUnits) {
+      emitFragment(key);
+      return;
+    }
+    const maxValUnits = maxUnits - key.length;
+    const boundedVal = val.length > maxValUnits ? val.slice(0, maxValUnits) : val;
+    emitFragment(`${key}=${boundedVal}`);
+  };
+
+  const stack: WalkFrame[] = [
+    {
+      kind: "object",
+      obj: root,
+      iter: iterateOwnKeys(root),
+    },
   ];
   let visitedNodes = 0;
 
@@ -1213,40 +1273,107 @@ function collectScanStrings(
     if (budget.remaining <= 0) {
       return false;
     }
-    if (visitedNodes >= MAX_WALK_NODES) {
-      return true;
-    }
-    const current = stack.pop()!;
-    visitedNodes++;
-    const { value, keyPrefix } = current;
 
-    if (value === null || value === undefined) {
-      continue;
-    }
-    if (typeof value === "string") {
-      if (value.length === 0) continue;
-      const fragment = keyPrefix.length > 0 ? `${keyPrefix}=${value}` : value;
-      parts.push(fragment);
-      budget.remaining -= textEncoder.encode(fragment).length + 1;
-      continue;
-    }
-    if (typeof value === "number" || typeof value === "boolean") {
-      const fragment = keyPrefix.length > 0 ? `${keyPrefix}=${String(value)}` : String(value);
-      parts.push(fragment);
-      budget.remaining -= textEncoder.encode(fragment).length + 1;
-      continue;
-    }
-    if (Array.isArray(value)) {
-      for (let i = value.length - 1; i >= 0; i--) {
-        stack.push({ value: value[i], keyPrefix });
+    const top = stack[stack.length - 1]!;
+    if (top.kind === "array") {
+      if (top.index >= top.items.length) {
+        stack.pop();
+        continue;
+      }
+      if (visitedNodes >= MAX_WALK_NODES) {
+        return true;
+      }
+      const item = top.items[top.index++];
+      visitedNodes++;
+
+      if (item === null || item === undefined) {
+        continue;
+      }
+      if (typeof item === "string") {
+        if (item.length > 0) {
+          emitFragment(item);
+        }
+        continue;
+      }
+      if (typeof item === "number" || typeof item === "boolean") {
+        emitFragment(String(item));
+        continue;
+      }
+      if (Array.isArray(item)) {
+        if (item.length > 0) {
+          stack.push({
+            kind: "array",
+            items: item,
+            index: 0,
+          });
+        }
+        continue;
+      }
+      if (typeof item === "object") {
+        const obj = item as Record<string, unknown>;
+        stack.push({
+          kind: "object",
+          obj,
+          iter: iterateOwnKeys(obj),
+        });
       }
       continue;
     }
-    if (typeof value === "object") {
-      const entries = Object.entries(value);
-      for (let i = entries.length - 1; i >= 0; i--) {
-        const [k, v] = entries[i]!;
-        stack.push({ value: v, keyPrefix: k });
+
+    const next = top.iter.next();
+    if (next.done) {
+      stack.pop();
+      continue;
+    }
+    if (visitedNodes >= MAX_WALK_NODES) {
+      return true;
+    }
+    const k = next.value;
+    const v = top.obj[k];
+    visitedNodes++;
+
+    if (v === null || v === undefined) {
+      if (k.length > 0) {
+        emitFragment(k);
+      }
+      continue;
+    }
+    if (typeof v === "string") {
+      if (v.length > 0) {
+        emitKeyValue(k, v);
+      } else if (k.length > 0) {
+        emitFragment(k);
+      }
+      continue;
+    }
+    if (typeof v === "number" || typeof v === "boolean") {
+      emitKeyValue(k, String(v));
+      continue;
+    }
+    if (Array.isArray(v)) {
+      if (k.length > 0) {
+        emitFragment(k);
+      }
+      if (v.length > 0 && budget.remaining > 0) {
+        stack.push({
+          kind: "array",
+          items: v,
+          index: 0,
+        });
+      }
+      continue;
+    }
+    if (typeof v === "object") {
+      if (k.length > 0) {
+        emitFragment(k);
+      }
+      if (budget.remaining > 0) {
+        const obj = v as Record<string, unknown>;
+        stack.push({
+          kind: "object",
+          obj,
+          iter: iterateOwnKeys(obj),
+        });
       }
     }
   }
@@ -1404,51 +1531,89 @@ export function normalizeAndDetect(
 
   const embeddedScanParts: string[] = [];
   if (embedded !== null) {
-    const budget = { remaining: MAX_SCAN_BYTES };
+    const budget = { remaining: MAX_SCAN_BYTES + 1 };
     const scanEmbeddedRecord = Object.create(null) as Record<string, unknown>;
-    for (const [key, value] of Object.entries(embedded.rawRecord)) {
-      if (value === undefined || value === null) continue;
+    let copiedTopKeys = 0;
+    let topRecordTruncated = false;
+    for (const key in embedded.rawRecord) {
+      if (!Object.hasOwn(embedded.rawRecord, key)) continue;
+      const value = embedded.rawRecord[key];
+      if (value === undefined) continue;
       if (YARA_META_SKIP_KEYS.has(key)) continue;
       if (
         (key === "message" || key === "MESSAGE") &&
-        embedded.messageField !== null &&
-        value === embedded.messageField.text
+        (value === null || key === embedded.consumedMessageKey)
       ) {
-        continue;
-      }
-      if ((key === "cmdline" || key === "_CMDLINE" || key === "process.command_line") && value === cmdline) {
-        continue;
-      }
-      if ((key === "exe" || key === "_EXE" || key === "process.executable.path") && value === exe) {
-        continue;
-      }
-      if ((key === "syslog_identifier" || key === "SYSLOG_IDENTIFIER" || key === "syslog.identifier") && value === syslog_identifier) {
-        continue;
-      }
-      if ((key === "systemd_unit" || key === "_SYSTEMD_UNIT" || key === "systemd.unit") && value === systemd_unit) {
         continue;
       }
       if (
-        (key === "attributes_json" || key === "attributes.json") &&
-        typeof value === "string" &&
-        value.trimStart().startsWith("{")
+        (key === "cmdline" || key === "_CMDLINE" || key === "process.command_line") &&
+        (value === null || value === cmdline)
       ) {
-        try {
-          const parsedAttr = JSON.parse(value) as unknown;
-          if (isPlainObject(parsedAttr)) {
-            scanEmbeddedRecord[key] = parsedAttr;
-            continue;
+        continue;
+      }
+      if (
+        (key === "exe" || key === "_EXE" || key === "process.executable.path") &&
+        (value === null || value === exe)
+      ) {
+        continue;
+      }
+      if (
+        (key === "syslog_identifier" ||
+          key === "SYSLOG_IDENTIFIER" ||
+          key === "syslog.identifier") &&
+        (value === null || value === syslog_identifier)
+      ) {
+        continue;
+      }
+      if (
+        (key === "systemd_unit" || key === "_SYSTEMD_UNIT" || key === "systemd.unit") &&
+        (value === null || value === systemd_unit)
+      ) {
+        continue;
+      }
+      if (copiedTopKeys >= MAX_WALK_NODES) {
+        topRecordTruncated = true;
+        break;
+      }
+      copiedTopKeys++;
+      if (
+        (key === "attributes_json" || key === "attributes.json") &&
+        typeof value === "string"
+      ) {
+        const trimmedAttr = value.trimStart();
+        if (
+          trimmedAttr.startsWith("{") ||
+          trimmedAttr.startsWith("[") ||
+          trimmedAttr.startsWith('"')
+        ) {
+          try {
+            const parsedAttr = JSON.parse(value) as unknown;
+            if (
+              isPlainObject(parsedAttr) ||
+              Array.isArray(parsedAttr) ||
+              typeof parsedAttr === "string"
+            ) {
+              scanEmbeddedRecord[key] = parsedAttr;
+              continue;
+            }
+          } catch {
+            // Keep original string below when not valid JSON.
           }
-        } catch {
-          // Keep original string below when not valid JSON object.
         }
       }
       scanEmbeddedRecord[key] = value;
     }
 
-    const walkTruncated = collectScanStrings(scanEmbeddedRecord, embeddedScanParts, budget);
+    const walkTruncated =
+      collectScanStrings(scanEmbeddedRecord, embeddedScanParts, budget) || topRecordTruncated;
     if (walkTruncated && budget.remaining > 0 && initialMsg.text.length > 0) {
-      embeddedScanParts.push(initialMsg.text);
+      const maxFallbackUnits = budget.remaining + 1;
+      embeddedScanParts.push(
+        initialMsg.text.length > maxFallbackUnits
+          ? initialMsg.text.slice(0, maxFallbackUnits)
+          : initialMsg.text,
+      );
     }
   }
 
