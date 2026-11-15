@@ -18,7 +18,9 @@
   "pipelines": [
     {
       "binding": "TELEMETRY_STREAM",
-      "stream": "journal_stream"
+      // Replace <STREAM_ID> with the Stream ID output by `provision-basin.sh`
+      // or `npx wrangler basin pipelines streams list` (do NOT use the stream name).
+      "stream": "<STREAM_ID>"
     }
   ]
 }

@@ -29,7 +29,7 @@ Options:
   --stream <name>          Basin stream name (default: journal_stream)
   --sink <name>            Basin sink name (default: journal_iceberg_sink)
   --pipeline <name>        Basin pipeline name (default: journal_to_iceberg)
-  --roll-interval <secs>   Sink commit interval in seconds (default: 60)
+  --roll-interval <secs>   Sink commit interval in seconds (default: 60, min: 60)
   --catalog-token <token>  Basin catalog API token (or set BASIN_CATALOG_TOKEN env var)
   --dry-run                Validate inputs and print Wrangler commands without executing
   -h, --help               Show this help
@@ -45,11 +45,19 @@ validate_sql_ident() {
   fi
 }
 
-validate_resource_name() {
+validate_bucket_name() {
+  local value="$1"
+  if [[ ! "${value}" =~ ^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$ ]]; then
+    echo "error: invalid bucket '${value}' (expected 3-63 lowercase letters, numbers, or hyphens starting/ending with alphanumeric)" >&2
+    exit 1
+  fi
+}
+
+validate_entity_name() {
   local label="$1"
   local value="$2"
-  if [[ ! "${value}" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]]; then
-    echo "error: invalid ${label} '${value}' (expected ^[a-zA-Z0-9][a-zA-Z0-9_-]*$)" >&2
+  if [[ ! "${value}" =~ ^[a-zA-Z0-9_]+$ ]]; then
+    echo "error: invalid ${label} '${value}' (expected ^[a-zA-Z0-9_]+$)" >&2
     exit 1
   fi
 }
@@ -112,15 +120,15 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-validate_resource_name "bucket" "${BUCKET}"
-validate_resource_name "pipeline" "${PIPELINE}"
+validate_bucket_name "${BUCKET}"
+validate_entity_name "pipeline" "${PIPELINE}"
 validate_sql_ident "namespace" "${NAMESPACE}"
 validate_sql_ident "table" "${TABLE}"
 validate_sql_ident "stream" "${STREAM}"
 validate_sql_ident "sink" "${SINK}"
 
-if [[ ! "${ROLL_INTERVAL}" =~ ^[0-9]+$ ]] || [[ "${ROLL_INTERVAL}" -lt 1 ]]; then
-  echo "error: invalid --roll-interval '${ROLL_INTERVAL}' (expected positive integer)" >&2
+if [[ ! "${ROLL_INTERVAL}" =~ ^[0-9]+$ ]] || [[ "${ROLL_INTERVAL}" -lt 60 ]]; then
+  echo "error: invalid --roll-interval '${ROLL_INTERVAL}' (expected integer >= 60 for r2-data-catalog sinks)" >&2
   exit 1
 fi
 
@@ -158,11 +166,13 @@ if [[ "${DRY_RUN}" == true ]]; then
 # Pipeline:  ${PIPELINE}
 
 npx wrangler r2 bucket create "${BUCKET}"
-npx wrangler r2 bucket catalog enable "${BUCKET}"
+npx wrangler basin catalog enable "${BUCKET}"
+# Note: \`streams create\` prints a Stream ID (<STREAM_ID>); copy that Stream ID
+# (not the stream name) into adapters/ingest/cloudflare-worker-basin/wrangler.jsonc (pipelines[0].stream).
 npx wrangler basin pipelines streams create "${STREAM}" \\
   --schema-file "${SCHEMA_FILE}"
 npx wrangler basin pipelines sinks create "${SINK}" \\
-  --type basin-catalog \\
+  --type r2-data-catalog \\
   --bucket "${BUCKET}" \\
   --namespace "${NAMESPACE}" \\
   --table "${TABLE}" \\
@@ -185,16 +195,23 @@ fi
 echo "[oof] Creating R2 bucket '${BUCKET}' (if not already present)..."
 npx wrangler r2 bucket create "${BUCKET}" || true
 
-echo "[oof] Enabling Basin / R2 Data Catalog on '${BUCKET}'..."
-npx wrangler r2 bucket catalog enable "${BUCKET}" || true
+echo "[oof] Enabling Basin Catalog on '${BUCKET}'..."
+npx wrangler basin catalog enable "${BUCKET}" || true
 
 echo "[oof] Creating Basin stream '${STREAM}'..."
-npx wrangler basin pipelines streams create "${STREAM}" \
-  --schema-file "${SCHEMA_FILE}"
+STREAM_CREATE_OUT="$(npx wrangler basin pipelines streams create "${STREAM}" \
+  --schema-file "${SCHEMA_FILE}")"
+printf '%s\n' "${STREAM_CREATE_OUT}"
+
+STREAM_ID=""
+id_pattern="with id '([^']+)'"
+if [[ "${STREAM_CREATE_OUT}" =~ ${id_pattern} ]]; then
+  STREAM_ID="${BASH_REMATCH[1]}"
+fi
 
 echo "[oof] Creating Basin Iceberg sink '${SINK}' -> ${NAMESPACE}.${TABLE}..."
 npx wrangler basin pipelines sinks create "${SINK}" \
-  --type basin-catalog \
+  --type r2-data-catalog \
   --bucket "${BUCKET}" \
   --namespace "${NAMESPACE}" \
   --table "${TABLE}" \
@@ -205,4 +222,8 @@ echo "[oof] Creating Basin pipeline '${PIPELINE}'..."
 npx wrangler basin pipelines create "${PIPELINE}" \
   --sql-file "${RENDERED_SQL}"
 
-echo "[oof] Provisioning complete. Next: bind stream '${STREAM}' to TELEMETRY_STREAM in wrangler.jsonc and deploy the Worker."
+if [[ -n "${STREAM_ID}" ]]; then
+  echo "[oof] Provisioning complete. Set pipelines[0].stream in adapters/ingest/cloudflare-worker-basin/wrangler.jsonc to Stream ID '${STREAM_ID}' and deploy the Worker."
+else
+  echo "[oof] Provisioning complete. Run 'npx wrangler basin pipelines streams list' to retrieve the Stream ID for '${STREAM}', set it as pipelines[0].stream in wrangler.jsonc, and deploy the Worker."
+fi

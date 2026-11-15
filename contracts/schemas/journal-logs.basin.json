@@ -102,7 +102,7 @@
     },
     {
       "name": "yara_matched",
-      "type": "boolean",
+      "type": "bool",
       "required": true
     },
     {

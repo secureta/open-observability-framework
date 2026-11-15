@@ -1,4 +1,10 @@
-import { isPlainObject, normalizeAndDetect, TelemetryLogRecord } from "./normalize";
+import {
+  isPlainObject,
+  normalizeAndDetect,
+  OtlpUnpackError,
+  TelemetryLogRecord,
+  unpackOtlpLogsPayload,
+} from "./normalize";
 import defaultRuleSource from "./rules/linux_journal_core.yar";
 import defaultWasmModule from "./wasm/oof_yara_wasm.wasm";
 import { getCachedWasmDetector, RuleDetector } from "./yara";
@@ -22,6 +28,13 @@ export interface HandlerOptions {
 export const MAX_BODY_BYTES = 5 * 1024 * 1024;
 export const MAX_BATCH_RECORDS = 1000;
 
+const SUPPORTED_CONTENT_TYPES = new Set([
+  "application/json",
+  "application/x-ndjson",
+  "application/ndjson",
+  "text/plain",
+]);
+
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder("utf-8", { fatal: true });
 
@@ -31,6 +44,23 @@ class HttpError extends Error {
     message: string,
   ) {
     super(message);
+  }
+}
+
+function validateContentType(request: Request): void {
+  const rawContentType = request.headers.get("content-type")?.trim();
+  if (!rawContentType) {
+    return;
+  }
+  const mediaType = rawContentType.split(";")[0]!.trim().toLowerCase();
+  if (mediaType.length === 0) {
+    return;
+  }
+  if (!SUPPORTED_CONTENT_TYPES.has(mediaType)) {
+    throw new HttpError(
+      415,
+      `Unsupported Content-Type: ${mediaType} (use JSON, NDJSON, or OTLP JSON with encoding: json)`,
+    );
   }
 }
 
@@ -219,10 +249,17 @@ function parseLogRecords(text: string): Record<string, unknown>[] {
       if (!isPlainObject(parsed)) {
         throw new HttpError(400, "Payload must be a JSON object");
       }
+      const otlpRecords = unpackOtlpLogsPayload(parsed, MAX_BATCH_RECORDS);
+      if (otlpRecords !== null) {
+        return otlpRecords;
+      }
       return [parsed];
     } catch (err) {
       if (err instanceof HttpError) {
         throw err;
+      }
+      if (err instanceof OtlpUnpackError) {
+        throw new HttpError(err.status, err.message);
       }
       // Multiple JSON objects separated by newlines (NDJSON) fail single-doc JSON.parse.
       return parseNdjsonRecords(trimmed);
@@ -275,6 +312,7 @@ export function createIngestHandler(options: HandlerOptions = {}) {
 
       let rawRecords: Record<string, unknown>[];
       try {
+        validateContentType(request);
         const bodyText = await readRequestBodyText(request);
         rawRecords = parseLogRecords(bodyText);
       } catch (err) {
