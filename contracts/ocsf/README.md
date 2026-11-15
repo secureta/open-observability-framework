@@ -45,7 +45,7 @@ Both [Vector](../../adapters/collect/vector-journald/vector.yaml) and [Fluent Bi
 
 | OCSF Path (Basin Type) | `systemd-journald` Source | OTLP Logs Source | Notes |
 | :--- | :--- | :--- | :--- |
-| `time` (`int64`) | `_SOURCE_REALTIME_TIMESTAMP` -> `__REALTIME_TIMESTAMP` -> `timestamp` -> `now()` | `timestamp` -> fallback `observed_timestamp` -> `now()` | Unix epoch **milliseconds** (`int64`, bounded to `[1, 253402300799999]`) |
+| `time` (`int64`) | `_SOURCE_REALTIME_TIMESTAMP` -> `__REALTIME_TIMESTAMP` -> `timestamp` -> `now()` | `timestamp` -> fallback `observed_timestamp` -> `now()` | Unix epoch **milliseconds** (`int64`, truncated via `floor` and bounded to `[1, 253402300799999]`; journald microsecond strings accept `[1000, 253402300799999999]`, numeric JSON integers require IEEE-754 safe range `[1000, 9007199254740991]`) |
 | `time_dt` (`timestamp`, `millisecond`) | Formatted from `time` | Formatted from `time` | 4-digit UTC RFC 3339 string `"YYYY-MM-DDTHH:MM:SS.sssZ"` (`1970..9999`) |
 | `message` (`string`) | `MESSAGE` / `message` | `body` / `message` | Primary log message |
 | `log_name` (`string`) | `_SYSTEMD_UNIT` -> `SYSLOG_IDENTIFIER` | `scope.name` -> `resources["service.name"]` | Unit, identifier, or instrumentation scope |
@@ -53,7 +53,7 @@ Both [Vector](../../adapters/collect/vector-journald/vector.yaml) and [Fluent Bi
 | `metadata.product` (`struct`) | Vector / Fluent Bit metadata | Vector / Fluent Bit metadata | `{ name, vendor_name }` |
 | `metadata.original_event_uid` (`string`) | `__CURSOR` | `attributes["event.id"]` -> `span_id` | Source record locator |
 | `metadata.correlation_uid` (`string`) | `TRACE_ID` / `OTEL_TRACE_ID` / `trace_id` | `trace_id` (16-byte binary or 32-char hex) | Lowercase hex; omitted when empty or all zeros (`0000...`) |
-| `metadata.logged_time` (`int64`) | `__REALTIME_TIMESTAMP` -> `now()` | `observed_timestamp` -> `now()` | Collector ingestion epoch **milliseconds** |
+| `metadata.logged_time` (`int64`) | `__REALTIME_TIMESTAMP` -> `now()` | `observed_timestamp` -> `now()` | Collector ingestion epoch **milliseconds** (truncated via `floor` and bounded to `[1, 253402300799999]`; Fluent Bit `filter_lua` exposes `observed_timestamp` as IEEE-754 `double` ns before truncation) |
 | `metadata.log_level` (`string`) | `PRIORITY` (string) | `severity_text` | Raw source severity text/code |
 | `metadata.log_facility` (`string`) | `SYSLOG_FACILITY` | — | Syslog facility code |
 | `device.type_id` / `type` | `1` / `"Server"` | `0` / `"Unknown"` | OCSF `device.type_id` is required |

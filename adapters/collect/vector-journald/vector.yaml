@@ -51,7 +51,8 @@ transforms:
       if exists(orig._SOURCE_REALTIME_TIMESTAMP) && orig._SOURCE_REALTIME_TIMESTAMP != null {
         src_us = -1
         if is_integer(orig._SOURCE_REALTIME_TIMESTAMP) {
-          src_us = int!(orig._SOURCE_REALTIME_TIMESTAMP)
+          si = int!(orig._SOURCE_REALTIME_TIMESTAMP)
+          if si >= 1000 && si <= 9007199254740991 { src_us = si }
         } else if is_string(orig._SOURCE_REALTIME_TIMESTAMP) {
           s_us = string!(orig._SOURCE_REALTIME_TIMESTAMP)
           if match(s_us, r'^[0-9]{1,18}$') {
@@ -73,7 +74,8 @@ transforms:
       if exists(orig.__REALTIME_TIMESTAMP) && orig.__REALTIME_TIMESTAMP != null {
         rt_us = -1
         if is_integer(orig.__REALTIME_TIMESTAMP) {
-          rt_us = int!(orig.__REALTIME_TIMESTAMP)
+          ri = int!(orig.__REALTIME_TIMESTAMP)
+          if ri >= 1000 && ri <= 9007199254740991 { rt_us = ri }
         } else if is_string(orig.__REALTIME_TIMESTAMP) {
           r_us = string!(orig.__REALTIME_TIMESTAMP)
           if match(r_us, r'^[0-9]{1,18}$') {

@@ -511,7 +511,7 @@ local function transform_otlp(ts, group, metadata, record)
 
   local obs_ms = nil
   if type(otlp.observed_timestamp) == "number" and otlp.observed_timestamp == otlp.observed_timestamp and otlp.observed_timestamp > 0 then
-    local cand_obs = math.floor((otlp.observed_timestamp + 200) / 1000000)
+    local cand_obs = math.floor(otlp.observed_timestamp / 1000000)
     if cand_obs >= 1 and cand_obs <= MAX_RFC3339_MS then
       obs_ms = cand_obs
     end

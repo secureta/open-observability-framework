@@ -935,7 +935,8 @@ test("8. Live E2E wire conformance: Vector and Fluent Bit emit identical valid O
       _HOSTNAME: "host-edge",
       _UID: "1e5",
       _PID: "inf",
-      _SOURCE_REALTIME_TIMESTAMP: "1731676801000000",
+      _SOURCE_REALTIME_TIMESTAMP: 10000000000000000,
+      __REALTIME_TIMESTAMP: "1731676801000000",
     };
 
     const jrnFallback = {
@@ -991,12 +992,18 @@ test("8. Live E2E wire conformance: Vector and Fluent Bit emit identical valid O
       logRecords: [
         {
           timeUnixNano: 0n,
-          observedTimeUnixNano: 1736496005123000000n,
+          observedTimeUnixNano: 1736496005122999900n,
           severityNumber: 0,
           body: { event: "structured", ok: true },
           attributes: { "process.pid": 777, "user.id": "", "enduser.id": "2002" },
           traceIdHex: "00000000000000000000000000000000",
           spanIdHex: "0000000000000000",
+        },
+        {
+          timeUnixNano: 0n,
+          observedTimeUnixNano: 999900n,
+          severityNumber: 9,
+          body: "sub-ms observed fallback",
         },
       ],
     });
@@ -1010,12 +1017,12 @@ test("8. Live E2E wire conformance: Vector and Fluent Bit emit identical valid O
       assert.ok(r.ok, `Vector OTLP /v1/logs rejected protobuf: ${r.status}`);
     }
 
-    await waitForCondition(() => mockBasin.records.length >= 5, 15000);
+    await waitForCondition(() => mockBasin.records.length >= 6, 15000);
     await terminateProcess(vectorProc);
     assert.equal(vecStderr.includes("ERROR "), false, `Vector stderr errors:\n${vecStderr}`);
 
     const vectorRecords = mockBasin.records.splice(0, mockBasin.records.length);
-    assert.equal(vectorRecords.length, 5, `Expected 5 Vector OCSF records, got ${vectorRecords.length}`);
+    assert.equal(vectorRecords.length, 6, `Expected 6 Vector OCSF records, got ${vectorRecords.length}`);
     for (const rec of vectorRecords) {
       assertConformsToOcsfContract(rec, basinSchema);
     }
@@ -1034,6 +1041,7 @@ test("8. Live E2E wire conformance: Vector and Fluent Bit emit identical valid O
     assert.ok(vecJrnEdgeOut, "missing Vector edge journald output");
     assert.equal(vecJrnEdgeOut.severity_id, 0);
     assert.equal(vecJrnEdgeOut.severity, "Unknown");
+    assert.equal(vecJrnEdgeOut.time, 1731676801000);
     assert.equal(vecJrnEdgeOut.actor.user.uid, "1e5");
     assert.equal(vecJrnEdgeOut.actor.user.uid_numeric, undefined);
     assert.equal(vecJrnEdgeOut.actor.process, undefined);
@@ -1059,15 +1067,21 @@ test("8. Live E2E wire conformance: Vector and Fluent Bit emit identical valid O
     assert.equal(vecOtlpOut.unmapped.span_id, "b7ad6b7169203331");
     assert.equal(vecOtlpOut.unmapped.attributes["order.id"], "ord-7");
 
-    const vecOtlpEdgeOut = vectorRecords.find((r) => r.log_name === "bsd-svc");
+    const vecOtlpEdgeOut = vectorRecords.find((r) => r.log_name === "bsd-svc" && r.message !== "sub-ms observed fallback");
     assert.ok(vecOtlpEdgeOut, "missing Vector edge OTLP output");
     assert.equal(vecOtlpEdgeOut.device.os, undefined, "unknown os.type must omit device.os");
     assert.equal(vecOtlpEdgeOut.metadata.correlation_uid, undefined, "all-zero trace_id must be omitted");
-    assert.equal(vecOtlpEdgeOut.time, 1736496005123, "must fall back to observed_timestamp when timeUnixNano=0");
+    assert.equal(vecOtlpEdgeOut.time, 1736496005122, "must fall back to truncated observed_timestamp when timeUnixNano=0");
+    assert.equal(vecOtlpEdgeOut.metadata.logged_time, 1736496005122);
     assert.equal(vecOtlpEdgeOut.actor.process.pid, 777);
     assert.equal(vecOtlpEdgeOut.actor.user.uid, "2002");
     assert.equal(vecOtlpEdgeOut.actor.user.uid_numeric, 2002);
     assert.equal(typeof vecOtlpEdgeOut.message, "string");
+
+    const vecOtlpSubMsOut = vectorRecords.find((r) => r.message === "sub-ms observed fallback");
+    assert.ok(vecOtlpSubMsOut, "missing Vector sub-ms observed fallback output");
+    assert.ok(vecOtlpSubMsOut.time >= 1700000000000, "sub-ms observed_timestamp must fall back to now()");
+    assert.ok(vecOtlpSubMsOut.metadata.logged_time >= 1700000000000);
 
     // --- Part B: Live Fluent Bit E2E (derived from real fluent-bit.conf + ocsf.lua -> loopback forward -> http) ---
     mockBasin.requests.length = 0;
@@ -1177,7 +1191,7 @@ test("8. Live E2E wire conformance: Vector and Fluent Bit emit identical valid O
       assert.ok(r.ok, `Fluent Bit OTLP /v1/logs rejected protobuf: ${r.status}`);
     }
 
-    await waitForCondition(() => mockBasin.records.length >= 5, 15000);
+    await waitForCondition(() => mockBasin.records.length >= 6, 15000);
     await terminateProcess(fbProc);
     assert.equal(/\[error\]/i.test(fbOutput), false, `Fluent Bit reported errors:\n${fbOutput}`);
 
@@ -1188,7 +1202,7 @@ test("8. Live E2E wire conformance: Vector and Fluent Bit emit identical valid O
     }
 
     const fbRecords = mockBasin.records.splice(0, mockBasin.records.length);
-    assert.equal(fbRecords.length, 5, `Expected exactly 5 Fluent Bit OCSF log records, got ${fbRecords.length}`);
+    assert.equal(fbRecords.length, 6, `Expected exactly 6 Fluent Bit OCSF log records, got ${fbRecords.length}`);
     for (const rec of fbRecords) {
       assert.equal(Object.hasOwn(rec, "date"), false, "Fluent Bit json_date_key=false must suppress 'date' key");
       assert.equal(Object.hasOwn(rec, "__internal__"), false, "Fluent Bit forward metadata stripping must suppress '__internal__' key");
@@ -1209,6 +1223,7 @@ test("8. Live E2E wire conformance: Vector and Fluent Bit emit identical valid O
     const fbJrnEdgeOut = fbRecords.find((r) => r.message === "edge record");
     assert.ok(fbJrnEdgeOut, "missing Fluent Bit edge journald output");
     assert.equal(fbJrnEdgeOut.severity_id, 0);
+    assert.equal(fbJrnEdgeOut.time, vecJrnEdgeOut.time);
     assert.equal(fbJrnEdgeOut.actor.user.uid, "1e5");
     assert.equal(fbJrnEdgeOut.actor.user.uid_numeric, undefined);
     assert.equal(fbJrnEdgeOut.actor.process, undefined);
@@ -1236,13 +1251,19 @@ test("8. Live E2E wire conformance: Vector and Fluent Bit emit identical valid O
     assert.deepEqual(fbOtlpOut.actor, vecOtlpOut.actor);
     assert.deepEqual(fbOtlpOut.unmapped, vecOtlpOut.unmapped);
 
-    const fbOtlpEdgeOut = fbRecords.find((r) => r.log_name === "bsd-svc");
+    const fbOtlpEdgeOut = fbRecords.find((r) => r.log_name === "bsd-svc" && r.message !== "sub-ms observed fallback");
     assert.ok(fbOtlpEdgeOut, "missing Fluent Bit edge OTLP output");
     assert.equal(fbOtlpEdgeOut.device.os, undefined, "unknown os.type must omit device.os");
     assert.equal(fbOtlpEdgeOut.metadata.correlation_uid, undefined, "all-zero binary trace_id must be omitted");
     assert.equal(fbOtlpEdgeOut.time, vecOtlpEdgeOut.time);
+    assert.equal(fbOtlpEdgeOut.metadata.logged_time, vecOtlpEdgeOut.metadata.logged_time);
     assert.deepEqual(fbOtlpEdgeOut.actor, vecOtlpEdgeOut.actor);
     assert.equal(typeof fbOtlpEdgeOut.message, "string");
+
+    const fbOtlpSubMsOut = fbRecords.find((r) => r.message === "sub-ms observed fallback");
+    assert.ok(fbOtlpSubMsOut, "missing Fluent Bit sub-ms observed fallback output");
+    assert.ok(fbOtlpSubMsOut.time >= 1700000000000, "sub-ms observed_timestamp must fall back to now()");
+    assert.ok(fbOtlpSubMsOut.metadata.logged_time >= 1700000000000);
   } finally {
     await terminateProcess(vectorProc);
     await terminateProcess(fbProc);
