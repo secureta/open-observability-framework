@@ -244,26 +244,28 @@ function parseLogRecords(text: string): Record<string, unknown>[] {
   }
 
   if (trimmed.startsWith("{")) {
+    let parsed: unknown;
     try {
-      const parsed = JSON.parse(trimmed) as unknown;
-      if (!isPlainObject(parsed)) {
-        throw new HttpError(400, "Payload must be a JSON object");
-      }
+      parsed = JSON.parse(trimmed);
+    } catch {
+      // Multiple JSON objects separated by newlines (NDJSON) fail single-doc JSON.parse.
+      return parseNdjsonRecords(trimmed);
+    }
+    if (!isPlainObject(parsed)) {
+      throw new HttpError(400, "Payload must be a JSON object");
+    }
+    try {
       const otlpRecords = unpackOtlpLogsPayload(parsed, MAX_BATCH_RECORDS);
       if (otlpRecords !== null) {
         return otlpRecords;
       }
-      return [parsed];
     } catch (err) {
-      if (err instanceof HttpError) {
-        throw err;
-      }
       if (err instanceof OtlpUnpackError) {
         throw new HttpError(err.status, err.message);
       }
-      // Multiple JSON objects separated by newlines (NDJSON) fail single-doc JSON.parse.
-      return parseNdjsonRecords(trimmed);
+      throw new HttpError(400, "Invalid OTLP logs payload");
     }
+    return [parsed];
   }
 
   throw new HttpError(400, "Payload must be JSON object, JSON array, or NDJSON");
