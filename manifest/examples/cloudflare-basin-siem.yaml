@@ -1,0 +1,42 @@
+version: "0.1"
+platform_name: cloudflare-basin-siem-apm
+
+collect:
+  adapter: vector-journald
+  sources:
+    - systemd-journald
+  options:
+    config_path: adapters/collect/vector-journald/vector.yaml
+    alternative_adapter: otel-collector-journald
+    alternative_config_path: adapters/collect/otel-collector-journald/otelcol.yaml
+
+detect:
+  placement: edge-ingest
+  engine: yara-wasm
+  rule_paths:
+    - rules/yara/linux_journal_core.yar
+
+ingest:
+  adapter: cloudflare-worker-basin
+  endpoint: /v1/logs
+  auth: bearer
+
+storage:
+  adapter: cloudflare-basin-iceberg
+  format: iceberg
+  catalog: basin-catalog
+  bucket: oof-telemetry
+  namespace: siem
+  tables:
+    logs_table: journal_logs
+    detections_table: yara_detections
+
+apm:
+  enabled: false
+  traces_adapter: otlp-basin-iceberg
+  metrics_adapter: otlp-prometheus-remote-write
+
+query:
+  adapters:
+    - basin-sql
+    - duckdb
