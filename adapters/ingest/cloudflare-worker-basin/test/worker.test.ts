@@ -1188,6 +1188,109 @@ rule SSHD_Brute_Force : auth {
     expect(JSON.parse(deepRec.attributes_json!).details).toEqual(deepNode);
   });
 
+  it("bounds walker allocations on multi-million-element embedded arrays and scans object-map keys", async () => {
+    const { handler, env, sentBatches } = makeTestHarness();
+
+    // Finding 1: 2,000,000-element embedded array must stay strictly bounded and produce a valid record
+    const massivePadding = Array(2_000_000).fill(0);
+    const massiveRes = await handler.fetch(
+      new Request("https://ingest.example/v1/logs", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer test-secret-token-12345",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          MESSAGE: JSON.stringify({
+            message: "ok",
+            padding: massivePadding,
+            target: "/etc/shadow",
+          }),
+        }),
+      }),
+      env,
+    );
+    expect(massiveRes.status).toBe(202);
+    expect(await massiveRes.json()).toMatchObject({ accepted: 1 });
+    const massiveRec = sentBatches[0]![0]!;
+    assertMatchesBasinSchema(massiveRec);
+    expect(massiveRec.message).toBe("ok");
+    expect(massiveRec.attributes_json).toBe('{"truncated":true}');
+
+    // Array < 64 KiB with 9,000 entries must still walk past padding to scan trailing target
+    const underBudgetRes = await handler.fetch(
+      new Request("https://ingest.example/v1/logs", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer test-secret-token-12345",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          MESSAGE: JSON.stringify({
+            message: "ok",
+            padding: Array(9_000).fill("AAAA"),
+            target: "/etc/shadow",
+          }),
+        }),
+      }),
+      env,
+    );
+    expect(underBudgetRes.status).toBe(202);
+    expect(await underBudgetRes.json()).toEqual({ accepted: 1, matched: 1 });
+    const underBudgetRec = sentBatches[1]![0]!;
+    assertMatchesBasinSchema(underBudgetRec);
+    expect(underBudgetRec.yara_rules).toContain("Linux_Credential_Access_Attempt");
+
+    // Finding 2: object-map keys (in MESSAGE, embedded attributes_json, empty object values, and null values) are scanned
+    const objectMapPayloads = [
+      {
+        message: "read succeeded",
+        files: { "/etc/shadow": { operation: "read" } },
+      },
+      {
+        message: "read succeeded",
+        attributes_json: JSON.stringify({
+          files: { "/etc/shadow": { operation: "read" } },
+        }),
+      },
+      {
+        message: "read succeeded",
+        files: { "/etc/shadow": {} },
+      },
+      {
+        message: "read succeeded",
+        "/etc/shadow": null,
+      },
+    ];
+
+    for (let i = 0; i < objectMapPayloads.length; i++) {
+      const res = await handler.fetch(
+        new Request("https://ingest.example/v1/logs", {
+          method: "POST",
+          headers: {
+            authorization: "Bearer test-secret-token-12345",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            MESSAGE: JSON.stringify(objectMapPayloads[i]),
+          }),
+        }),
+        env,
+      );
+      expect(res.status).toBe(202);
+      expect(await res.json()).toEqual({ accepted: 1, matched: 1 });
+      const rec = sentBatches[2 + i]![0]!;
+      assertMatchesBasinSchema(rec);
+      expect(rec.message).toBe("read succeeded");
+      expect(rec.yara_rules).toContain("Linux_Credential_Access_Attempt");
+      if (i === 0) {
+        expect(JSON.parse(rec.attributes_json!).files).toEqual({
+          "/etc/shadow": { operation: "read" },
+        });
+      }
+    }
+  });
+
   it("maintains bounded WASM heap across 500 repeated scans including empty and oversized payloads", () => {
     const detector = new WasmYaraDetector(wasmModule, workerRuleSource);
     const symbols = {
