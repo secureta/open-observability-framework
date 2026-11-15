@@ -801,7 +801,38 @@ test("7. Fluent Bit config and OTel Collector bridge enforce safety/wire invaria
   const otelConf = fs.readFileSync(OTELCOL_CONF_PATH, "utf8");
   assert.match(otelConf, /encoding:\s*proto/);
   assert.match(otelConf, /OOF_OTLP_BRIDGE_ENDPOINT:-http:\/\/127\.0\.0\.1:4320/);
+  assert.match(otelConf, /OOF_OTLP_GRPC_LISTEN=127\.0\.0\.1:4319/);
+  assert.match(otelConf, /OOF_OTLP_HTTP_LISTEN=127\.0\.0\.1:4320/);
   assert.ok(!/^\s+journald:/m.test(otelConf), "otelcol.yaml journald receiver must be commented out by default");
+
+  const skillDoc = fs.readFileSync(path.join(REPO_ROOT, "skills/setup-cloudflare-basin-iceberg/SKILL.md"), "utf8");
+  assert.match(skillDoc, /OOF_OTLP_GRPC_LISTEN=127\.0\.0\.1:4319/);
+  assert.match(skillDoc, /OOF_OTLP_HTTP_LISTEN=127\.0\.0\.1:4320/);
+
+  const vecConfText = fs.readFileSync(VECTOR_CONFIG_PATH, "utf8");
+  assert.match(vecConfText, /OOF_OTLP_GRPC_LISTEN.*127\.0\.0\.1:4319/);
+  assert.match(vecConfText, /OOF_OTLP_HTTP_LISTEN.*127\.0\.0\.1:4320/);
+
+  const vecBin = requireBinary("vector");
+  const tmpCoLocDir = fs.mkdtempSync(path.join(os.tmpdir(), "oof-vec-coloc-"));
+  try {
+    const vecColocVal = spawnSync(vecBin, ["validate", "--no-environment", VECTOR_CONFIG_PATH], {
+      cwd: REPO_ROOT,
+      env: {
+        ...process.env,
+        VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION: "true",
+        OOF_VECTOR_DATA_DIR: tmpCoLocDir,
+        OOF_BASIN_ENDPOINT: "https://example-stream.ingest.cloudflare.com",
+        OOF_INGEST_TOKEN: "dummy-basin-token",
+        OOF_OTLP_GRPC_LISTEN: "127.0.0.1:4319",
+        OOF_OTLP_HTTP_LISTEN: "127.0.0.1:4320",
+      },
+      encoding: "utf8",
+    });
+    assert.equal(vecColocVal.status, 0, `${vecColocVal.stdout}\n${vecColocVal.stderr}`);
+  } finally {
+    fs.rmSync(tmpCoLocDir, { recursive: true, force: true });
+  }
 });
 
 test("8. Live E2E wire conformance: Vector and Fluent Bit emit identical valid OCSF v1.3.0 batches", async () => {
@@ -907,8 +938,22 @@ test("8. Live E2E wire conformance: Vector and Fluent Bit emit identical valid O
       _SOURCE_REALTIME_TIMESTAMP: "1731676801000000",
     };
 
+    const jrnFallback = {
+      MESSAGE: "fallback check",
+      PRIORITY: "03",
+      _HOSTNAME: "host-fb",
+      TRACE_ID: "",
+      OTEL_TRACE_ID: "0af7651916cd43dd8448eb211c80319c",
+      SPAN_ID: "0000000000000000",
+      OTEL_SPAN_ID: "b7ad6b7169203331",
+      _PID: "invalid",
+      SYSLOG_PID: "4242",
+      _SOURCE_REALTIME_TIMESTAMP: "999999999999999999",
+      __REALTIME_TIMESTAMP: "253402300799999999",
+    };
+
     // Send journald records to Vector
-    for (const payload of [jrnNormal, jrnEdge]) {
+    for (const payload of [jrnNormal, jrnEdge, jrnFallback]) {
       const r = await fetch(`http://127.0.0.1:${vecJrnPort}/`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -941,7 +986,7 @@ test("8. Live E2E wire conformance: Vector and Fluent Bit emit identical valid O
     });
 
     const otlpEdgePayload = encodeOtlpLogsRequest({
-      resourceAttrs: { "service.name": "bsd-svc", "os.type": "freebsd" },
+      resourceAttrs: { "service.name": "bsd-svc", "os.type": "freebsd", "process.pid": "bad" },
       scopeName: "",
       logRecords: [
         {
@@ -949,6 +994,7 @@ test("8. Live E2E wire conformance: Vector and Fluent Bit emit identical valid O
           observedTimeUnixNano: 1736496005123000000n,
           severityNumber: 0,
           body: { event: "structured", ok: true },
+          attributes: { "process.pid": 777, "user.id": "", "enduser.id": "2002" },
           traceIdHex: "00000000000000000000000000000000",
           spanIdHex: "0000000000000000",
         },
@@ -964,11 +1010,12 @@ test("8. Live E2E wire conformance: Vector and Fluent Bit emit identical valid O
       assert.ok(r.ok, `Vector OTLP /v1/logs rejected protobuf: ${r.status}`);
     }
 
-    await waitForCondition(() => mockBasin.records.length >= 4, 15000);
+    await waitForCondition(() => mockBasin.records.length >= 5, 15000);
     await terminateProcess(vectorProc);
     assert.equal(vecStderr.includes("ERROR "), false, `Vector stderr errors:\n${vecStderr}`);
 
     const vectorRecords = mockBasin.records.splice(0, mockBasin.records.length);
+    assert.equal(vectorRecords.length, 5, `Expected 5 Vector OCSF records, got ${vectorRecords.length}`);
     for (const rec of vectorRecords) {
       assertConformsToOcsfContract(rec, basinSchema);
     }
@@ -992,6 +1039,17 @@ test("8. Live E2E wire conformance: Vector and Fluent Bit emit identical valid O
     assert.equal(vecJrnEdgeOut.actor.process, undefined);
     assert.equal(vecJrnEdgeOut.unmapped, undefined);
 
+    const vecJrnFallbackOut = vectorRecords.find((r) => r.message === "fallback check");
+    assert.ok(vecJrnFallbackOut, "missing Vector fallback journald output");
+    assert.equal(vecJrnFallbackOut.severity_id, 0);
+    assert.equal(vecJrnFallbackOut.severity, "Unknown");
+    assert.equal(vecJrnFallbackOut.metadata.log_level, "03");
+    assert.equal(vecJrnFallbackOut.metadata.correlation_uid, "0af7651916cd43dd8448eb211c80319c");
+    assert.equal(vecJrnFallbackOut.unmapped.span_id, "b7ad6b7169203331");
+    assert.equal(vecJrnFallbackOut.actor.process.pid, 4242);
+    assert.equal(vecJrnFallbackOut.time, 253402300799999);
+    assert.equal(vecJrnFallbackOut.time_dt, "9999-12-31T23:59:59.999Z");
+
     const vecOtlpOut = vectorRecords.find((r) => r.message === "card charge timeout");
     assert.ok(vecOtlpOut, "missing Vector normal OTLP output");
     assert.equal(vecOtlpOut.severity_id, 4);
@@ -1006,6 +1064,9 @@ test("8. Live E2E wire conformance: Vector and Fluent Bit emit identical valid O
     assert.equal(vecOtlpEdgeOut.device.os, undefined, "unknown os.type must omit device.os");
     assert.equal(vecOtlpEdgeOut.metadata.correlation_uid, undefined, "all-zero trace_id must be omitted");
     assert.equal(vecOtlpEdgeOut.time, 1736496005123, "must fall back to observed_timestamp when timeUnixNano=0");
+    assert.equal(vecOtlpEdgeOut.actor.process.pid, 777);
+    assert.equal(vecOtlpEdgeOut.actor.user.uid, "2002");
+    assert.equal(vecOtlpEdgeOut.actor.user.uid_numeric, 2002);
     assert.equal(typeof vecOtlpEdgeOut.message, "string");
 
     // --- Part B: Live Fluent Bit E2E (derived from real fluent-bit.conf + ocsf.lua -> loopback forward -> http) ---
@@ -1098,7 +1159,7 @@ test("8. Live E2E wire conformance: Vector and Fluent Bit emit identical valid O
     });
     assert.ok(fbTracesRes.ok, `Fluent Bit OTLP /v1/traces unexpected status: ${fbTracesRes.status}`);
 
-    for (const payload of [jrnNormal, jrnEdge]) {
+    for (const payload of [jrnNormal, jrnEdge, jrnFallback]) {
       const r = await fetch(`http://127.0.0.1:${fbJrnPort}/`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -1116,7 +1177,7 @@ test("8. Live E2E wire conformance: Vector and Fluent Bit emit identical valid O
       assert.ok(r.ok, `Fluent Bit OTLP /v1/logs rejected protobuf: ${r.status}`);
     }
 
-    await waitForCondition(() => mockBasin.records.length >= 4, 15000);
+    await waitForCondition(() => mockBasin.records.length >= 5, 15000);
     await terminateProcess(fbProc);
     assert.equal(/\[error\]/i.test(fbOutput), false, `Fluent Bit reported errors:\n${fbOutput}`);
 
@@ -1127,7 +1188,7 @@ test("8. Live E2E wire conformance: Vector and Fluent Bit emit identical valid O
     }
 
     const fbRecords = mockBasin.records.splice(0, mockBasin.records.length);
-    assert.equal(fbRecords.length, 4, `Expected exactly 4 Fluent Bit OCSF log records, got ${fbRecords.length}`);
+    assert.equal(fbRecords.length, 5, `Expected exactly 5 Fluent Bit OCSF log records, got ${fbRecords.length}`);
     for (const rec of fbRecords) {
       assert.equal(Object.hasOwn(rec, "date"), false, "Fluent Bit json_date_key=false must suppress 'date' key");
       assert.equal(Object.hasOwn(rec, "__internal__"), false, "Fluent Bit forward metadata stripping must suppress '__internal__' key");
@@ -1153,6 +1214,17 @@ test("8. Live E2E wire conformance: Vector and Fluent Bit emit identical valid O
     assert.equal(fbJrnEdgeOut.actor.process, undefined);
     assert.equal(fbJrnEdgeOut.unmapped, undefined, "empty unmapped must be omitted, never []");
 
+    const fbJrnFallbackOut = fbRecords.find((r) => r.message === "fallback check");
+    assert.ok(fbJrnFallbackOut, "missing Fluent Bit fallback journald output");
+    assert.equal(fbJrnFallbackOut.severity_id, vecJrnFallbackOut.severity_id);
+    assert.equal(fbJrnFallbackOut.severity, vecJrnFallbackOut.severity);
+    assert.equal(fbJrnFallbackOut.time, vecJrnFallbackOut.time);
+    assert.equal(fbJrnFallbackOut.time_dt, vecJrnFallbackOut.time_dt);
+    assert.equal(fbJrnFallbackOut.metadata.log_level, vecJrnFallbackOut.metadata.log_level);
+    assert.equal(fbJrnFallbackOut.metadata.correlation_uid, vecJrnFallbackOut.metadata.correlation_uid);
+    assert.deepEqual(fbJrnFallbackOut.actor, vecJrnFallbackOut.actor);
+    assert.deepEqual(fbJrnFallbackOut.unmapped, vecJrnFallbackOut.unmapped);
+
     const fbOtlpOut = fbRecords.find((r) => r.message === "card charge timeout");
     assert.ok(fbOtlpOut, "missing Fluent Bit normal OTLP output");
     assert.equal(fbOtlpOut.severity_id, vecOtlpOut.severity_id);
@@ -1169,6 +1241,7 @@ test("8. Live E2E wire conformance: Vector and Fluent Bit emit identical valid O
     assert.equal(fbOtlpEdgeOut.device.os, undefined, "unknown os.type must omit device.os");
     assert.equal(fbOtlpEdgeOut.metadata.correlation_uid, undefined, "all-zero binary trace_id must be omitted");
     assert.equal(fbOtlpEdgeOut.time, vecOtlpEdgeOut.time);
+    assert.deepEqual(fbOtlpEdgeOut.actor, vecOtlpEdgeOut.actor);
     assert.equal(typeof fbOtlpEdgeOut.message, "string");
   } finally {
     await terminateProcess(vectorProc);

@@ -8,7 +8,7 @@
 # Anti-loop & port-isolation note:
 #   Default exporter endpoint is `http://127.0.0.1:4320` (distinct from this collector's
 #   `4317`/`4318` receiver ports so running `otelcol` locally never self-loops).
-#   - Co-located on same host as Vector: run Vector with `OOF_OTLP_HTTP_LISTEN=127.0.0.1:4320`.
+#   - Co-located on same host as Vector: run Vector with `OOF_OTLP_GRPC_LISTEN=127.0.0.1:4319` and `OOF_OTLP_HTTP_LISTEN=127.0.0.1:4320`.
 #   - Co-located on same host as Fluent Bit: set `opentelemetry` input `Port 4320`.
 #   - Forwarding to a central Vector/Fluent Bit gateway: set `OOF_OTLP_BRIDGE_ENDPOINT=http://ocsf-gateway.internal:4318`.
 #
