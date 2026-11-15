@@ -1,0 +1,166 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://open-observability-framework.dev/schemas/stack/v0.1.json",
+  "title": "Open Observability Framework Stack Manifest",
+  "description": "Declarative manifest binding interchangeable SIEM + APM service adapters across the 6 framework slots.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "platform_name",
+    "collect",
+    "detect",
+    "ingest",
+    "storage",
+    "apm",
+    "query"
+  ],
+  "properties": {
+    "version": {
+      "type": "string",
+      "const": "0.1"
+    },
+    "platform_name": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
+    },
+    "collect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["adapter", "sources"],
+      "properties": {
+        "adapter": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Collector service adapter (e.g. vector-journald, otel-collector-journald, fluent-bit)."
+        },
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "options": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
+    "detect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["placement", "engine", "rule_paths"],
+      "properties": {
+        "placement": {
+          "type": "string",
+          "enum": ["edge-ingest", "host-agent", "lakehouse-batch", "hybrid"]
+        },
+        "engine": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Detection engine identifier (e.g. yara-wasm, yara-x, kunai-yara)."
+        },
+        "rule_paths": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "ingest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["adapter", "auth"],
+      "properties": {
+        "adapter": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Ingestion gateway adapter (e.g. cloudflare-worker-basin, direct-basin-http)."
+        },
+        "endpoint": {
+          "type": "string",
+          "minLength": 1
+        },
+        "auth": {
+          "type": "string",
+          "enum": ["bearer", "mtls", "access"]
+        }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["adapter", "format", "namespace", "tables"],
+      "properties": {
+        "adapter": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Lakehouse/telemetry storage adapter (e.g. cloudflare-basin-iceberg)."
+        },
+        "format": {
+          "type": "string",
+          "enum": ["iceberg", "parquet"]
+        },
+        "catalog": {
+          "type": "string",
+          "minLength": 1
+        },
+        "bucket": {
+          "type": "string",
+          "minLength": 1
+        },
+        "namespace": {
+          "type": "string",
+          "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$"
+        },
+        "tables": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$"
+          }
+        }
+      }
+    },
+    "apm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "traces_adapter": {
+          "type": "string",
+          "minLength": 1
+        },
+        "metrics_adapter": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "query": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["adapters"],
+      "properties": {
+        "adapters": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,219 @@
+# Open Observability Framework - Vector systemd-journald Collector
+#
+# Collects host systemd-journald records, normalizes them into the 24-field
+# canonical OOF SIEM+APM envelope, and ships NDJSON batches over HTTPS to the
+# Cloudflare Worker ingest gateway.
+#
+# Required environment variables:
+#   OOF_INGEST_URL   (e.g. https://oof-ingest-worker.<subdomain>.workers.dev/v1/logs)
+#   OOF_INGEST_TOKEN (must match INGEST_AUTH_TOKEN secret on the Worker)
+
+sources:
+  systemd_journal:
+    type: journald
+    current_boot_only: false
+
+transforms:
+  normalize_journal:
+    type: remap
+    inputs:
+      - systemd_journal
+    source: |
+      observed_at = format_timestamp!(now(), "%+")
+
+      event_time = observed_at
+      if exists(.__REALTIME_TIMESTAMP) {
+        us, us_err = to_int(.__REALTIME_TIMESTAMP)
+        if us_err == null {
+          ts, ts_err = from_unix_timestamp(us, unit: "microseconds")
+          if ts_err == null {
+            event_time = format_timestamp!(ts, "%+")
+          }
+        }
+      } else if exists(.timestamp) {
+        if is_timestamp(.timestamp) {
+          event_time = format_timestamp!(.timestamp, "%+")
+        } else {
+          ts, ts_err = parse_timestamp(string(.timestamp) ?? "", "%+")
+          if ts_err == null {
+            event_time = format_timestamp!(ts, "%+")
+          }
+        }
+      }
+
+      raw_priority = if exists(.PRIORITY) && .PRIORITY != null { to_int(.PRIORITY) ?? 6 } else { 6 }
+      priority = if raw_priority < 0 { 0 } else if raw_priority > 7 { 7 } else { raw_priority }
+
+      severity = "INFO"
+      if priority == 0 { severity = "EMERG" }
+      if priority == 1 { severity = "ALERT" }
+      if priority == 2 { severity = "CRIT" }
+      if priority == 3 { severity = "ERR" }
+      if priority == 4 { severity = "WARN" }
+      if priority == 5 { severity = "NOTICE" }
+      if priority == 6 { severity = "INFO" }
+      if priority == 7 { severity = "DEBUG" }
+
+      systemd_unit = string(._SYSTEMD_UNIT) ?? null
+      if systemd_unit == "" { systemd_unit = null }
+
+      syslog_identifier = string(.SYSLOG_IDENTIFIER) ?? null
+      if syslog_identifier == "" { syslog_identifier = null }
+
+      transport = string(._TRANSPORT) ?? null
+      if transport == "" { transport = null }
+
+      comm = string(._COMM) ?? null
+      if comm == "" { comm = null }
+
+      exe = string(._EXE) ?? null
+      if exe == "" { exe = null }
+
+      cmdline = string(._CMDLINE) ?? null
+      if cmdline == "" { cmdline = null }
+
+      boot_id = string(._BOOT_ID) ?? null
+      if boot_id == "" { boot_id = null }
+
+      machine_id = string(._MACHINE_ID) ?? null
+      if machine_id == "" { machine_id = null }
+
+      pid = null
+      if exists(._PID) { pid = to_int(._PID) ?? null }
+
+      uid = null
+      if exists(._UID) { uid = to_int(._UID) ?? null }
+
+      host_candidate = string(._HOSTNAME) ?? ""
+      if host_candidate == "" { host_candidate = string(.host) ?? "" }
+      if host_candidate == "" { host_candidate = get_hostname() ?? "" }
+      host = if host_candidate != "" { host_candidate } else { "unknown" }
+
+      raw_msg = ""
+      if exists(.MESSAGE) && .MESSAGE != null {
+        raw_msg = if is_string(.MESSAGE) { string!(.MESSAGE) } else { encode_json(.MESSAGE) }
+      } else if exists(.message) && .message != null {
+        raw_msg = if is_string(.message) { string!(.message) } else { encode_json(.message) }
+      }
+
+      trace_id = string(.TRACE_ID) ?? null
+      if trace_id == "" { trace_id = null }
+      if trace_id == null {
+        trace_id = string(.OTEL_TRACE_ID) ?? null
+        if trace_id == "" { trace_id = null }
+      }
+
+      span_id = string(.SPAN_ID) ?? null
+      if span_id == "" { span_id = null }
+      if span_id == null {
+        span_id = string(.OTEL_SPAN_ID) ?? null
+        if span_id == "" { span_id = null }
+      }
+
+      service_name = "unknown"
+      if systemd_unit != null {
+        service_name = systemd_unit
+      } else if syslog_identifier != null {
+        service_name = syslog_identifier
+      } else if comm != null {
+        service_name = comm
+      }
+
+      yara_matched = false
+      yara_rules = []
+      yara_tags = []
+      message = raw_msg
+      extra_attrs = {}
+
+      # Support structured JSON logs emitted by host-side YARA-X / Kunai / APM apps.
+      if starts_with(raw_msg, "{") {
+        parsed, parse_err = parse_json(raw_msg)
+        if parse_err == null && is_object(parsed) {
+          if exists(parsed.service_name) && is_string(parsed.service_name) && string!(parsed.service_name) != "" {
+            service_name = string!(parsed.service_name)
+          }
+          if exists(parsed.trace_id) && is_string(parsed.trace_id) && string!(parsed.trace_id) != "" {
+            trace_id = string!(parsed.trace_id)
+          }
+          if exists(parsed.span_id) && is_string(parsed.span_id) && string!(parsed.span_id) != "" {
+            span_id = string!(parsed.span_id)
+          }
+          if exists(parsed.yara_rules) && is_array(parsed.yara_rules) {
+            yara_rules = filter(array!(parsed.yara_rules)) -> |_idx, v| { is_string(v) }
+            yara_matched = length(yara_rules) > 0
+          }
+          if exists(parsed.yara_tags) && is_array(parsed.yara_tags) {
+            yara_tags = filter(array!(parsed.yara_tags)) -> |_idx, v| { is_string(v) }
+          }
+          if exists(parsed.message) && is_string(parsed.message) {
+            message = string!(parsed.message)
+          }
+          if exists(parsed.attributes_json) && is_string(parsed.attributes_json) {
+            extra_attrs.upstream_attributes = string!(parsed.attributes_json)
+          }
+        }
+      }
+
+      event_id = uuid_v4()
+      if exists(.__CURSOR) {
+        cursor_str = string(.__CURSOR) ?? ""
+        if cursor_str != "" {
+          event_id = cursor_str
+        }
+      }
+
+      attrs_json = null
+      if length(extra_attrs) > 0 {
+        attrs_json = encode_json(extra_attrs)
+      }
+
+      . = {
+        "event_id": event_id,
+        "observed_at": observed_at,
+        "event_time": event_time,
+        "host": host,
+        "service_name": service_name,
+        "systemd_unit": systemd_unit,
+        "syslog_identifier": syslog_identifier,
+        "transport": transport,
+        "priority": priority,
+        "severity": severity,
+        "pid": pid,
+        "uid": uid,
+        "comm": comm,
+        "exe": exe,
+        "cmdline": cmdline,
+        "boot_id": boot_id,
+        "machine_id": machine_id,
+        "message": message,
+        "trace_id": trace_id,
+        "span_id": span_id,
+        "yara_matched": yara_matched,
+        "yara_rules": yara_rules,
+        "yara_tags": yara_tags,
+        "attributes_json": attrs_json
+      }
+
+sinks:
+  cloudflare_ingest:
+    type: http
+    inputs:
+      - normalize_journal
+    uri: "${OOF_INGEST_URL}"
+    method: post
+    compression: gzip
+    encoding:
+      codec: json
+    framing:
+      method: newline_delimited
+    auth:
+      strategy: bearer
+      token: "${OOF_INGEST_TOKEN}"
+    batch:
+      max_events: 250
+      max_bytes: 524288
+      timeout_secs: 2
+    request:
+      retry_attempts: 5
+      retry_initial_backoff_secs: 1
+      retry_max_duration_secs: 30

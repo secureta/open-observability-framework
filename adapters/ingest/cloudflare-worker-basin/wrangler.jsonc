@@ -1,0 +1,24 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "oof-ingest-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  "rules": [
+    {
+      "type": "CompiledWasm",
+      "globs": ["**/*.wasm"],
+      "fallthrough": true
+    },
+    {
+      "type": "Text",
+      "globs": ["**/*.yar"],
+      "fallthrough": true
+    }
+  ],
+  "pipelines": [
+    {
+      "binding": "TELEMETRY_STREAM",
+      "stream": "journal_stream"
+    }
+  ]
+}

@@ -1,0 +1,83 @@
+# Open Observability Framework - OpenTelemetry Collector (SIEM + APM Reference)
+#
+# Alternative collector adapter when unifying systemd-journald SIEM logs with
+# OTLP application traces and metrics under a single host agent.
+#
+# Required environment variables:
+#   OOF_INGEST_URL   (e.g. https://oof-ingest-worker.<subdomain>.workers.dev/v1/logs)
+#   OOF_INGEST_TOKEN (must match INGEST_AUTH_TOKEN secret on the Worker)
+# Optional APM endpoints (enable in pipelines when apm.enabled = true):
+#   OOF_TRACES_URL   (e.g. https://<otlp-traces-endpoint>)
+#   OOF_METRICS_URL  (e.g. https://<prometheus-remote-write-or-otlp-endpoint>)
+
+receivers:
+  journald:
+    directory: /var/log/journal
+    operators:
+      - type: move
+        from: body._HOSTNAME
+        to: resource["host.name"]
+        if: 'body._HOSTNAME != nil'
+      - type: move
+        from: body._SYSTEMD_UNIT
+        to: attributes["systemd.unit"]
+        if: 'body._SYSTEMD_UNIT != nil'
+      - type: move
+        from: body.SYSLOG_IDENTIFIER
+        to: attributes["syslog.identifier"]
+        if: 'body.SYSLOG_IDENTIFIER != nil'
+      - type: move
+        from: body._CMDLINE
+        to: attributes["process.command_line"]
+        if: 'body._CMDLINE != nil'
+      - type: move
+        from: body._EXE
+        to: attributes["process.executable.path"]
+        if: 'body._EXE != nil'
+
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 127.0.0.1:4317
+      http:
+        endpoint: 127.0.0.1:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+    spike_limit_mib: 64
+  resourcedetection:
+    detectors: [env, system]
+    timeout: 2s
+  batch:
+    send_batch_size: 256
+    timeout: 2s
+
+exporters:
+  otlphttp/oof_logs:
+    logs_endpoint: "${env:OOF_INGEST_URL}"
+    compression: gzip
+    headers:
+      Authorization: "Bearer ${env:OOF_INGEST_TOKEN}"
+
+  # Future APM extension exporters:
+  # otlphttp/apm_traces:
+  #   traces_endpoint: "${env:OOF_TRACES_URL}"
+  # otlphttp/apm_metrics:
+  #   metrics_endpoint: "${env:OOF_METRICS_URL}"
+
+service:
+  pipelines:
+    logs:
+      receivers: [journald, otlp]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters: [otlphttp/oof_logs]
+    # traces:
+    #   receivers: [otlp]
+    #   processors: [memory_limiter, resourcedetection, batch]
+    #   exporters: [otlphttp/apm_traces]
+    # metrics:
+    #   receivers: [otlp]
+    #   processors: [memory_limiter, resourcedetection, batch]
+    #   exporters: [otlphttp/apm_metrics]
