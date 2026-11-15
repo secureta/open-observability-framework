@@ -668,7 +668,6 @@ rule SSHD_Brute_Force : auth {
       "cat /etc/shadow",
       123,
       ["x"],
-      { unknownField: "x" },
       { stringValue: "a", intValue: 1 },
       { stringValue: { toString: 123 } },
       { boolValue: "yes" },
@@ -1072,6 +1071,121 @@ rule SSHD_Brute_Force : auth {
     });
     expect(records[2]!.message).toBe("");
     expect(records[3]!.message).toBe("NaN");
+  });
+
+  it("reclaims unused scan quota across short message + long cmdline, ignores unknown OTLP fields, and scans deep embedded JSON", async () => {
+    const { handler, env, sentBatches } = makeTestHarness();
+
+    // Finding A: short message + 40 KiB cmdline still fits within 64 KiB budget
+    const longCmdline = `${"A".repeat(40960)} /etc/shadow`;
+    const quotaRes = await handler.fetch(
+      new Request("https://ingest.example/v1/logs", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer test-secret-token-12345",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          message: "ok",
+          cmdline: longCmdline,
+        }),
+      }),
+      env,
+    );
+    expect(quotaRes.status).toBe(202);
+    expect(await quotaRes.json()).toEqual({ accepted: 1, matched: 1 });
+    assertMatchesBasinSchema(sentBatches[0]![0]!);
+    expect(sentBatches[0]![0]!.yara_rules).toContain("Linux_Credential_Access_Attempt");
+
+    // Finding B: ignore unknown extension fields across OTLP AnyValue, KeyValue, ArrayValue, and KeyValueList
+    const otlpRes = await handler.fetch(
+      new Request("https://ingest.example/v1/logs", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer test-secret-token-12345",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          resourceLogs: [
+            {
+              scopeLogs: [
+                {
+                  scope: { name: "otlp-forward-compat" },
+                  logRecords: [
+                    {
+                      body: { stringValue: "normal", futureField: 123 },
+                      attributes: [
+                        { key: "custom.k", value: { stringValue: "v" }, futureMeta: true },
+                      ],
+                    },
+                    {
+                      body: { futureField: 123 },
+                    },
+                    {
+                      body: {
+                        arrayValue: {
+                          values: [{ stringValue: "arr-item", futureElem: 1 }],
+                          futureArrayMeta: true,
+                        },
+                      },
+                    },
+                    {
+                      body: {
+                        kvlistValue: {
+                          values: [{ key: "message", value: { stringValue: "kv-ok" } }],
+                          futureKvMeta: true,
+                        },
+                      },
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        }),
+      }),
+      env,
+    );
+    expect(otlpRes.status).toBe(202);
+    expect(await otlpRes.json()).toEqual({ accepted: 4, matched: 0 });
+    const otlpRecords = sentBatches[1]!;
+    for (const rec of otlpRecords) {
+      assertMatchesBasinSchema(rec);
+    }
+    expect(otlpRecords[0]!.message).toBe("normal");
+    expect(JSON.parse(otlpRecords[0]!.attributes_json!)).toMatchObject({ "custom.k": "v" });
+    expect(otlpRecords[1]!.message).toBe("");
+    expect(otlpRecords[2]!.message).toBe('["arr-item"]');
+    expect(otlpRecords[3]!.message).toBe("kv-ok");
+
+    // Finding C: deep nested object (12+ levels) inside embedded MESSAGE JSON is still scanned and stored
+    let deepNode: Record<string, unknown> = { target: "/etc/shadow" };
+    for (let level = 12; level >= 1; level--) {
+      deepNode = { [`level${level}`]: deepNode };
+    }
+    const deepRes = await handler.fetch(
+      new Request("https://ingest.example/v1/logs", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer test-secret-token-12345",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          MESSAGE: JSON.stringify({
+            message: "read succeeded",
+            details: deepNode,
+          }),
+        }),
+      }),
+      env,
+    );
+    expect(deepRes.status).toBe(202);
+    expect(await deepRes.json()).toEqual({ accepted: 1, matched: 1 });
+    const deepRec = sentBatches[2]![0]!;
+    assertMatchesBasinSchema(deepRec);
+    expect(deepRec.message).toBe("read succeeded");
+    expect(deepRec.yara_rules).toContain("Linux_Credential_Access_Attempt");
+    expect(JSON.parse(deepRec.attributes_json!).details).toEqual(deepNode);
   });
 
   it("maintains bounded WASM heap across 500 repeated scans including empty and oversized payloads", () => {

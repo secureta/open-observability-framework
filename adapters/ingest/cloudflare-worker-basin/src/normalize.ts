@@ -355,21 +355,34 @@ function buildScanBuffer(
     fields.systemd_unit,
   ].filter((part): part is string => part !== null && part.length > 0);
 
-  let canonicalBytes: Uint8Array = new Uint8Array(0);
-  if (canonicalParts.length > 0) {
-    const prefix = messageBytes.length > 0 ? "\n" : "";
-    const encodedCanonical = textEncoder.encode(`${prefix}${canonicalParts.join("\n")}`);
-    const canonicalCap =
-      messageBytes.length > 0 ? Math.floor(MAX_SCAN_BYTES / 2) : MAX_SCAN_BYTES;
-    canonicalBytes =
-      encodedCanonical.length > canonicalCap
-        ? encodedCanonical.subarray(0, canonicalCap)
-        : encodedCanonical;
+  const rawCanonicalBytes =
+    canonicalParts.length > 0
+      ? textEncoder.encode(`${messageBytes.length > 0 ? "\n" : ""}${canonicalParts.join("\n")}`)
+      : new Uint8Array(0);
+
+  const half = Math.floor(MAX_SCAN_BYTES / 2);
+  let msgTake: number;
+  let canTake: number;
+  if (messageBytes.length + rawCanonicalBytes.length <= MAX_SCAN_BYTES) {
+    msgTake = messageBytes.length;
+    canTake = rawCanonicalBytes.length;
+  } else if (messageBytes.length <= half) {
+    msgTake = messageBytes.length;
+    canTake = MAX_SCAN_BYTES - msgTake;
+  } else if (rawCanonicalBytes.length <= half) {
+    canTake = rawCanonicalBytes.length;
+    msgTake = MAX_SCAN_BYTES - canTake;
+  } else {
+    msgTake = half;
+    canTake = MAX_SCAN_BYTES - half;
   }
 
-  const msgCap = Math.max(0, MAX_SCAN_BYTES - canonicalBytes.length);
   const slicedMsg =
-    messageBytes.length > msgCap ? messageBytes.subarray(0, msgCap) : messageBytes;
+    messageBytes.length > msgTake ? messageBytes.subarray(0, msgTake) : messageBytes;
+  const canonicalBytes =
+    rawCanonicalBytes.length > canTake
+      ? rawCanonicalBytes.subarray(0, canTake)
+      : rawCanonicalBytes;
 
   let remainingForExtra = Math.max(0, MAX_SCAN_BYTES - (slicedMsg.length + canonicalBytes.length));
   const extraChunks: Uint8Array[] = [];
@@ -499,21 +512,6 @@ function decodeBase64Bytes(encoded: string): number[] | null {
   }
 }
 
-const OTLP_KEYVALUE_KEYS = new Set(["key", "value"]);
-const OTLP_VALUES_CONTAINER_KEYS = new Set(["values"]);
-
-function assertKnownOtlpKeys(
-  record: Record<string, unknown>,
-  allowed: ReadonlySet<string>,
-  label: string,
-): void {
-  for (const key of Object.keys(record)) {
-    if (!allowed.has(key)) {
-      throw new OtlpUnpackError(400, `Unknown OTLP ${label} field: ${key}`);
-    }
-  }
-}
-
 function decodeOtlpAttributes(rawAttrs: unknown): Record<string, unknown> {
   const out = Object.create(null) as Record<string, unknown>;
   if (rawAttrs === undefined || rawAttrs === null) {
@@ -526,7 +524,6 @@ function decodeOtlpAttributes(rawAttrs: unknown): Record<string, unknown> {
     if (!isPlainObject(entry)) {
       throw new OtlpUnpackError(400, "OTLP attribute entry must be an object");
     }
-    assertKnownOtlpKeys(entry, OTLP_KEYVALUE_KEYS, "KeyValue");
     const key = ownProp(entry, "key");
     if (typeof key !== "string" || key.length === 0) {
       throw new OtlpUnpackError(400, "OTLP attribute entry requires a non-empty string key");
@@ -548,7 +545,7 @@ function decodeOtlpAnyValue(rawValue: unknown): unknown {
   let setFieldCount = 0;
   for (const key of Object.keys(rawValue)) {
     if (!OTLP_ANYVALUE_KEYS.has(key)) {
-      throw new OtlpUnpackError(400, `Unknown OTLP AnyValue field: ${key}`);
+      continue;
     }
     const val = rawValue[key];
     if (val !== undefined && val !== null) {
@@ -637,7 +634,6 @@ function decodeOtlpAnyValue(rawValue: unknown): unknown {
     if (!isPlainObject(arrayVal)) {
       throw new OtlpUnpackError(400, "Invalid OTLP arrayValue");
     }
-    assertKnownOtlpKeys(arrayVal, OTLP_VALUES_CONTAINER_KEYS, "ArrayValue");
     const values = ownProp(arrayVal, "values");
     if (values === undefined || values === null) {
       return [];
@@ -652,7 +648,6 @@ function decodeOtlpAnyValue(rawValue: unknown): unknown {
   if (!isPlainObject(kvlistVal)) {
     throw new OtlpUnpackError(400, "Invalid OTLP kvlistValue");
   }
-  assertKnownOtlpKeys(kvlistVal, OTLP_VALUES_CONTAINER_KEYS, "KeyValueList");
   return decodeOtlpAttributes(ownProp(kvlistVal, "values"));
 }
 
@@ -1194,42 +1189,69 @@ function pushUniqueStrings(target: string[], additions: readonly string[]): void
   }
 }
 
+const MAX_WALK_NODES = 8192;
+
+const YARA_META_SKIP_KEYS = new Set([
+  "yara_matched",
+  "yara_rules",
+  "yara.rules",
+  "yara_tags",
+  "yara.tags",
+]);
+
 function collectScanStrings(
-  value: unknown,
+  root: unknown,
   parts: string[],
   budget: { remaining: number },
-  depth: number = 0,
-  keyPrefix: string = "",
-): void {
-  if (depth > 8 || budget.remaining <= 0 || value === null || value === undefined) {
-    return;
-  }
-  if (typeof value === "string") {
-    if (value.length === 0) return;
-    const fragment = keyPrefix.length > 0 ? `${keyPrefix}=${value}` : value;
-    parts.push(fragment);
-    budget.remaining -= textEncoder.encode(fragment).length + 1;
-    return;
-  }
-  if (typeof value === "number" || typeof value === "boolean") {
-    const fragment = keyPrefix.length > 0 ? `${keyPrefix}=${String(value)}` : String(value);
-    parts.push(fragment);
-    budget.remaining -= textEncoder.encode(fragment).length + 1;
-    return;
-  }
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      if (budget.remaining <= 0) break;
-      collectScanStrings(item, parts, budget, depth + 1, keyPrefix);
+): boolean {
+  const stack: Array<{ value: unknown; keyPrefix: string }> = [
+    { value: root, keyPrefix: "" },
+  ];
+  let visitedNodes = 0;
+
+  while (stack.length > 0) {
+    if (budget.remaining <= 0) {
+      return false;
     }
-    return;
-  }
-  if (typeof value === "object") {
-    for (const [k, v] of Object.entries(value)) {
-      if (budget.remaining <= 0) break;
-      collectScanStrings(v, parts, budget, depth + 1, k);
+    if (visitedNodes >= MAX_WALK_NODES) {
+      return true;
+    }
+    const current = stack.pop()!;
+    visitedNodes++;
+    const { value, keyPrefix } = current;
+
+    if (value === null || value === undefined) {
+      continue;
+    }
+    if (typeof value === "string") {
+      if (value.length === 0) continue;
+      const fragment = keyPrefix.length > 0 ? `${keyPrefix}=${value}` : value;
+      parts.push(fragment);
+      budget.remaining -= textEncoder.encode(fragment).length + 1;
+      continue;
+    }
+    if (typeof value === "number" || typeof value === "boolean") {
+      const fragment = keyPrefix.length > 0 ? `${keyPrefix}=${String(value)}` : String(value);
+      parts.push(fragment);
+      budget.remaining -= textEncoder.encode(fragment).length + 1;
+      continue;
+    }
+    if (Array.isArray(value)) {
+      for (let i = value.length - 1; i >= 0; i--) {
+        stack.push({ value: value[i], keyPrefix });
+      }
+      continue;
+    }
+    if (typeof value === "object") {
+      const entries = Object.entries(value);
+      for (let i = entries.length - 1; i >= 0; i--) {
+        const [k, v] = entries[i]!;
+        stack.push({ value: v, keyPrefix: k });
+      }
     }
   }
+
+  return false;
 }
 
 function buildAttributesJson(
@@ -1383,26 +1405,50 @@ export function normalizeAndDetect(
   const embeddedScanParts: string[] = [];
   if (embedded !== null) {
     const budget = { remaining: MAX_SCAN_BYTES };
-    if (embeddedExtraAttrs) {
-      collectScanStrings(embeddedExtraAttrs, embeddedScanParts, budget);
-    }
-    if (embedded.messageField !== null) {
-      for (const extraVal of [
-        embedded.fields.comm,
-        embedded.fields.host,
-        embedded.fields.serviceName,
-        embedded.fields.transport,
-      ]) {
-        if (
-          extraVal !== null &&
-          extraVal.length > 0 &&
-          budget.remaining > 0 &&
-          !embeddedScanParts.includes(extraVal)
-        ) {
-          embeddedScanParts.push(extraVal);
-          budget.remaining -= textEncoder.encode(extraVal).length + 1;
+    const scanEmbeddedRecord = Object.create(null) as Record<string, unknown>;
+    for (const [key, value] of Object.entries(embedded.rawRecord)) {
+      if (value === undefined || value === null) continue;
+      if (YARA_META_SKIP_KEYS.has(key)) continue;
+      if (
+        (key === "message" || key === "MESSAGE") &&
+        embedded.messageField !== null &&
+        value === embedded.messageField.text
+      ) {
+        continue;
+      }
+      if ((key === "cmdline" || key === "_CMDLINE" || key === "process.command_line") && value === cmdline) {
+        continue;
+      }
+      if ((key === "exe" || key === "_EXE" || key === "process.executable.path") && value === exe) {
+        continue;
+      }
+      if ((key === "syslog_identifier" || key === "SYSLOG_IDENTIFIER" || key === "syslog.identifier") && value === syslog_identifier) {
+        continue;
+      }
+      if ((key === "systemd_unit" || key === "_SYSTEMD_UNIT" || key === "systemd.unit") && value === systemd_unit) {
+        continue;
+      }
+      if (
+        (key === "attributes_json" || key === "attributes.json") &&
+        typeof value === "string" &&
+        value.trimStart().startsWith("{")
+      ) {
+        try {
+          const parsedAttr = JSON.parse(value) as unknown;
+          if (isPlainObject(parsedAttr)) {
+            scanEmbeddedRecord[key] = parsedAttr;
+            continue;
+          }
+        } catch {
+          // Keep original string below when not valid JSON object.
         }
       }
+      scanEmbeddedRecord[key] = value;
+    }
+
+    const walkTruncated = collectScanStrings(scanEmbeddedRecord, embeddedScanParts, budget);
+    if (walkTruncated && budget.remaining > 0 && initialMsg.text.length > 0) {
+      embeddedScanParts.push(initialMsg.text);
     }
   }
 
