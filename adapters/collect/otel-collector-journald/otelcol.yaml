@@ -34,6 +34,34 @@ receivers:
         from: body._EXE
         to: attributes["process.executable.path"]
         if: 'body._EXE != nil'
+      - type: move
+        from: body._PID
+        to: attributes["process.pid"]
+        if: 'body._PID != nil'
+      - type: move
+        from: body._UID
+        to: attributes["user.id"]
+        if: 'body._UID != nil'
+      - type: move
+        from: body._COMM
+        to: attributes["process.command"]
+        if: 'body._COMM != nil'
+      - type: move
+        from: body._TRANSPORT
+        to: attributes["journald.transport"]
+        if: 'body._TRANSPORT != nil'
+      - type: move
+        from: body._BOOT_ID
+        to: resource["host.boot_id"]
+        if: 'body._BOOT_ID != nil'
+      - type: move
+        from: body._MACHINE_ID
+        to: resource["host.id"]
+        if: 'body._MACHINE_ID != nil'
+      - type: move
+        from: body.__CURSOR
+        to: attributes["event.id"]
+        if: 'body.__CURSOR != nil'
 
   otlp:
     protocols:
@@ -57,6 +85,7 @@ processors:
 exporters:
   otlphttp/oof_logs:
     logs_endpoint: "${env:OOF_INGEST_URL}"
+    encoding: json
     compression: gzip
     headers:
       Authorization: "Bearer ${env:OOF_INGEST_TOKEN}"

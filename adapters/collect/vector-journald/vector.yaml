@@ -7,6 +7,13 @@
 # Required environment variables:
 #   OOF_INGEST_URL   (e.g. https://oof-ingest-worker.<subdomain>.workers.dev/v1/logs)
 #   OOF_INGEST_TOKEN (must match INGEST_AUTH_TOKEN secret on the Worker)
+#
+# Vector >= 0.60 note:
+#   Because this template interpolates ${OOF_INGEST_URL} and ${OOF_INGEST_TOKEN},
+#   validate and run with `--dangerously-allow-env-var-interpolation` (or set
+#   `VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true`):
+#     vector validate --no-environment --dangerously-allow-env-var-interpolation adapters/collect/vector-journald/vector.yaml
+#     vector --dangerously-allow-env-var-interpolation --config adapters/collect/vector-journald/vector.yaml
 
 sources:
   systemd_journal:

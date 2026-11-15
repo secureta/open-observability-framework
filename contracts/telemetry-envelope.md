@@ -33,7 +33,7 @@ Keeping every adapter aligned to this contract ensures:
 | `message` | `string` | Yes | `MESSAGE` (string or byte array) | `body` | Empty string if absent; raw bytes scanned by YARA |
 | `trace_id` | `string` | No | `TRACE_ID` / `OTEL_TRACE_ID` | `trace_id` | 32-hex W3C Trace Context ID |
 | `span_id` | `string` | No | `SPAN_ID` / `OTEL_SPAN_ID` | `span_id` | 16-hex W3C Span ID |
-| `yara_matched` | `boolean` | Yes | `false` or host detector output | `false` | `true` when `yara_rules.length > 0` |
+| `yara_matched` | `bool` | Yes | `false` or host detector output | `false` | `true` when `yara_rules.length > 0` |
 | `yara_rules` | `list<string>` | Yes | Upstream host matches (`[]`) | `[]` | Deduplicated rule identifiers |
 | `yara_tags` | `list<string>` | Yes | Upstream host tags (`[]`) | `[]` | Deduplicated rule tags |
 | `attributes_json` | `string` | No | Extra fields + YARA match details | Remaining resource/log attributes | Bounded JSON string (`<= 16 KiB`) |

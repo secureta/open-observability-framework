@@ -120,6 +120,10 @@ export class WasmYaraDetector implements RuleDetector {
     }
   }
 
+  get heapByteLength(): number {
+    return this.exports.memory.buffer.byteLength;
+  }
+
   dispose(): void {
     if (this.handle !== 0) {
       this.exports.oof_free_scanner(this.handle);
