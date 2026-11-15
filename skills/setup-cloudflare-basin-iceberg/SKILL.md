@@ -40,15 +40,13 @@ Follow these steps to provision Cloudflare Basin resources and deploy the `journ
 
 3. **Configure Worker binding and secret, then deploy**
    - Copy the `<STREAM_ID>` emitted by `provision-basin.sh` (or run `npx wrangler basin pipelines streams list` to inspect the stream's `id`) into `pipelines[0].stream` in [wrangler.jsonc](../../adapters/ingest/cloudflare-worker-basin/wrangler.jsonc) — Wrangler expects the **Stream ID**, not the stream name.
-   - Run tests and typecheck:
+   - Install dependencies, run tests/typecheck, upload the ingest Bearer token, and deploy (all commands work directly from the repository root):
      ```bash
+     npm --prefix adapters/ingest/cloudflare-worker-basin install
      npm --prefix adapters/ingest/cloudflare-worker-basin run typecheck
      npm --prefix adapters/ingest/cloudflare-worker-basin test
-     ```
-   - Upload the ingest Bearer token and deploy:
-     ```bash
-     npx --prefix adapters/ingest/cloudflare-worker-basin wrangler secret put INGEST_AUTH_TOKEN
-     npx --prefix adapters/ingest/cloudflare-worker-basin wrangler deploy
+     npm exec --prefix adapters/ingest/cloudflare-worker-basin -- wrangler secret put INGEST_AUTH_TOKEN --config adapters/ingest/cloudflare-worker-basin/wrangler.jsonc
+     npm --prefix adapters/ingest/cloudflare-worker-basin run deploy
      ```
 
 4. **Point host collector (`Vector` or `OTel Collector`) at the Worker**

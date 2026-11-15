@@ -661,6 +661,231 @@ rule SSHD_Brute_Force : auth {
       );
       expect(emptyRes.status).toBe(400);
     }
+
+    // Malformed OTLP AnyValue variants -> 400 without falling back to NDJSON
+    const sentCountBeforeMalformed = sentBatches.length;
+    for (const badAnyVal of [
+      { stringValue: { toString: 123 } },
+      { boolValue: "yes" },
+      { intValue: {} },
+      { doubleValue: "NaN" },
+      { bytesValue: "not valid base64!!!" },
+    ]) {
+      const badRes = await handler.fetch(
+        new Request("https://ingest.example/v1/logs", {
+          method: "POST",
+          headers: {
+            authorization: "Bearer test-secret-token-12345",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            resourceLogs: [{ scopeLogs: [{ logRecords: [{ body: badAnyVal }] }] }],
+          }),
+        }),
+        env,
+      );
+      expect(badRes.status).toBe(400);
+    }
+    expect(sentBatches).toHaveLength(sentCountBeforeMalformed);
+  });
+
+  it("preserves OTLP attributes_json, honors service precedence, and unpacks host-agent JSON in MESSAGE", async () => {
+    const { handler, env, sentBatches } = makeTestHarness();
+    const hostFindingJson = JSON.stringify({
+      service_name: "host-yara-x",
+      priority: 2,
+      severity: "CRIT",
+      message: "YARA-X host match on /tmp/sample",
+      yara_matched: true,
+      yara_rules: ["Host_Malware"],
+      yara_tags: ["malware"],
+      attributes_json: JSON.stringify({ target_path: "/tmp/sample", detector: "host-yara-x" }),
+    });
+
+    const payload = {
+      resourceLogs: [
+        {
+          resource: {
+            attributes: [
+              { key: "host.name", value: { stringValue: "otlp-host-02" } },
+              { key: "service.name", value: { stringValue: "real-resource-service" } },
+            ],
+          },
+          scopeLogs: [
+            {
+              scope: { name: "journald-receiver" },
+              logRecords: [
+                // Case A + B: logAttr unknown_service falls back to valid resource service.name; attributes_json preserved
+                {
+                  body: { stringValue: "audit heartbeat" },
+                  attributes: [
+                    { key: "service.name", value: { stringValue: "unknown_service:logger" } },
+                    {
+                      key: "attributes_json",
+                      value: { stringValue: '{"target_path":"/tmp/sample","agent":"kunai"}' },
+                    },
+                  ],
+                },
+                // Case B: service_name inside kvlistValue body overrides scope name, and attributes_json in body preserved
+                {
+                  body: {
+                    kvlistValue: {
+                      values: [
+                        { key: "message", value: { stringValue: "kvlist service hit" } },
+                        { key: "service_name", value: { stringValue: "kv-service" } },
+                        {
+                          key: "attributes_json",
+                          value: { stringValue: '{"source":"kvlist"}' },
+                        },
+                      ],
+                    },
+                  },
+                  attributes: [
+                    { key: "service.name", value: { stringValue: "unknown_service:sidecar" } },
+                  ],
+                },
+                // Case E: journald receiver kvlist MESSAGE containing host-yara-x structured JSON
+                {
+                  body: {
+                    kvlistValue: {
+                      values: [
+                        { key: "MESSAGE", value: { stringValue: hostFindingJson } },
+                        { key: "PRIORITY", value: { stringValue: "2" } },
+                      ],
+                    },
+                  },
+                  attributes: [
+                    { key: "systemd.unit", value: { stringValue: "host-agent.service" } },
+                  ],
+                },
+                // Case E: stringValue body containing host-yara-x structured JSON
+                {
+                  body: { stringValue: hostFindingJson },
+                  attributes: [
+                    { key: "systemd.unit", value: { stringValue: "host-agent.service" } },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+
+    // Test record #2 without resource.attributes service.name so kvlist body service_name wins explicitly
+    const isolatedKvPayload = {
+      resourceLogs: [
+        {
+          scopeLogs: [
+            {
+              scope: { name: "journald-receiver" },
+              logRecords: [payload.resourceLogs[0]!.scopeLogs[0]!.logRecords[1]],
+            },
+          ],
+        },
+      ],
+    };
+    const kvRes = await handler.fetch(
+      new Request("https://ingest.example/v1/logs", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer test-secret-token-12345",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(isolatedKvPayload),
+      }),
+      env,
+    );
+    expect(kvRes.status).toBe(202);
+    expect(sentBatches[0]![0]!.service_name).toBe("kv-service");
+    expect(JSON.parse(sentBatches[0]![0]!.attributes_json!)).toMatchObject({
+      source: "kvlist",
+      "otel.scope.name": "journald-receiver",
+    });
+
+    // Test batch with unknown_service resource fallback and host-yara-x embedded MESSAGE JSON
+    const batchWithoutValidResourceService = {
+      resourceLogs: [
+        {
+          resource: {
+            attributes: [
+              { key: "host.name", value: { stringValue: "otlp-host-02" } },
+              { key: "service.name", value: { stringValue: "unknown_service:otelcol" } },
+            ],
+          },
+          scopeLogs: [
+            {
+              scope: { name: "journald-receiver" },
+              logRecords: [
+                payload.resourceLogs[0]!.scopeLogs[0]!.logRecords[2],
+                payload.resourceLogs[0]!.scopeLogs[0]!.logRecords[3],
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const hostRes = await handler.fetch(
+      new Request("https://ingest.example/v1/logs", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer test-secret-token-12345",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(batchWithoutValidResourceService),
+      }),
+      env,
+    );
+    expect(hostRes.status).toBe(202);
+    expect(await hostRes.json()).toEqual({ accepted: 2, matched: 2 });
+    for (const rec of sentBatches[1]!) {
+      assertMatchesBasinSchema(rec);
+      expect(rec.service_name).toBe("host-yara-x");
+      expect(rec.priority).toBe(2);
+      expect(rec.severity).toBe("CRIT");
+      expect(rec.message).toBe("YARA-X host match on /tmp/sample");
+      expect(rec.yara_matched).toBe(true);
+      expect(rec.yara_rules).toEqual(["Host_Malware"]);
+      expect(rec.yara_tags).toEqual(["malware"]);
+      expect(JSON.parse(rec.attributes_json!)).toMatchObject({
+        target_path: "/tmp/sample",
+        detector: "host-yara-x",
+      });
+    }
+
+    // Test resource.attributes real-resource-service fallback when log attr is unknown_service:logger
+    const fallbackRes = await handler.fetch(
+      new Request("https://ingest.example/v1/logs", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer test-secret-token-12345",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          resourceLogs: [
+            {
+              resource: payload.resourceLogs[0]!.resource,
+              scopeLogs: [
+                {
+                  scope: { name: "journald-receiver" },
+                  logRecords: [payload.resourceLogs[0]!.scopeLogs[0]!.logRecords[0]],
+                },
+              ],
+            },
+          ],
+        }),
+      }),
+      env,
+    );
+    expect(fallbackRes.status).toBe(202);
+    const rec0 = sentBatches[2]![0]!;
+    assertMatchesBasinSchema(rec0);
+    expect(rec0.service_name).toBe("real-resource-service");
+    expect(JSON.parse(rec0.attributes_json!)).toMatchObject({
+      target_path: "/tmp/sample",
+      agent: "kunai",
+      "otel.scope.name": "journald-receiver",
+    });
   });
 
   it("maintains bounded WASM heap across 500 repeated scans including empty and oversized payloads", () => {

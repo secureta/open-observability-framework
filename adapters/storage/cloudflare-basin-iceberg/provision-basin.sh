@@ -127,10 +127,11 @@ validate_sql_ident "table" "${TABLE}"
 validate_sql_ident "stream" "${STREAM}"
 validate_sql_ident "sink" "${SINK}"
 
-if [[ ! "${ROLL_INTERVAL}" =~ ^[0-9]+$ ]] || [[ "${ROLL_INTERVAL}" -lt 60 ]]; then
+if [[ ! "${ROLL_INTERVAL}" =~ ^[0-9]+$ ]] || (( 10#${ROLL_INTERVAL} < 60 )); then
   echo "error: invalid --roll-interval '${ROLL_INTERVAL}' (expected integer >= 60 for r2-data-catalog sinks)" >&2
   exit 1
 fi
+ROLL_INTERVAL="$(( 10#${ROLL_INTERVAL} ))"
 
 if [[ ! -f "${SCHEMA_FILE}" ]]; then
   echo "error: missing schema file at ${SCHEMA_FILE}" >&2
@@ -146,6 +147,36 @@ if [[ "${DRY_RUN}" == false ]] && [[ -z "${CATALOG_TOKEN}" ]]; then
   echo "error: BASIN_CATALOG_TOKEN (or --catalog-token) is required for live provisioning" >&2
   exit 1
 fi
+
+LOCAL_WRANGLER="${REPO_ROOT}/adapters/ingest/cloudflare-worker-basin/node_modules/.bin/wrangler"
+
+run_wrangler() {
+  if [[ -x "${LOCAL_WRANGLER}" ]]; then
+    "${LOCAL_WRANGLER}" "$@"
+  else
+    npx wrangler "$@"
+  fi
+}
+
+run_wrangler_idempotent() {
+  local out=""
+  local rc=0
+  set +e
+  out="$(run_wrangler "$@" 2>&1)"
+  rc=$?
+  set -e
+  if [[ -n "${out}" ]]; then
+    printf '%s\n' "${out}"
+  fi
+  if [[ "${rc}" -eq 0 ]]; then
+    return 0
+  fi
+  if [[ "${out}" =~ [Aa]lready[[:space:]]+(exists|enabled) ]]; then
+    return 0
+  fi
+  echo "error: wrangler command failed (exit ${rc})" >&2
+  return "${rc}"
+}
 
 RENDERED_SQL="$(mktemp "${TMPDIR:-/tmp}/oof-pipeline.XXXXXX.sql")"
 cleanup() {
@@ -165,20 +196,20 @@ if [[ "${DRY_RUN}" == true ]]; then
 # Sink:      ${SINK}
 # Pipeline:  ${PIPELINE}
 
-npx wrangler r2 bucket create "${BUCKET}"
-npx wrangler basin catalog enable "${BUCKET}"
+npx --prefix adapters/ingest/cloudflare-worker-basin wrangler r2 bucket create "${BUCKET}"
+npx --prefix adapters/ingest/cloudflare-worker-basin wrangler basin catalog enable "${BUCKET}"
 # Note: \`streams create\` prints a Stream ID (<STREAM_ID>); copy that Stream ID
 # (not the stream name) into adapters/ingest/cloudflare-worker-basin/wrangler.jsonc (pipelines[0].stream).
-npx wrangler basin pipelines streams create "${STREAM}" \\
+npx --prefix adapters/ingest/cloudflare-worker-basin wrangler basin pipelines streams create "${STREAM}" \\
   --schema-file "${SCHEMA_FILE}"
-npx wrangler basin pipelines sinks create "${SINK}" \\
+npx --prefix adapters/ingest/cloudflare-worker-basin wrangler basin pipelines sinks create "${SINK}" \\
   --type r2-data-catalog \\
   --bucket "${BUCKET}" \\
   --namespace "${NAMESPACE}" \\
   --table "${TABLE}" \\
   --roll-interval "${ROLL_INTERVAL}" \\
   --catalog-token "<BASIN_CATALOG_TOKEN>"
-npx wrangler basin pipelines create "${PIPELINE}" \\
+npx --prefix adapters/ingest/cloudflare-worker-basin wrangler basin pipelines create "${PIPELINE}" \\
   --sql-file "${RENDERED_SQL}"
 
 # Rendered Pipeline SQL (${RENDERED_SQL}):
@@ -187,30 +218,32 @@ EOF
   exit 0
 fi
 
-if ! command -v npx >/dev/null 2>&1; then
-  echo "error: npx (Node.js) is required to run wrangler" >&2
+if [[ ! -x "${LOCAL_WRANGLER}" ]] && ! command -v npx >/dev/null 2>&1; then
+  echo "error: local wrangler binary or npx (Node.js) is required to run wrangler" >&2
   exit 1
 fi
 
 echo "[oof] Creating R2 bucket '${BUCKET}' (if not already present)..."
-npx wrangler r2 bucket create "${BUCKET}" || true
+run_wrangler_idempotent r2 bucket create "${BUCKET}"
 
 echo "[oof] Enabling Basin Catalog on '${BUCKET}'..."
-npx wrangler basin catalog enable "${BUCKET}" || true
+run_wrangler_idempotent basin catalog enable "${BUCKET}"
 
 echo "[oof] Creating Basin stream '${STREAM}'..."
-STREAM_CREATE_OUT="$(npx wrangler basin pipelines streams create "${STREAM}" \
+STREAM_CREATE_OUT="$(NO_COLOR=1 run_wrangler basin pipelines streams create "${STREAM}" \
   --schema-file "${SCHEMA_FILE}")"
 printf '%s\n' "${STREAM_CREATE_OUT}"
 
+ANSI_ESC=$'\033'
+STREAM_CREATE_CLEAN="$(printf '%s\n' "${STREAM_CREATE_OUT}" | sed "s/${ANSI_ESC}\\[[0-9;]*m//g")"
 STREAM_ID=""
 id_pattern="with id '([^']+)'"
-if [[ "${STREAM_CREATE_OUT}" =~ ${id_pattern} ]]; then
+if [[ "${STREAM_CREATE_CLEAN}" =~ ${id_pattern} ]]; then
   STREAM_ID="${BASH_REMATCH[1]}"
 fi
 
 echo "[oof] Creating Basin Iceberg sink '${SINK}' -> ${NAMESPACE}.${TABLE}..."
-npx wrangler basin pipelines sinks create "${SINK}" \
+run_wrangler basin pipelines sinks create "${SINK}" \
   --type r2-data-catalog \
   --bucket "${BUCKET}" \
   --namespace "${NAMESPACE}" \
@@ -219,11 +252,11 @@ npx wrangler basin pipelines sinks create "${SINK}" \
   --catalog-token "${CATALOG_TOKEN}"
 
 echo "[oof] Creating Basin pipeline '${PIPELINE}'..."
-npx wrangler basin pipelines create "${PIPELINE}" \
+run_wrangler basin pipelines create "${PIPELINE}" \
   --sql-file "${RENDERED_SQL}"
 
 if [[ -n "${STREAM_ID}" ]]; then
   echo "[oof] Provisioning complete. Set pipelines[0].stream in adapters/ingest/cloudflare-worker-basin/wrangler.jsonc to Stream ID '${STREAM_ID}' and deploy the Worker."
 else
-  echo "[oof] Provisioning complete. Run 'npx wrangler basin pipelines streams list' to retrieve the Stream ID for '${STREAM}', set it as pipelines[0].stream in wrangler.jsonc, and deploy the Worker."
+  echo "[oof] Provisioning complete. Run 'npm exec --prefix adapters/ingest/cloudflare-worker-basin -- wrangler basin pipelines streams list' to retrieve the Stream ID for '${STREAM}', set it as pipelines[0].stream in wrangler.jsonc, and deploy the Worker."
 fi
