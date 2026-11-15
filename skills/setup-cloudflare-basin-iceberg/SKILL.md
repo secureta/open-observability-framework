@@ -59,7 +59,7 @@ Follow these steps to provision Cloudflare Basin resources and configure direct 
      fluent-bit -c adapters/collect/fluent-bit-journald/fluent-bit.conf
      ```
    - **Option C — Co-located OTel Collector Bridge (`adapters/collect/otel-collector-journald/otelcol.yaml`)**:
-     Keep `journald` commented out in `otelcol.yaml` when Vector or Fluent Bit already reads journald. Point Vector (`OOF_OTLP_HTTP_LISTEN=127.0.0.1:4320`) or Fluent Bit (`Port 4320`) to match `OOF_OTLP_BRIDGE_ENDPOINT=http://127.0.0.1:4320`.
+     Keep `journald` commented out in `otelcol.yaml` when Vector or Fluent Bit already reads journald. Move Vector's OTLP listeners to `OOF_OTLP_GRPC_LISTEN=127.0.0.1:4319` and `OOF_OTLP_HTTP_LISTEN=127.0.0.1:4320` (avoiding collision with `otelcol`'s `4317`/`4318`), or set Fluent Bit's `opentelemetry` `Port 4320`, so both match `OOF_OTLP_BRIDGE_ENDPOINT=http://127.0.0.1:4320`.
 
 5. **Verify Iceberg Ingestion**
    - Send a compliant test OCSF array to `https://<STREAM_ID>.ingest.cloudflare.com` with `Authorization: Bearer $OOF_INGEST_TOKEN` and wait past `--roll-interval` (default `60` seconds).

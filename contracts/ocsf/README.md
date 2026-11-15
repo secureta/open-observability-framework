@@ -37,7 +37,7 @@ Both [Vector](../../adapters/collect/vector-journald/vector.yaml) and [Fluent Bi
 | `3` | `"Medium"` | `4` (warning) | `13..16` (WARN) |
 | `2` | `"Low"` | `5` (notice) | — |
 | `1` | `"Informational"` | `6` (info), `7` (debug) | `1..12` (TRACE / DEBUG / INFO) |
-| `0` | `"Unknown"` | missing / invalid / out of range | `0` / missing / invalid |
+| `0` | `"Unknown"` | missing / invalid (incl. zero-padded `"03"`) / out of range (`0..7`) | `0` / missing / invalid |
 
 ---
 
@@ -45,8 +45,8 @@ Both [Vector](../../adapters/collect/vector-journald/vector.yaml) and [Fluent Bi
 
 | OCSF Path (Basin Type) | `systemd-journald` Source | OTLP Logs Source | Notes |
 | :--- | :--- | :--- | :--- |
-| `time` (`int64`) | `_SOURCE_REALTIME_TIMESTAMP` / `timestamp` | `timestamp` -> fallback `observed_timestamp` -> `now()` | Unix epoch **milliseconds** (`int64`) |
-| `time_dt` (`timestamp`, `millisecond`) | Formatted from `time` | Formatted from `time` | RFC 3339 UTC string `"YYYY-MM-DDTHH:MM:SS.sssZ"` |
+| `time` (`int64`) | `_SOURCE_REALTIME_TIMESTAMP` -> `__REALTIME_TIMESTAMP` -> `timestamp` -> `now()` | `timestamp` -> fallback `observed_timestamp` -> `now()` | Unix epoch **milliseconds** (`int64`, bounded to `[1, 253402300799999]`) |
+| `time_dt` (`timestamp`, `millisecond`) | Formatted from `time` | Formatted from `time` | 4-digit UTC RFC 3339 string `"YYYY-MM-DDTHH:MM:SS.sssZ"` (`1970..9999`) |
 | `message` (`string`) | `MESSAGE` / `message` | `body` / `message` | Primary log message |
 | `log_name` (`string`) | `_SYSTEMD_UNIT` -> `SYSLOG_IDENTIFIER` | `scope.name` -> `resources["service.name"]` | Unit, identifier, or instrumentation scope |
 | `log_provider` (`string`) | `_TRANSPORT` -> `"systemd-journald"` | `"opentelemetry"` | Telemetry source subsystem |

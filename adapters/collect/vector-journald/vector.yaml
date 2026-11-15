@@ -11,8 +11,8 @@
 #
 # Optional environment variables:
 #   OOF_VECTOR_DATA_DIR    (default: /var/lib/vector)
-#   OOF_OTLP_GRPC_LISTEN   (default: 127.0.0.1:4317)
-#   OOF_OTLP_HTTP_LISTEN   (default: 127.0.0.1:4318; set to 127.0.0.1:4320 if bridging behind otelcol)
+#   OOF_OTLP_GRPC_LISTEN   (default: 127.0.0.1:4317; set to 127.0.0.1:4319 if bridging behind co-located otelcol)
+#   OOF_OTLP_HTTP_LISTEN   (default: 127.0.0.1:4318; set to 127.0.0.1:4320 if bridging behind co-located otelcol)
 #
 # Vector >= 0.60 note:
 #   Interpolating environment variables (e.g. `$OOF_BASIN_ENDPOINT` with braces) requires `--dangerously-allow-env-var-interpolation`
@@ -43,38 +43,73 @@ transforms:
       orig = .
       now_ts = now()
 
-      # Resolve primary event timestamp: _SOURCE_REALTIME_TIMESTAMP (us) -> .timestamp -> __REALTIME_TIMESTAMP (us) -> now()
+      # Resolve primary event timestamp within 4-digit UTC RFC 3339 bounds (0001..9999 -> [1, 253402300799999] ms):
+      # _SOURCE_REALTIME_TIMESTAMP (us) -> __REALTIME_TIMESTAMP (us) -> .timestamp -> now()
       event_ts = now_ts
       ts_resolved = false
 
-      if exists(orig._SOURCE_REALTIME_TIMESTAMP) && is_string(orig._SOURCE_REALTIME_TIMESTAMP) {
-        s_us = string!(orig._SOURCE_REALTIME_TIMESTAMP)
-        if match(s_us, r'^[0-9]{1,18}$') {
-          us_val, us_err = to_int(s_us)
-          if us_err == null && us_val > 0 {
-            parsed_ts, p_err = from_unix_timestamp(us_val, unit: "microseconds")
-            if p_err == null {
-              event_ts = parsed_ts
-              ts_resolved = true
-            }
+      if exists(orig._SOURCE_REALTIME_TIMESTAMP) && orig._SOURCE_REALTIME_TIMESTAMP != null {
+        src_us = -1
+        if is_integer(orig._SOURCE_REALTIME_TIMESTAMP) {
+          src_us = int!(orig._SOURCE_REALTIME_TIMESTAMP)
+        } else if is_string(orig._SOURCE_REALTIME_TIMESTAMP) {
+          s_us = string!(orig._SOURCE_REALTIME_TIMESTAMP)
+          if match(s_us, r'^[0-9]{1,18}$') {
+            u_parsed, u_err = to_int(s_us)
+            if u_err == null { src_us = u_parsed }
+          }
+        }
+        if src_us >= 1000 && src_us <= 253402300799999999 {
+          parsed_ts, p_err = from_unix_timestamp(src_us, unit: "microseconds")
+          if p_err == null {
+            event_ts = parsed_ts
+            ts_resolved = true
           }
         }
       }
 
+      rt_ts = now_ts
+      rt_valid = false
+      if exists(orig.__REALTIME_TIMESTAMP) && orig.__REALTIME_TIMESTAMP != null {
+        rt_us = -1
+        if is_integer(orig.__REALTIME_TIMESTAMP) {
+          rt_us = int!(orig.__REALTIME_TIMESTAMP)
+        } else if is_string(orig.__REALTIME_TIMESTAMP) {
+          r_us = string!(orig.__REALTIME_TIMESTAMP)
+          if match(r_us, r'^[0-9]{1,18}$') {
+            u_parsed, u_err = to_int(r_us)
+            if u_err == null { rt_us = u_parsed }
+          }
+        }
+        if rt_us >= 1000 && rt_us <= 253402300799999999 {
+          parsed_rt, l_err = from_unix_timestamp(rt_us, unit: "microseconds")
+          if l_err == null {
+            rt_ts = parsed_rt
+            rt_valid = true
+          }
+        }
+      }
+
+      if !ts_resolved && rt_valid {
+        event_ts = rt_ts
+        ts_resolved = true
+      }
+
       if !ts_resolved && exists(orig.timestamp) && orig.timestamp != null {
         if is_timestamp(orig.timestamp) {
-          cand_ms, cand_err = to_unix_timestamp(orig.timestamp, unit: "milliseconds")
-          if cand_err == null && cand_ms > 0 {
-            event_ts = orig.timestamp
+          ts_v = timestamp!(orig.timestamp)
+          cand_ms = to_unix_timestamp(ts_v, unit: "milliseconds")
+          if cand_ms >= 1 && cand_ms <= 253402300799999 {
+            event_ts = ts_v
             ts_resolved = true
           }
-        } else {
-          ts_str = to_string(orig.timestamp) ?? ""
+        } else if is_string(orig.timestamp) {
+          ts_str = string!(orig.timestamp)
           if ts_str != "" {
             parsed_ts, p_err = parse_timestamp(ts_str, "%+")
             if p_err == null {
               cand_ms = to_unix_timestamp(parsed_ts, unit: "milliseconds")
-              if cand_ms > 0 {
+              if cand_ms >= 1 && cand_ms <= 253402300799999 {
                 event_ts = parsed_ts
                 ts_resolved = true
               }
@@ -83,36 +118,9 @@ transforms:
         }
       }
 
-      if !ts_resolved && exists(orig.__REALTIME_TIMESTAMP) && is_string(orig.__REALTIME_TIMESTAMP) {
-        r_us = string!(orig.__REALTIME_TIMESTAMP)
-        if match(r_us, r'^[0-9]{1,18}$') {
-          us_val, us_err = to_int(r_us)
-          if us_err == null && us_val > 0 {
-            parsed_ts, p_err = from_unix_timestamp(us_val, unit: "microseconds")
-            if p_err == null {
-              event_ts = parsed_ts
-              ts_resolved = true
-            }
-          }
-        }
-      }
-
-      time_ms = to_unix_timestamp!(event_ts, unit: "milliseconds")
+      time_ms = to_unix_timestamp(event_ts, unit: "milliseconds")
       time_dt = format_timestamp!(event_ts, "%Y-%m-%dT%H:%M:%S%.3fZ")
-
-      logged_ms = to_unix_timestamp(now_ts, unit: "milliseconds")
-      if exists(orig.__REALTIME_TIMESTAMP) && is_string(orig.__REALTIME_TIMESTAMP) {
-        rt_str = string!(orig.__REALTIME_TIMESTAMP)
-        if match(rt_str, r'^[0-9]{1,18}$') {
-          rt_us, rt_err = to_int(rt_str)
-          if rt_err == null && rt_us > 0 {
-            rt_ts, l_err = from_unix_timestamp(rt_us, unit: "microseconds")
-            if l_err == null {
-              logged_ms = to_unix_timestamp(rt_ts, unit: "milliseconds")
-            }
-          }
-        }
-      }
+      logged_ms = to_unix_timestamp(rt_ts, unit: "milliseconds")
 
       # Map syslog PRIORITY (0..7) strictly to OCSF v1.3.0 severity_id / severity
       prio_val = null
@@ -120,7 +128,9 @@ transforms:
       if exists(orig.PRIORITY) && orig.PRIORITY != null {
         if is_integer(orig.PRIORITY) {
           pi = int!(orig.PRIORITY)
-          raw_prio = to_string(pi)
+          if pi >= -9007199254740991 && pi <= 9007199254740991 {
+            raw_prio = to_string(pi)
+          }
           if pi >= 0 && pi <= 7 { prio_val = pi }
         } else if is_string(orig.PRIORITY) {
           ps = string!(orig.PRIORITY)
@@ -167,66 +177,86 @@ transforms:
       boot_id = if exists(orig._BOOT_ID) && is_string(orig._BOOT_ID) && string!(orig._BOOT_ID) != "" { string!(orig._BOOT_ID) } else { null }
       machine_id = if exists(orig._MACHINE_ID) && is_string(orig._MACHINE_ID) && string!(orig._MACHINE_ID) != "" { string!(orig._MACHINE_ID) } else { null }
       cursor = if exists(orig.__CURSOR) && is_string(orig.__CURSOR) && string!(orig.__CURSOR) != "" { string!(orig.__CURSOR) } else { null }
-      facility = if exists(orig.SYSLOG_FACILITY) && orig.SYSLOG_FACILITY != null {
-        f_s = to_string(orig.SYSLOG_FACILITY) ?? ""
-        if f_s != "" { f_s } else { null }
-      } else { null }
+      facility = null
+      if exists(orig.SYSLOG_FACILITY) && orig.SYSLOG_FACILITY != null {
+        if is_string(orig.SYSLOG_FACILITY) && string!(orig.SYSLOG_FACILITY) != "" {
+          facility = string!(orig.SYSLOG_FACILITY)
+        } else if is_integer(orig.SYSLOG_FACILITY) {
+          fi = int!(orig.SYSLOG_FACILITY)
+          if fi >= -9007199254740991 && fi <= 9007199254740991 {
+            facility = to_string(fi)
+          }
+        }
+      }
 
       hostname = null
       if exists(orig._HOSTNAME) && is_string(orig._HOSTNAME) && string!(orig._HOSTNAME) != "" {
         hostname = string!(orig._HOSTNAME)
       } else if exists(orig.host) && is_string(orig.host) && string!(orig.host) != "" {
         hostname = string!(orig.host)
-      } else {
-        sys_host = get_hostname() ?? ""
-        if sys_host != "" { hostname = sys_host }
       }
 
       log_name = if systemd_unit != null { systemd_unit } else if syslog_identifier != null { syslog_identifier } else { comm }
       log_provider = if transport != null { transport } else { "systemd-journald" }
 
-      # Extract optional correlation trace_id / span_id
-      raw_trace = ""
-      if exists(orig.TRACE_ID) && is_string(orig.TRACE_ID) {
-        raw_trace = string!(orig.TRACE_ID)
-      } else if exists(orig.OTEL_TRACE_ID) && is_string(orig.OTEL_TRACE_ID) {
-        raw_trace = string!(orig.OTEL_TRACE_ID)
-      } else if exists(orig.trace_id) && is_string(orig.trace_id) {
-        raw_trace = string!(orig.trace_id)
-      }
+      # Extract optional correlation trace_id / span_id (skip empty or all-zero candidates before falling back)
       correlation_uid = null
-      if raw_trace != "" {
-        t_clean = if match(raw_trace, r'^[0-9A-Fa-f]+$') { downcase(raw_trace) } else { raw_trace }
-        if !match(t_clean, r'^0+$') {
-          correlation_uid = t_clean
+      if exists(orig.TRACE_ID) && is_string(orig.TRACE_ID) {
+        rt = string!(orig.TRACE_ID)
+        if rt != "" && !match(rt, r'^0+$') {
+          correlation_uid = if match(rt, r'^[0-9A-Fa-f]+$') { downcase(rt) } else { rt }
+        }
+      }
+      if correlation_uid == null && exists(orig.OTEL_TRACE_ID) && is_string(orig.OTEL_TRACE_ID) {
+        rt = string!(orig.OTEL_TRACE_ID)
+        if rt != "" && !match(rt, r'^0+$') {
+          correlation_uid = if match(rt, r'^[0-9A-Fa-f]+$') { downcase(rt) } else { rt }
+        }
+      }
+      if correlation_uid == null && exists(orig.trace_id) && is_string(orig.trace_id) {
+        rt = string!(orig.trace_id)
+        if rt != "" && !match(rt, r'^0+$') {
+          correlation_uid = if match(rt, r'^[0-9A-Fa-f]+$') { downcase(rt) } else { rt }
         }
       }
 
-      raw_span = ""
-      if exists(orig.SPAN_ID) && is_string(orig.SPAN_ID) {
-        raw_span = string!(orig.SPAN_ID)
-      } else if exists(orig.OTEL_SPAN_ID) && is_string(orig.OTEL_SPAN_ID) {
-        raw_span = string!(orig.OTEL_SPAN_ID)
-      } else if exists(orig.span_id) && is_string(orig.span_id) {
-        raw_span = string!(orig.span_id)
-      }
       span_clean = null
-      if raw_span != "" {
-        s_clean = if match(raw_span, r'^[0-9A-Fa-f]+$') { downcase(raw_span) } else { raw_span }
-        if !match(s_clean, r'^0+$') {
-          span_clean = s_clean
+      if exists(orig.SPAN_ID) && is_string(orig.SPAN_ID) {
+        rs = string!(orig.SPAN_ID)
+        if rs != "" && !match(rs, r'^0+$') {
+          span_clean = if match(rs, r'^[0-9A-Fa-f]+$') { downcase(rs) } else { rs }
+        }
+      }
+      if span_clean == null && exists(orig.OTEL_SPAN_ID) && is_string(orig.OTEL_SPAN_ID) {
+        rs = string!(orig.OTEL_SPAN_ID)
+        if rs != "" && !match(rs, r'^0+$') {
+          span_clean = if match(rs, r'^[0-9A-Fa-f]+$') { downcase(rs) } else { rs }
+        }
+      }
+      if span_clean == null && exists(orig.span_id) && is_string(orig.span_id) {
+        rs = string!(orig.span_id)
+        if rs != "" && !match(rs, r'^0+$') {
+          span_clean = if match(rs, r'^[0-9A-Fa-f]+$') { downcase(rs) } else { rs }
         }
       }
 
-      # Actor process & user (strict integer parsing; actor.user.uid is always string_t in OCSF)
+      # Actor process & user (strict integer parsing with fallback; actor.user.uid is always string_t in OCSF)
       pid_val = null
-      raw_pid = if exists(orig._PID) && orig._PID != null { orig._PID } else if exists(orig.SYSLOG_PID) && orig.SYSLOG_PID != null { orig.SYSLOG_PID } else { null }
-      if raw_pid != null {
-        if is_integer(raw_pid) {
-          pv = int!(raw_pid)
-          if pv >= 0 { pid_val = pv }
-        } else if is_string(raw_pid) {
-          ps = string!(raw_pid)
+      if exists(orig._PID) && orig._PID != null {
+        if is_integer(orig._PID) {
+          pi = int!(orig._PID)
+          if pi >= 0 && pi <= 9007199254740991 { pid_val = pi }
+        } else if is_string(orig._PID) {
+          ps = string!(orig._PID)
+          if match(ps, r'^[0-9]{1,15}$') { pid_val = to_int!(ps) }
+        }
+      }
+      if pid_val == null && exists(orig.SYSLOG_PID) && orig.SYSLOG_PID != null {
+        if is_integer(orig.SYSLOG_PID) {
+          pi = int!(orig.SYSLOG_PID)
+          if pi >= 0 && pi <= 9007199254740991 { pid_val = pi }
+        } else if is_string(orig.SYSLOG_PID) {
+          ps = string!(orig.SYSLOG_PID)
           if match(ps, r'^[0-9]{1,15}$') { pid_val = to_int!(ps) }
         }
       }
@@ -236,7 +266,7 @@ transforms:
       if exists(orig._UID) && orig._UID != null {
         if is_integer(orig._UID) {
           uv = int!(orig._UID)
-          if uv >= 0 {
+          if uv >= 0 && uv <= 9007199254740991 {
             uid_str = to_string(uv)
             uid_num = uv
           }
@@ -359,23 +389,28 @@ transforms:
     source: |
       now_ts = now()
 
-      # Resolve event_ts (fallback to observed_timestamp if timestamp <= 0, then now())
+      # Resolve event_ts within 4-digit UTC RFC 3339 bounds ([1, 253402300799999] ms):
+      # timestamp -> observed_timestamp -> now()
       obs_ts = now_ts
       obs_valid = false
       if exists(.observed_timestamp) && .observed_timestamp != null {
         if is_timestamp(.observed_timestamp) {
-          oms, oms_err = to_unix_timestamp(.observed_timestamp, unit: "milliseconds")
-          if oms_err == null && oms > 0 {
-            obs_ts = .observed_timestamp
+          obs_v = timestamp!(.observed_timestamp)
+          oms = to_unix_timestamp(obs_v, unit: "milliseconds")
+          if oms >= 1 && oms <= 253402300799999 {
+            obs_ts = obs_v
             obs_valid = true
           }
-        } else {
-          obs_str = to_string(.observed_timestamp) ?? ""
+        } else if is_string(.observed_timestamp) {
+          obs_str = string!(.observed_timestamp)
           if obs_str != "" {
             parsed_obs, o_err = parse_timestamp(obs_str, "%+")
-            if o_err == null && to_unix_timestamp(parsed_obs, unit: "milliseconds") > 0 {
-              obs_ts = parsed_obs
-              obs_valid = true
+            if o_err == null {
+              oms = to_unix_timestamp(parsed_obs, unit: "milliseconds")
+              if oms >= 1 && oms <= 253402300799999 {
+                obs_ts = parsed_obs
+                obs_valid = true
+              }
             }
           }
         }
@@ -384,24 +419,28 @@ transforms:
       event_ts = if obs_valid { obs_ts } else { now_ts }
       if exists(.timestamp) && .timestamp != null {
         if is_timestamp(.timestamp) {
-          tms, tms_err = to_unix_timestamp(.timestamp, unit: "milliseconds")
-          if tms_err == null && tms > 0 {
-            event_ts = .timestamp
+          ts_v = timestamp!(.timestamp)
+          tms = to_unix_timestamp(ts_v, unit: "milliseconds")
+          if tms >= 1 && tms <= 253402300799999 {
+            event_ts = ts_v
           }
-        } else {
-          ts_str = to_string(.timestamp) ?? ""
+        } else if is_string(.timestamp) {
+          ts_str = string!(.timestamp)
           if ts_str != "" {
             parsed_ev, t_err = parse_timestamp(ts_str, "%+")
-            if t_err == null && to_unix_timestamp(parsed_ev, unit: "milliseconds") > 0 {
-              event_ts = parsed_ev
+            if t_err == null {
+              tms = to_unix_timestamp(parsed_ev, unit: "milliseconds")
+              if tms >= 1 && tms <= 253402300799999 {
+                event_ts = parsed_ev
+              }
             }
           }
         }
       }
 
-      time_ms = to_unix_timestamp!(event_ts, unit: "milliseconds")
+      time_ms = to_unix_timestamp(event_ts, unit: "milliseconds")
       time_dt = format_timestamp!(event_ts, "%Y-%m-%dT%H:%M:%S%.3fZ")
-      logged_ms = to_unix_timestamp!(obs_ts, unit: "milliseconds")
+      logged_ms = to_unix_timestamp(obs_ts, unit: "milliseconds")
 
       # Map OTLP severity_number (1..24) strictly to OCSF v1.3.0 severity_id / severity
       sev_num = 0
@@ -493,17 +532,21 @@ transforms:
       }
 
       pid_val = null
-      raw_pid = if exists(res."process.pid") && res."process.pid" != null {
-        res."process.pid"
-      } else if exists(attrs."process.pid") && attrs."process.pid" != null {
-        attrs."process.pid"
-      } else { null }
-      if raw_pid != null {
-        if is_integer(raw_pid) {
-          pv = int!(raw_pid)
-          if pv >= 0 { pid_val = pv }
-        } else if is_string(raw_pid) {
-          ps = string!(raw_pid)
+      if exists(res."process.pid") && res."process.pid" != null {
+        if is_integer(res."process.pid") {
+          pi = int!(res."process.pid")
+          if pi >= 0 && pi <= 9007199254740991 { pid_val = pi }
+        } else if is_string(res."process.pid") {
+          ps = string!(res."process.pid")
+          if match(ps, r'^[0-9]{1,15}$') { pid_val = to_int!(ps) }
+        }
+      }
+      if pid_val == null && exists(attrs."process.pid") && attrs."process.pid" != null {
+        if is_integer(attrs."process.pid") {
+          pi = int!(attrs."process.pid")
+          if pi >= 0 && pi <= 9007199254740991 { pid_val = pi }
+        } else if is_string(attrs."process.pid") {
+          ps = string!(attrs."process.pid")
           if match(ps, r'^[0-9]{1,15}$') { pid_val = to_int!(ps) }
         }
       }
@@ -522,20 +565,30 @@ transforms:
 
       uid_str = null
       uid_num = null
-      raw_uid = if exists(attrs."user.id") && attrs."user.id" != null {
-        attrs."user.id"
-      } else if exists(attrs."enduser.id") && attrs."enduser.id" != null {
-        attrs."enduser.id"
-      } else { null }
-      if raw_uid != null {
-        if is_integer(raw_uid) {
-          uv = int!(raw_uid)
-          if uv >= 0 {
+      if exists(attrs."user.id") && attrs."user.id" != null {
+        if is_integer(attrs."user.id") {
+          uv = int!(attrs."user.id")
+          if uv >= 0 && uv <= 9007199254740991 {
             uid_str = to_string(uv)
             uid_num = uv
           }
-        } else if is_string(raw_uid) {
-          us = string!(raw_uid)
+        } else if is_string(attrs."user.id") {
+          us = string!(attrs."user.id")
+          if us != "" {
+            uid_str = us
+            if match(us, r'^[0-9]{1,15}$') { uid_num = to_int!(us) }
+          }
+        }
+      }
+      if uid_str == null && exists(attrs."enduser.id") && attrs."enduser.id" != null {
+        if is_integer(attrs."enduser.id") {
+          uv = int!(attrs."enduser.id")
+          if uv >= 0 && uv <= 9007199254740991 {
+            uid_str = to_string(uv)
+            uid_num = uv
+          }
+        } else if is_string(attrs."enduser.id") {
+          us = string!(attrs."enduser.id")
           if us != "" {
             uid_str = us
             if match(us, r'^[0-9]{1,15}$') { uid_num = to_int!(us) }

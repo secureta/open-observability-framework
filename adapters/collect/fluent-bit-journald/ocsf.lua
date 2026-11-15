@@ -2,6 +2,9 @@
 -- Supports Fluent Bit `Time_As_Table On` 5-arg callbacks `(tag, ts, group, metadata, record)`
 -- and falls back safely to 3-arg callbacks `(tag, ts, record)`.
 
+local MAX_RFC3339_SEC = 253402300799
+local MAX_RFC3339_MS = 253402300799999
+
 local function is_non_empty_string(v)
   return type(v) == "string" and v ~= ""
 end
@@ -29,12 +32,13 @@ local function parse_uint(v)
   return nil
 end
 
--- Parse microsecond Unix timestamps safely without IEEE-754 precision loss.
+-- Parse microsecond Unix timestamps safely without IEEE-754 precision loss,
+-- restricted to 4-digit UTC RFC 3339 millisecond bounds ([1, 253402300799999] ms).
 local function parse_usec_to_ms_parts(v)
   local s
   if type(v) == "string" then
     s = v
-  elseif type(v) == "number" and v > 0 and v <= 9007199254740991 and math.floor(v) == v then
+  elseif type(v) == "number" and v >= 1000 and v <= 9007199254740991 and math.floor(v) == v then
     s = string.format("%.0f", v)
   else
     return nil, nil, nil
@@ -47,10 +51,14 @@ local function parse_usec_to_ms_parts(v)
   local padded = string.rep("0", math.max(0, 7 - #s)) .. s
   local sec = tonumber(padded:sub(1, #padded - 6))
   local sub_ms = tonumber(padded:sub(#padded - 5, #padded - 3))
-  if sec == nil or sec <= 0 then
+  if sec == nil or sub_ms == nil or sec < 0 or sec > MAX_RFC3339_SEC then
     return nil, nil, nil
   end
-  return sec, sub_ms, sec * 1000 + sub_ms
+  local ms = sec * 1000 + sub_ms
+  if ms < 1 or ms > MAX_RFC3339_MS then
+    return nil, nil, nil
+  end
+  return sec, sub_ms, ms
 end
 
 local function format_rfc3339_ms(sec, sub_ms)
@@ -176,9 +184,22 @@ local function normalize_otlp_id(val, expected_bytes)
   return clean
 end
 
+local function parse_syslog_priority(v)
+  if type(v) == "number" then
+    if v >= 0 and v <= 7 and math.floor(v) == v then
+      return v
+    end
+    return nil
+  end
+  if type(v) == "string" and v:match("^[0-7]$") then
+    return tonumber(v)
+  end
+  return nil
+end
+
 local function map_syslog_severity(priority_val)
-  local p = parse_uint(priority_val)
-  if p == nil or p > 7 then
+  local p = parse_syslog_priority(priority_val)
+  if p == nil then
     return 0, "Unknown"
   elseif p == 0 then
     return 6, "Fatal"
@@ -210,20 +231,37 @@ local function map_otlp_severity(severity_number)
   end
 end
 
+local function ts_table_to_ms_parts(ts)
+  if type(ts) ~= "table" or type(ts.sec) ~= "number" or ts.sec ~= ts.sec then
+    return nil, nil, nil
+  end
+  if ts.sec < 0 or ts.sec > MAX_RFC3339_SEC or math.floor(ts.sec) ~= ts.sec then
+    return nil, nil, nil
+  end
+  local sec = ts.sec
+  local nsec = type(ts.nsec) == "number" and ts.nsec == ts.nsec and math.max(0, math.floor(ts.nsec)) or 0
+  local sub_ms = math.floor(nsec / 1000000) % 1000
+  local ms = sec * 1000 + sub_ms
+  if ms < 1 or ms > MAX_RFC3339_MS then
+    return nil, nil, nil
+  end
+  return sec, sub_ms, ms
+end
+
 local function resolve_ts_parts(ts, fallback_ms)
-  if type(ts) == "table" and type(ts.sec) == "number" and ts.sec > 0 then
-    local sec = math.floor(ts.sec)
-    local nsec = type(ts.nsec) == "number" and math.max(0, math.floor(ts.nsec)) or 0
-    local sub_ms = math.floor(nsec / 1000000) % 1000
-    local ms = sec * 1000 + sub_ms
+  local sec, sub_ms, ms = ts_table_to_ms_parts(ts)
+  if ms ~= nil then
     return sec, sub_ms, ms
   end
-  if type(fallback_ms) == "number" and fallback_ms > 0 then
-    local sec = math.floor(fallback_ms / 1000)
-    local sub_ms = math.floor(fallback_ms % 1000)
-    return sec, sub_ms, math.floor(fallback_ms)
+  if type(fallback_ms) == "number" and fallback_ms == fallback_ms and fallback_ms >= 1 and fallback_ms <= MAX_RFC3339_MS then
+    local fms = math.floor(fallback_ms)
+    local fsec = math.floor(fms / 1000)
+    local fsub = fms % 1000
+    if fsec >= 0 and fsec <= MAX_RFC3339_SEC then
+      return fsec, fsub, fms
+    end
   end
-  local now_sec = os.time()
+  local now_sec = math.min(os.time(), MAX_RFC3339_SEC)
   return now_sec, 0, now_sec * 1000
 end
 
@@ -283,20 +321,22 @@ local function transform_journald(ts, record)
   local rec = type(record) == "table" and record or {}
 
   local src_sec, src_sub_ms, src_ms = parse_usec_to_ms_parts(rec._SOURCE_REALTIME_TIMESTAMP)
+  local ts_sec, ts_sub_ms, ts_ms = ts_table_to_ms_parts(ts)
   local rt_sec, rt_sub_ms, rt_ms = parse_usec_to_ms_parts(rec.__REALTIME_TIMESTAMP)
 
   local sec, sub_ms, time_ms
   if src_ms ~= nil then
     sec, sub_ms, time_ms = src_sec, src_sub_ms, src_ms
-  elseif type(ts) == "table" and type(ts.sec) == "number" and ts.sec > 0 then
-    sec, sub_ms, time_ms = resolve_ts_parts(ts, nil)
   elseif rt_ms ~= nil then
     sec, sub_ms, time_ms = rt_sec, rt_sub_ms, rt_ms
+  elseif ts_ms ~= nil then
+    sec, sub_ms, time_ms = ts_sec, ts_sub_ms, ts_ms
   else
-    sec, sub_ms, time_ms = resolve_ts_parts(ts, nil)
+    local now_sec = math.min(os.time(), MAX_RFC3339_SEC)
+    sec, sub_ms, time_ms = now_sec, 0, now_sec * 1000
   end
 
-  local logged_ms = rt_ms or (os.time() * 1000)
+  local logged_ms = rt_ms or (math.min(os.time(), MAX_RFC3339_SEC) * 1000)
 
   local sev_id, sev_label = map_syslog_severity(rec.PRIORITY)
   local raw_prio = nil
@@ -326,12 +366,12 @@ local function transform_journald(ts, record)
     facility = string.format("%.0f", rec.SYSLOG_FACILITY)
   end
 
-  local correlation_uid = normalize_text_id(
-    first_non_empty(rec.TRACE_ID, rec.OTEL_TRACE_ID, rec.trace_id)
-  )
-  local span_clean = normalize_text_id(
-    first_non_empty(rec.SPAN_ID, rec.OTEL_SPAN_ID, rec.span_id)
-  )
+  local correlation_uid = normalize_text_id(rec.TRACE_ID)
+    or normalize_text_id(rec.OTEL_TRACE_ID)
+    or normalize_text_id(rec.trace_id)
+  local span_clean = normalize_text_id(rec.SPAN_ID)
+    or normalize_text_id(rec.OTEL_SPAN_ID)
+    or normalize_text_id(rec.span_id)
 
   local msg = nil
   if rec.MESSAGE ~= nil then
@@ -437,6 +477,15 @@ local function transform_journald(ts, record)
   return out
 end
 
+local function parse_otlp_uid(raw)
+  if is_non_empty_string(raw) then
+    return raw, parse_uint(raw)
+  elseif type(raw) == "number" and raw == raw and raw >= 0 and raw <= 9007199254740991 and math.floor(raw) == raw then
+    return string.format("%.0f", raw), raw
+  end
+  return nil, nil
+end
+
 local function transform_otlp(ts, group, metadata, record)
   local rec = type(record) == "table" and record or {}
   local grp = type(group) == "table" and group or {}
@@ -461,12 +510,16 @@ local function transform_otlp(ts, group, metadata, record)
   end
 
   local obs_ms = nil
-  if type(otlp.observed_timestamp) == "number" and otlp.observed_timestamp > 0 then
-    obs_ms = math.floor((otlp.observed_timestamp + 200) / 1000000)
+  if type(otlp.observed_timestamp) == "number" and otlp.observed_timestamp == otlp.observed_timestamp and otlp.observed_timestamp > 0 then
+    local cand_obs = math.floor((otlp.observed_timestamp + 200) / 1000000)
+    if cand_obs >= 1 and cand_obs <= MAX_RFC3339_MS then
+      obs_ms = cand_obs
+    end
   end
 
   local sec, sub_ms, time_ms = resolve_ts_parts(ts, obs_ms)
-  local logged_ms = (obs_ms ~= nil and obs_ms > 0) and obs_ms or (os.time() * 1000)
+  local now_ms = math.min(os.time(), MAX_RFC3339_SEC) * 1000
+  local logged_ms = (obs_ms ~= nil) and obs_ms or now_ms
 
   local sev_id, sev_label = map_otlp_severity(otlp.severity_number)
   local sev_text = is_non_empty_string(otlp.severity_text) and otlp.severity_text or nil
@@ -516,15 +569,9 @@ local function transform_otlp(ts, group, metadata, record)
   local proc_cmd = first_non_empty(res["process.command_line"])
   if proc_cmd ~= nil then proc.cmd_line = proc_cmd end
 
-  local raw_uid = attrs["user.id"] ~= nil and attrs["user.id"] or attrs["enduser.id"]
-  local uid_str = nil
-  local uid_num = nil
-  if is_non_empty_string(raw_uid) then
-    uid_str = raw_uid
-    uid_num = parse_uint(raw_uid)
-  elseif type(raw_uid) == "number" and raw_uid >= 0 and raw_uid <= 9007199254740991 and math.floor(raw_uid) == raw_uid then
-    uid_str = string.format("%.0f", raw_uid)
-    uid_num = raw_uid
+  local uid_str, uid_num = parse_otlp_uid(attrs["user.id"])
+  if uid_str == nil then
+    uid_str, uid_num = parse_otlp_uid(attrs["enduser.id"])
   end
   local user_name = first_non_empty(attrs["user.name"], attrs["user.full_name"])
 
