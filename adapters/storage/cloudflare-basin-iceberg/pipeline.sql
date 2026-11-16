@@ -1,6 +1,5 @@
 -- Cloudflare Basin Pipeline SQL: OCSF v1.3.0 Event Log Activity (1008) -> Iceberg Sink
--- Placeholders `__SINK_NAME__` and `__STREAM_NAME__` are rendered by provision-basin.sh
--- (defaults: sink = ocsf_event_log_sink, stream = ocsf_event_log_stream).
+-- Rendered by Terraform/OpenTofu (terraform/main.tf) and Pulumi (pulumi/basin-core.ts) (__SINK_NAME__ and __STREAM_NAME__ substituted)
 
 INSERT INTO __SINK_NAME__
 SELECT

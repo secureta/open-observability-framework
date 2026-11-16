@@ -1,0 +1,3 @@
+name: oof-cloudflare-basin-iceberg
+runtime: nodejs
+description: Open Observability Framework — Cloudflare R2 + Basin Catalog + OCSF v1.3.0 Stream/Sink/Pipeline

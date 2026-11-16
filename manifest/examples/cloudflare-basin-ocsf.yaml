@@ -35,6 +35,10 @@ storage:
   namespace: siem
   tables:
     logs_table: ocsf_event_log_activity
+  options:
+    pipeline_sql_path: adapters/storage/cloudflare-basin-iceberg/pipeline.sql
+    terraform_dir: adapters/storage/cloudflare-basin-iceberg/terraform
+    pulumi_dir: adapters/storage/cloudflare-basin-iceberg/pulumi
 
 apm:
   enabled: false

@@ -1,0 +1,17 @@
+# Copy to `terraform.tfvars` (gitignored) and pass secrets via environment variables:
+#   export TF_VAR_cloudflare_api_token="<ADMIN_API_TOKEN>"
+#   export TF_VAR_catalog_token="<CATALOG_API_TOKEN>"
+
+cloudflare_account_id = "0123456789abcdef0123456789abcdef"
+
+bucket_name           = "oof-security-lake"
+namespace             = "ocsf"
+table_name            = "event_log_activity"
+stream_name           = "oof_ocsf_event_log_activity_stream"
+sink_name             = "oof_ocsf_event_log_activity_sink"
+pipeline_name         = "oof_ocsf_event_log_activity_pipeline"
+roll_interval_seconds = 300
+
+# Optional: mint a dedicated `Pipelines Send` Account API Token in Terraform state
+create_ingest_token = false
+ingest_token_name   = "oof-basin-ingest"
