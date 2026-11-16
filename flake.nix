@@ -415,7 +415,7 @@
                 kind = "dns";
                 name = lib.removeSuffix "." (lib.toLower rawHost);
               };
-          valid = canonical != null;
+          valid = canonical != null && !(isWildcardIpv4 canonical) && !(isWildcardIpv6 canonical);
         in
         {
           inherit
@@ -440,10 +440,16 @@
             || (listenerCanon.kind == "ipv6" && (listenerCanon.words == [ 0 0 0 0 0 0 0 1 ] || listenerCanon.words == [ 0 0 0 0 0 0 0 0 ]))
           )
         else if targetCanon.kind == "ipv4" then
-          (listenerCanon.kind == "ipv4" && (listenerCanon.octets == targetCanon.octets || listenerCanon.octets == [ 0 0 0 0 ]))
+          let
+            effectiveOctets = if isWildcardIpv4 targetCanon then [ 127 0 0 1 ] else targetCanon.octets;
+          in
+          (listenerCanon.kind == "ipv4" && (listenerCanon.octets == effectiveOctets || listenerCanon.octets == [ 0 0 0 0 ]))
           || isWildcardIpv6 listenerCanon
         else
-          listenerCanon.kind == "ipv6" && (listenerCanon.words == targetCanon.words || isWildcardIpv6 listenerCanon);
+          let
+            effectiveWords = if isWildcardIpv6 targetCanon then [ 0 0 0 0 0 0 0 1 ] else targetCanon.words;
+          in
+          listenerCanon.kind == "ipv6" && (listenerCanon.words == effectiveWords || isWildcardIpv6 listenerCanon);
     in
     {
       packages =
@@ -701,7 +707,7 @@
               }
               {
                 assertion = (!cfg.otelBridge.enable) || bridgeTargetParsed.valid;
-                message = "services.oof-collector.otelBridge.bridgeEndpoint ('${cfg.otelBridge.bridgeEndpoint}') must be a valid http(s)://host:port URL.";
+                message = "services.oof-collector.otelBridge.bridgeEndpoint ('${cfg.otelBridge.bridgeEndpoint}') must be a valid non-wildcard http(s)://host:port URL (unspecified 0.0.0.0/[::] targets are not allowed).";
               }
               {
                 assertion = collidingPairs == [ ];
@@ -1025,6 +1031,28 @@
                 };
               };
 
+              badWildcardTargetIpv4Cfg = evalNixos {
+                services.oof-collector = {
+                  enable = true;
+                  collector = "vector";
+                  environmentFile = "/run/secrets/oof-collector.env";
+                  otelBridge.enable = true;
+                  otelBridge.httpListen = "127.0.0.1:4318";
+                  otelBridge.bridgeEndpoint = "http://0.0.0.0:4318";
+                };
+              };
+
+              badWildcardTargetIpv6Cfg = evalNixos {
+                services.oof-collector = {
+                  enable = true;
+                  collector = "vector";
+                  environmentFile = "/run/secrets/oof-collector.env";
+                  otelBridge.enable = true;
+                  otelBridge.httpListen = "[::1]:4318";
+                  otelBridge.bridgeEndpoint = "http://[::]:4318";
+                };
+              };
+
               # Discard string context so nixpkgs#opentelemetry-collector-contrib is not compiled during flake check.
               fbUnitConfigMatch =
                 builtins.match ".* \"?-c\"? \"?([^ \"]+)\"?.*"
@@ -1060,6 +1088,8 @@
                   badIpv6AliasCollisionRejected = !(checkAssertionsPass badIpv6AliasCollisionCfg);
                   badIpv6AliasSelfLoopRejected = !(checkAssertionsPass badIpv6AliasSelfLoopCfg);
                   badIpv4MappedCollisionRejected = !(checkAssertionsPass badIpv4MappedCollisionCfg);
+                  badWildcardTargetIpv4Rejected = !(checkAssertionsPass badWildcardTargetIpv4Cfg);
+                  badWildcardTargetIpv6Rejected = !(checkAssertionsPass badWildcardTargetIpv6Cfg);
                 }
               );
 
@@ -1116,6 +1146,8 @@
                       assert.equal(s.badIpv6AliasCollisionRejected, true);
                       assert.equal(s.badIpv6AliasSelfLoopRejected, true);
                       assert.equal(s.badIpv4MappedCollisionRejected, true);
+                      assert.equal(s.badWildcardTargetIpv4Rejected, true);
+                      assert.equal(s.badWildcardTargetIpv6Rejected, true);
 
                       const fb = fs.readFileSync(process.env.actualFbBridgeConf, "utf8");
                       assert.match(fb, /Port               4320/);
