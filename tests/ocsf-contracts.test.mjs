@@ -1393,13 +1393,47 @@ test("5. Cloud IaC (Terraform/OpenTofu + Pulumi) CRUD lifecycle, struct schema p
     assert.deepEqual(schemaReplaceDiff.replaces, ["schema"]);
     assert.equal(schemaReplaceDiff.deleteBeforeReplace, true);
 
-    // Token must be scrubbed from error messages on failure
+    // Token must be scrubbed from error messages BEFORE slicing, including when straddling 200/300 char bounds.
     const secretSentinel = "super_secret_token_never_echo_40chars_0000";
     process.env.CLOUDFLARE_API_TOKEN = secretSentinel;
     await assert.rejects(
       () => provider.create(checkGood.inputs),
       (err) => {
         assert.ok(!err.message.includes(secretSentinel), "API errors must scrub Bearer token");
+        return true;
+      }
+    );
+
+    mockCf.setNextResponse({ method: "GET", status: 200, rawBody: "x".repeat(161) + secretSentinel });
+    await assert.rejects(
+      () => provider.read(created.id, created.outs),
+      (err) => {
+        assert.ok(!err.message.includes(secretSentinel.slice(0, 10)), "200 non-JSON slice must not leak token prefix");
+        assert.ok(err.message.includes("[REDACTED]"));
+        return true;
+      }
+    );
+
+    mockCf.setNextResponse({ method: "GET", status: 404, rawBody: "x".repeat(161) + secretSentinel });
+    await assert.rejects(
+      () => provider.read(created.id, created.outs),
+      (err) => {
+        assert.ok(!err.message.includes(secretSentinel.slice(0, 10)), "404 non-JSON slice must not leak token prefix");
+        assert.ok(err.message.includes("[REDACTED]"));
+        return true;
+      }
+    );
+
+    mockCf.setNextResponse({
+      method: "GET",
+      status: 403,
+      rawBody: JSON.stringify({ success: false, errors: [{ message: "y".repeat(261) + secretSentinel }] }),
+    });
+    await assert.rejects(
+      () => provider.read(created.id, created.outs),
+      (err) => {
+        assert.ok(!err.message.includes(secretSentinel.slice(0, 10)), "403 JSON error slice must not leak token prefix");
+        assert.ok(err.message.includes("[REDACTED]"));
         return true;
       }
     );

@@ -311,7 +311,7 @@ async function cfRequest<T>(
         parsed404 = JSON.parse(rawText);
       } catch {
         throw new Error(
-          `Cloudflare Basin API ${method} ${url} returned non-JSON 404 response: ${scrubSecret(trimmed.slice(0, 200), token)}`
+          `Cloudflare Basin API ${method} ${url} returned non-JSON 404 response: ${scrubSecret(trimmed, token).slice(0, 200)}`
         );
       }
       if (!isPlainObject(parsed404)) {
@@ -338,7 +338,7 @@ async function cfRequest<T>(
     parsedRaw = JSON.parse(rawText);
   } catch {
     throw new Error(
-      `Cloudflare Basin API ${method} ${url} returned non-JSON response (${response.status}): ${scrubSecret(trimmed.slice(0, 200), token)}`
+      `Cloudflare Basin API ${method} ${url} returned non-JSON response (${response.status}): ${scrubSecret(trimmed, token).slice(0, 200)}`
     );
   }
 
@@ -353,7 +353,7 @@ async function cfRequest<T>(
     const apiErrs = Array.isArray(parsed.errors)
       ? parsed.errors.map((e) => e?.message).filter(Boolean).join("; ")
       : "";
-    const detail = scrubSecret(apiErrs || trimmed.slice(0, 300) || response.statusText, token);
+    const detail = scrubSecret(apiErrs || trimmed || response.statusText, token).slice(0, 300);
     throw new Error(`Cloudflare Basin API ${method} ${url} failed (${response.status}): ${detail}`);
   }
 
