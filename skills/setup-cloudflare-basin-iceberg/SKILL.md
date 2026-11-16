@@ -51,6 +51,7 @@ Follow these steps to provision Cloudflare Basin resources declaratively via **T
      pulumi config set --secret catalogToken "<CATALOG_API_TOKEN>"
      pulumi preview
      ```
+     (`CLOUDFLARE_API_TOKEN` must remain in the environment rather than Pulumi config so `refresh` and `destroy` authenticate without persisting tokens in dynamic state.)
 
 2. **Apply Cloud Infrastructure and Verify with `cf` CLI**
    - Terraform / OpenTofu:
@@ -69,7 +70,7 @@ Follow these steps to provision Cloudflare Basin resources declaratively via **T
      ```bash
      cf auth whoami
      cf r2 buckets list --output json
-     cf basin-catalog get oof-security-lake --output json
+     cf basin-catalog get oof-telemetry --output json
      cf pipelines streams list --output json
      cf pipelines streams get "<STREAM_ID>" --output json
      cf pipelines sinks get "<SINK_ID>" --output json

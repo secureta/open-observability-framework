@@ -43,7 +43,6 @@ export interface BasinStreamSchema {
 export interface BasinStructuredStreamInputs {
   accountId: string;
   apiBaseUrl: string;
-  apiToken?: string;
   name: string;
   format: BasinStreamFormat;
   http: BasinStreamHttpConfig;
@@ -78,6 +77,7 @@ export interface BasinSettingsValidationInput {
 }
 
 export const ACCOUNT_ID_RE = /^[a-fA-F0-9]{32}$/;
+export const API_TOKEN_RE = /^[A-Za-z0-9_-]{40,}$/;
 export const API_BASE_URL_RE =
   /^(https:\/\/[A-Za-z0-9.-]+(:[0-9]+)?|http:\/\/(127\.0\.0\.1|localhost):[0-9]+)\/client\/v4$/;
 export const BUCKET_NAME_RE = /^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/;
@@ -200,11 +200,15 @@ function scrubSecret(text: string, secret?: string): string {
   return text.split(secret).join("[REDACTED]");
 }
 
-function resolveApiToken(props?: { apiToken?: string }): string {
-  const token = (props?.apiToken || process.env.CLOUDFLARE_API_TOKEN || "").trim();
-  if (!token) {
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+export function requireEnvApiToken(): string {
+  const token = (process.env.CLOUDFLARE_API_TOKEN || "").trim();
+  if (!token || !API_TOKEN_RE.test(token)) {
     throw new Error(
-      "Missing Cloudflare API token for BasinStructuredStream (set Pulumi secret 'apiToken' or CLOUDFLARE_API_TOKEN)."
+      "CLOUDFLARE_API_TOKEN must be exported in the environment (at least 40 [A-Za-z0-9_-] characters) so Pulumi create, refresh, update, and destroy all authenticate without storing API tokens in state."
     );
   }
   return token;
@@ -297,23 +301,59 @@ async function cfRequest<T>(
     throw new Error(`Cloudflare Basin API ${method} request failed: ${scrubSecret(msg, token)}`);
   }
 
+  const rawText = await response.text();
+  const trimmed = rawText.trim();
+
   if (allowNotFound && response.status === 404) {
+    if (trimmed.length > 0) {
+      let parsed404: unknown;
+      try {
+        parsed404 = JSON.parse(rawText);
+      } catch {
+        throw new Error(
+          `Cloudflare Basin API ${method} ${url} returned non-JSON 404 response: ${scrubSecret(trimmed.slice(0, 200), token)}`
+        );
+      }
+      if (!isPlainObject(parsed404)) {
+        throw new Error(
+          `Cloudflare Basin API ${method} ${url} returned invalid 404 JSON payload.`
+        );
+      }
+    }
     return { status: 404, data: null };
   }
 
-  const rawText = await response.text();
-  let parsed: CloudflareEnvelope<T> | null = null;
-  if (rawText.trim().length > 0) {
-    try {
-      parsed = JSON.parse(rawText) as CloudflareEnvelope<T>;
-    } catch {
-      parsed = null;
-    }
+  if (method === "DELETE" && response.status === 204 && trimmed.length === 0) {
+    return { status: 204, data: null };
   }
 
-  if (!response.ok || (parsed && parsed.success === false)) {
-    const apiErrs = parsed?.errors?.map((e) => e.message).filter(Boolean).join("; ");
-    const detail = scrubSecret(apiErrs || rawText || response.statusText, token);
+  if (trimmed.length === 0) {
+    throw new Error(
+      `Cloudflare Basin API ${method} ${url} returned empty response (${response.status}).`
+    );
+  }
+
+  let parsedRaw: unknown;
+  try {
+    parsedRaw = JSON.parse(rawText);
+  } catch {
+    throw new Error(
+      `Cloudflare Basin API ${method} ${url} returned non-JSON response (${response.status}): ${scrubSecret(trimmed.slice(0, 200), token)}`
+    );
+  }
+
+  if (!isPlainObject(parsedRaw)) {
+    throw new Error(
+      `Cloudflare Basin API ${method} ${url} returned non-object JSON payload (${response.status}).`
+    );
+  }
+
+  const parsed = parsedRaw as CloudflareEnvelope<T>;
+  if (!response.ok || parsed.success !== true) {
+    const apiErrs = Array.isArray(parsed.errors)
+      ? parsed.errors.map((e) => e?.message).filter(Boolean).join("; ")
+      : "";
+    const detail = scrubSecret(apiErrs || trimmed.slice(0, 300) || response.statusText, token);
     throw new Error(`Cloudflare Basin API ${method} ${url} failed (${response.status}): ${detail}`);
   }
 
@@ -326,6 +366,13 @@ export class BasinStructuredStreamProvider {
     news: BasinStructuredStreamInputs
   ): Promise<{ inputs: BasinStructuredStreamInputs; failures?: Array<{ property: string; reason: string }> }> {
     const failures: Array<{ property: string; reason: string }> = [];
+    const envToken = (process.env.CLOUDFLARE_API_TOKEN || "").trim();
+    if (!API_TOKEN_RE.test(envToken)) {
+      failures.push({
+        property: "CLOUDFLARE_API_TOKEN",
+        reason: "must be exported in environment (at least 40 [A-Za-z0-9_-] characters)",
+      });
+    }
     if (!ACCOUNT_ID_RE.test(news.accountId || "")) {
       failures.push({
         property: "accountId",
@@ -355,7 +402,6 @@ export class BasinStructuredStreamProvider {
     const sanitizedInputs: BasinStructuredStreamInputs = {
       accountId: news.accountId,
       apiBaseUrl: baseUrl,
-      ...(news.apiToken !== undefined ? { apiToken: news.apiToken } : {}),
       name: news.name,
       format: normalizeFormat(news.format),
       http: normalizeHttpConfig(news.http),
@@ -418,7 +464,7 @@ export class BasinStructuredStreamProvider {
   async create(
     inputs: BasinStructuredStreamInputs
   ): Promise<{ id: string; outs: BasinStructuredStreamState }> {
-    const token = resolveApiToken(inputs);
+    const token = requireEnvApiToken();
     const baseUrl = inputs.apiBaseUrl || DEFAULT_API_BASE_URL;
     const url = `${baseUrl}/accounts/${inputs.accountId}/pipelines/v1/streams`;
 
@@ -432,8 +478,8 @@ export class BasinStructuredStreamProvider {
 
     const { data } = await cfRequest<BasinStreamApiResult>("POST", url, token, payload);
     const result = data?.result;
-    if (!result?.id) {
-      throw new Error("Cloudflare Basin stream creation response missing result.id.");
+    if (!isPlainObject(result) || typeof result.id !== "string" || result.id.length === 0) {
+      throw new Error("Cloudflare Basin stream creation response missing result object or result.id.");
     }
 
     return {
@@ -444,21 +490,25 @@ export class BasinStructuredStreamProvider {
 
   async read(
     id: string,
-    props?: Partial<BasinStructuredStreamState> & { apiToken?: string }
+    props?: Partial<BasinStructuredStreamState>
   ): Promise<{ id?: string; props?: BasinStructuredStreamState }> {
     if (!props?.accountId) {
       throw new Error("Cannot read BasinStructuredStream without accountId in state.");
     }
-    const token = resolveApiToken(props);
+    const token = requireEnvApiToken();
     const baseUrl = props.apiBaseUrl || DEFAULT_API_BASE_URL;
     const url = `${baseUrl}/accounts/${props.accountId}/pipelines/v1/streams/${id}`;
 
     const { status, data } = await cfRequest<BasinStreamApiResult>("GET", url, token, undefined, true);
-    if (status === 404 || !data?.result) {
+    if (status === 404) {
       return {};
     }
 
-    const result = data.result;
+    const result = data?.result;
+    if (!isPlainObject(result) || typeof result.id !== "string" || result.id.length === 0) {
+      throw new Error("Cloudflare Basin stream read response missing result object or result.id.");
+    }
+
     const state: BasinStructuredStreamState = {
       accountId: props.accountId,
       apiBaseUrl: baseUrl,
@@ -471,7 +521,7 @@ export class BasinStructuredStreamProvider {
       version: typeof result.version === "number" ? result.version : (props.version ?? 1),
     };
 
-    return { id: result.id ?? id, props: state };
+    return { id: result.id, props: state };
   }
 
   async update(
@@ -479,7 +529,7 @@ export class BasinStructuredStreamProvider {
     _olds: BasinStructuredStreamState,
     news: BasinStructuredStreamInputs
   ): Promise<{ outs: BasinStructuredStreamState }> {
-    const token = resolveApiToken(news);
+    const token = requireEnvApiToken();
     const baseUrl = news.apiBaseUrl || DEFAULT_API_BASE_URL;
     const url = `${baseUrl}/accounts/${news.accountId}/pipelines/v1/streams/${id}`;
 
@@ -490,20 +540,23 @@ export class BasinStructuredStreamProvider {
     };
 
     const { data } = await cfRequest<BasinStreamApiResult>("PATCH", url, token, patchBody);
-    const result = data?.result ?? { id };
+    const result = data?.result;
+    if (!isPlainObject(result) || typeof result.id !== "string" || result.id.length === 0) {
+      throw new Error("Cloudflare Basin stream update response missing result object or result.id.");
+    }
     return {
-      outs: this.buildState(news, { ...result, id: result.id ?? id }),
+      outs: this.buildState(news, result),
     };
   }
 
   async delete(
     id: string,
-    props: BasinStructuredStreamState & { apiToken?: string }
+    props: BasinStructuredStreamState
   ): Promise<void> {
     if (!props?.accountId) {
       return;
     }
-    const token = resolveApiToken(props);
+    const token = requireEnvApiToken();
     const baseUrl = props.apiBaseUrl || DEFAULT_API_BASE_URL;
     const url = `${baseUrl}/accounts/${props.accountId}/pipelines/v1/streams/${id}`;
 

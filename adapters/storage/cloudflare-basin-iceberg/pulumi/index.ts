@@ -6,6 +6,7 @@ import {
   extractHostFromEndpoint,
   loadBasinSchemaFields,
   renderPipelineSql,
+  requireEnvApiToken,
   resolveDefaultRepoPaths,
   validateBasinSettings,
 } from "./stream";
@@ -13,20 +14,26 @@ import {
 const config = new pulumi.Config();
 const cfConfig = new pulumi.Config("cloudflare");
 
+if (config.get("apiToken") !== undefined || cfConfig.get("apiToken") !== undefined) {
+  throw new Error(
+    "Do not set apiToken in Pulumi config; export CLOUDFLARE_API_TOKEN in the environment so create, refresh, and destroy all authenticate without storing API tokens in dynamic resource state."
+  );
+}
+requireEnvApiToken();
+
 const accountId = config.require("accountId");
 const catalogToken = config.requireSecret("catalogToken");
-const apiToken = config.getSecret("apiToken") ?? cfConfig.getSecret("apiToken");
 const apiBaseUrl =
   config.get("apiBaseUrl") ?? cfConfig.get("baseUrl") ?? DEFAULT_API_BASE_URL;
 
-const bucketNameConfig = config.get("bucketName") ?? "oof-security-lake";
+const bucketNameConfig = config.get("bucketName") ?? "oof-telemetry";
 const createBucket = config.getBoolean("createBucket") ?? true;
 const enableCatalog = config.getBoolean("enableCatalog") ?? true;
-const namespace = config.get("namespace") ?? "ocsf";
-const tableName = config.get("tableName") ?? "event_log_activity";
-const streamNameConfig = config.get("streamName") ?? "oof_ocsf_event_log_activity_stream";
-const sinkName = config.get("sinkName") ?? "oof_ocsf_event_log_activity_sink";
-const pipelineName = config.get("pipelineName") ?? "oof_ocsf_event_log_activity_pipeline";
+const namespace = config.get("namespace") ?? "siem";
+const tableName = config.get("tableName") ?? "ocsf_event_log_activity";
+const streamNameConfig = config.get("streamName") ?? "ocsf_event_log_stream";
+const sinkName = config.get("sinkName") ?? "ocsf_event_log_sink";
+const pipelineName = config.get("pipelineName") ?? "ocsf_event_log_to_iceberg";
 const rollIntervalSeconds = config.getNumber("rollIntervalSeconds") ?? 300;
 const streamCorsOrigins = config.getObject<string[]>("streamCorsOrigins") ?? [];
 
@@ -75,7 +82,6 @@ const renderedSql = renderPipelineSql(pipelineSqlFile, sinkName, streamNameConfi
 
 const cfProvider = new cloudflare.Provider("cloudflare", {
   baseUrl: apiBaseUrl,
-  ...(apiToken ? { apiToken } : {}),
 });
 
 const bucket = createBucket
@@ -108,7 +114,6 @@ const catalog = enableCatalog
 const stream = new BasinStructuredStream("oof-ocsf-stream", {
   accountId,
   apiBaseUrl,
-  ...(apiToken ? { apiToken } : {}),
   name: streamNameConfig,
   format: {
     type: "json",
@@ -163,12 +168,14 @@ const pipeline = new cloudflare.Pipeline(
   {
     accountId,
     name: pipelineName,
-    // Anchor replacement ordering when stream or sink IDs rotate.
-    sql: pulumi.all([stream.id, sink.id]).apply(() => renderedSql),
+    // Encode stream.id and sink.id into SQL comment so replacement of either forces pipeline replacement first.
+    sql: pulumi.interpolate`-- stream_id=${stream.id} sink_id=${sink.id}\n${renderedSql}`,
   },
   {
     provider: cfProvider,
     dependsOn: [stream, sink],
+    replaceOnChanges: ["sql"],
+    deleteBeforeReplace: true,
   }
 );
 

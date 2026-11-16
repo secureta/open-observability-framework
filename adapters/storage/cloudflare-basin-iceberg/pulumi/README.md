@@ -14,7 +14,7 @@ npm install
 export CLOUDFLARE_API_TOKEN="<CLOUDFLARE_API_TOKEN>"
 ```
 
-> Keeping `CLOUDFLARE_API_TOKEN` in the environment (rather than only `apiToken` config) allows `pulumi refresh` and `pulumi destroy` to authenticate without ever writing `apiToken` into dynamic resource state.
+> `CLOUDFLARE_API_TOKEN` must be exported in the environment (do not set `apiToken` in Pulumi stack config) so `pulumi preview`, `pulumi up`, `pulumi refresh`, and `pulumi destroy` all authenticate consistently without persisting API tokens in dynamic resource state.
 
 Select or initialize a stack and configure required values:
 
@@ -23,10 +23,10 @@ pulumi stack init prod
 pulumi config set accountId "<32_HEX_ACCOUNT_ID>"
 pulumi config set --secret catalogToken "<R2_DATA_CATALOG_TOKEN>"
 
-# Optional overrides:
-pulumi config set bucketName "oof-security-lake"
-pulumi config set namespace "ocsf"
-pulumi config set tableName "event_log_activity"
+# Optional overrides (defaults shown match manifest/examples/cloudflare-basin-ocsf.yaml and queries/siem_hunting.sql):
+pulumi config set bucketName "oof-telemetry"
+pulumi config set namespace "siem"
+pulumi config set tableName "ocsf_event_log_activity"
 pulumi config set createIngestToken "true"
 ```
 

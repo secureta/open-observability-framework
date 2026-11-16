@@ -4,12 +4,12 @@
 
 cloudflare_account_id = "0123456789abcdef0123456789abcdef"
 
-bucket_name           = "oof-security-lake"
-namespace             = "ocsf"
-table_name            = "event_log_activity"
-stream_name           = "oof_ocsf_event_log_activity_stream"
-sink_name             = "oof_ocsf_event_log_activity_sink"
-pipeline_name         = "oof_ocsf_event_log_activity_pipeline"
+bucket_name           = "oof-telemetry"
+namespace             = "siem"
+table_name            = "ocsf_event_log_activity"
+stream_name           = "ocsf_event_log_stream"
+sink_name             = "ocsf_event_log_sink"
+pipeline_name         = "ocsf_event_log_to_iceberg"
 roll_interval_seconds = 300
 
 # Optional: mint a dedicated `Pipelines Send` Account API Token in Terraform state
