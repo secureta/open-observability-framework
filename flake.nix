@@ -204,30 +204,50 @@
             ;
         };
 
-      isValidIpv4 =
+      parseIpv4Octets =
         s:
         let
           m = builtins.match "^([0-9]{1,3})\\.([0-9]{1,3})\\.([0-9]{1,3})\\.([0-9]{1,3})$" s;
-          validOctet =
-            o:
-            (o == "0" || !(lib.hasPrefix "0" o))
-            && (lib.toInt o) <= 255;
+          validOctet = o: (o == "0" || !(lib.hasPrefix "0" o)) && (lib.toInt o) <= 255;
         in
-        m != null && lib.all validOctet m;
+        if m != null && lib.all validOctet m then map lib.toInt m else null;
+
+      hexDigitValues = {
+        "0" = 0;
+        "1" = 1;
+        "2" = 2;
+        "3" = 3;
+        "4" = 4;
+        "5" = 5;
+        "6" = 6;
+        "7" = 7;
+        "8" = 8;
+        "9" = 9;
+        "a" = 10;
+        "b" = 11;
+        "c" = 12;
+        "d" = 13;
+        "e" = 14;
+        "f" = 15;
+      };
 
       isValidHextet = tok: builtins.match "^[0-9a-fA-F]{1,4}$" tok != null;
 
-      isValidIpv6 =
+      hexToInt =
+        tok:
+        lib.foldl' (acc: ch: acc * 16 + hexDigitValues.${ch}) 0 (lib.stringToCharacters (lib.toLower tok));
+
+      parseIpv6Words =
         s:
         if s == "" || lib.hasInfix ":::" s then
-          false
+          null
         else
           let
             halves = lib.splitString "::" s;
             halfCount = lib.length halves;
           in
           if halfCount > 2 then
-            false
+            null
           else
             let
               leftStr = builtins.elemAt halves 0;
@@ -239,23 +259,65 @@
               ipv4InRight = halfCount == 2 && rightLast != null && lib.hasInfix "." rightLast;
               ipv4InLeft = halfCount == 1 && leftLast != null && lib.hasInfix "." leftLast;
               hasTrailingIpv4 = ipv4InRight || ipv4InLeft;
-              ipv4Token =
+              ipv4Octets =
                 if ipv4InRight then
-                  rightLast
+                  parseIpv4Octets rightLast
                 else if ipv4InLeft then
-                  leftLast
+                  parseIpv4Octets leftLast
                 else
-                  "";
+                  null;
+              ipv4Words =
+                if !hasTrailingIpv4 then
+                  [ ]
+                else if ipv4Octets == null then
+                  null
+                else
+                  [
+                    ((builtins.elemAt ipv4Octets 0) * 256 + (builtins.elemAt ipv4Octets 1))
+                    ((builtins.elemAt ipv4Octets 2) * 256 + (builtins.elemAt ipv4Octets 3))
+                  ];
               leftHextets = if ipv4InLeft then lib.init leftTokens else leftTokens;
               rightHextets = if ipv4InRight then lib.init rightTokens else rightTokens;
               allHextets = leftHextets ++ rightHextets;
               groupCount = lib.length allHextets + (if hasTrailingIpv4 then 2 else 0);
               groupsValid =
                 lib.all isValidHextet allHextets
-                && (!hasTrailingIpv4 || isValidIpv4 ipv4Token);
+                && (!hasTrailingIpv4 || ipv4Words != null);
               countValid = if halfCount == 1 then groupCount == 8 else groupCount <= 7;
             in
-            groupsValid && countValid;
+            if !(groupsValid && countValid) then
+              null
+            else if halfCount == 1 then
+              (map hexToInt leftHextets) ++ ipv4Words
+            else
+              (map hexToInt leftHextets)
+              ++ (lib.genList (_: 0) (8 - groupCount))
+              ++ (map hexToInt rightHextets)
+              ++ ipv4Words;
+
+      ipv6WordsToCanonical =
+        words:
+        if lib.take 6 words == [ 0 0 0 0 0 65535 ] then
+          let
+            hi = builtins.elemAt words 6;
+            lo = builtins.elemAt words 7;
+            hiDiv = hi / 256;
+            loDiv = lo / 256;
+          in
+          {
+            kind = "ipv4";
+            octets = [
+              hiDiv
+              (hi - hiDiv * 256)
+              loDiv
+              (lo - loDiv * 256)
+            ];
+          }
+        else
+          {
+            kind = "ipv6";
+            inherit words;
+          };
 
       parseSocketAddr =
         addr:
@@ -263,16 +325,26 @@
           m = builtins.match "^(\\[[0-9a-fA-F:.]+]|[0-9.]+):([1-9][0-9]{0,4})$" addr;
           rawHost = if m == null then null else builtins.elemAt m 0;
           port = if m == null then null else lib.toInt (builtins.elemAt m 1);
+          portValid = port != null && port >= 1 && port <= 65535;
           isBracketed = rawHost != null && lib.hasPrefix "[" rawHost && lib.hasSuffix "]" rawHost;
           bareHost = if rawHost == null then "" else lib.removePrefix "[" (lib.removeSuffix "]" rawHost);
-          hostValid =
-            if rawHost == null then
-              false
+          canonical =
+            if rawHost == null || !portValid then
+              null
             else if isBracketed then
-              isValidIpv6 bareHost
+              let
+                v6 = parseIpv6Words bareHost;
+              in
+              if v6 == null then null else ipv6WordsToCanonical v6
             else
-              isValidIpv4 bareHost;
-          valid = m != null && port >= 1 && port <= 65535 && hostValid;
+              let
+                v4 = parseIpv4Octets bareHost;
+              in
+              if v4 == null then null else {
+                kind = "ipv4";
+                octets = v4;
+              };
+          valid = canonical != null;
         in
         {
           inherit
@@ -280,30 +352,35 @@
             rawHost
             bareHost
             port
+            canonical
             ;
         };
 
       toClientHost =
-        rawHost:
-        if rawHost == "0.0.0.0" then
+        parsed:
+        if !parsed.valid then
           "127.0.0.1"
-        else if rawHost == "[::]" || rawHost == "::" then
+        else if parsed.canonical.kind == "ipv4" && parsed.canonical.octets == [ 0 0 0 0 ] then
+          "127.0.0.1"
+        else if parsed.canonical.kind == "ipv6" && parsed.canonical.words == [ 0 0 0 0 0 0 0 0 ] then
           "[::1]"
         else
-          rawHost;
+          parsed.rawHost;
+
+      isWildcardIpv4 = c: c.kind == "ipv4" && c.octets == [ 0 0 0 0 ];
+      isWildcardIpv6 = c: c.kind == "ipv6" && c.words == [ 0 0 0 0 0 0 0 0 ];
 
       hostsCollide =
-        aBare: bBare:
-        aBare == bBare
-        || aBare == "0.0.0.0"
-        || bBare == "0.0.0.0"
-        || aBare == "::"
-        || bBare == "::";
+        aCanon: bCanon:
+        aCanon == bCanon
+        || isWildcardIpv6 aCanon
+        || isWildcardIpv6 bCanon
+        || (aCanon.kind == "ipv4" && bCanon.kind == "ipv4" && (isWildcardIpv4 aCanon || isWildcardIpv4 bCanon));
 
       parseHttpUrlHostPort =
         url:
         let
-          m = builtins.match "^(https?)://(\\[[0-9a-fA-F:]+]|[A-Za-z0-9._-]+)(:([1-9][0-9]{0,4}))?(/.*)?$" url;
+          m = builtins.match "^(https?)://(\\[[0-9a-fA-F:.]+]|[A-Za-z0-9._-]+)(:([1-9][0-9]{0,4}))?(/.*)?$" url;
           scheme = if m == null then null else builtins.elemAt m 0;
           rawHost = if m == null then null else builtins.elemAt m 1;
           portStr = if m == null then null else builtins.elemAt m 3;
@@ -314,8 +391,31 @@
               (if scheme == "https" then 443 else 80)
             else
               lib.toInt portStr;
-          valid = m != null && port >= 1 && port <= 65535;
-          bareHost = if !valid then "" else lib.removePrefix "[" (lib.removeSuffix "]" rawHost);
+          portValid = port != null && port >= 1 && port <= 65535;
+          isBracketed = rawHost != null && lib.hasPrefix "[" rawHost && lib.hasSuffix "]" rawHost;
+          bareHost = if rawHost == null then "" else lib.removePrefix "[" (lib.removeSuffix "]" rawHost);
+          canonical =
+            if rawHost == null || !portValid then
+              null
+            else if isBracketed then
+              let
+                v6 = parseIpv6Words bareHost;
+              in
+              if v6 == null then null else ipv6WordsToCanonical v6
+            else if builtins.match "^[0-9.]+$" rawHost != null then
+              let
+                v4 = parseIpv4Octets rawHost;
+              in
+              if v4 == null then null else {
+                kind = "ipv4";
+                octets = v4;
+              }
+            else
+              {
+                kind = "dns";
+                name = lib.removeSuffix "." (lib.toLower rawHost);
+              };
+          valid = canonical != null;
         in
         {
           inherit
@@ -324,27 +424,26 @@
             rawHost
             bareHost
             port
+            canonical
             ;
         };
 
       isLocalBindTarget =
-        targetBare: listenerBare:
-        let
-          loopbacks = [
-            "127.0.0.1"
-            "localhost"
-            "::1"
-          ];
-          wildcards = [
-            "0.0.0.0"
-            "::"
-          ];
-        in
-        targetBare == listenerBare
-        || (
-          lib.elem targetBare loopbacks
-          && (lib.elem listenerBare (loopbacks ++ wildcards))
-        );
+        targetCanon: listenerCanon:
+        if targetCanon.kind == "dns" then
+          let
+            isLocalDns = targetCanon.name == "localhost" || lib.hasSuffix ".localhost" targetCanon.name;
+          in
+          isLocalDns
+          && (
+            (listenerCanon.kind == "ipv4" && (builtins.elemAt listenerCanon.octets 0 == 127 || listenerCanon.octets == [ 0 0 0 0 ]))
+            || (listenerCanon.kind == "ipv6" && (listenerCanon.words == [ 0 0 0 0 0 0 0 1 ] || listenerCanon.words == [ 0 0 0 0 0 0 0 0 ]))
+          )
+        else if targetCanon.kind == "ipv4" then
+          (listenerCanon.kind == "ipv4" && (listenerCanon.octets == targetCanon.octets || listenerCanon.octets == [ 0 0 0 0 ]))
+          || isWildcardIpv6 listenerCanon
+        else
+          listenerCanon.kind == "ipv6" && (listenerCanon.words == targetCanon.words || isWildcardIpv6 listenerCanon);
     in
     {
       packages =
@@ -432,6 +531,15 @@
                 rawHost = "127.0.0.1";
                 bareHost = "127.0.0.1";
                 port = cfg.fluentBit.forwardPort;
+                canonical = {
+                  kind = "ipv4";
+                  octets = [
+                    127
+                    0
+                    0
+                    1
+                  ];
+                };
               };
             })
             ++ (lib.optionals cfg.otelBridge.enable [
@@ -462,7 +570,7 @@
             pair.first.parsed.valid
             && pair.second.parsed.valid
             && pair.first.parsed.port == pair.second.parsed.port
-            && hostsCollide pair.first.parsed.bareHost pair.second.parsed.bareHost
+            && hostsCollide pair.first.parsed.canonical pair.second.parsed.canonical
           ) listenerPairs;
 
           selfLoopDetected =
@@ -470,7 +578,7 @@
             && bridgeHttpParsed.valid
             && bridgeTargetParsed.valid
             && bridgeTargetParsed.port == bridgeHttpParsed.port
-            && isLocalBindTarget bridgeTargetParsed.bareHost bridgeHttpParsed.bareHost;
+            && isLocalBindTarget bridgeTargetParsed.canonical bridgeHttpParsed.canonical;
         in
         {
           options.services.oof-collector = {
@@ -546,7 +654,7 @@
                 type = lib.types.str;
                 default =
                   let
-                    hostPart = if httpParsed.valid then toClientHost httpParsed.rawHost else "127.0.0.1";
+                    hostPart = toClientHost httpParsed;
                     portPart = if httpParsed.valid then toString httpParsed.port else "4320";
                   in
                   "http://${hostPart}:${portPart}";
@@ -886,6 +994,37 @@
                 };
               };
 
+              badIpv6AliasCollisionCfg = evalNixos {
+                services.oof-collector = {
+                  enable = true;
+                  collector = "vector";
+                  environmentFile = "/run/secrets/oof-collector.env";
+                  otlp.grpcListen = "[::1]:4317";
+                  otlp.httpListen = "[0:0:0:0:0:0:0:1]:4317";
+                };
+              };
+
+              badIpv6AliasSelfLoopCfg = evalNixos {
+                services.oof-collector = {
+                  enable = true;
+                  collector = "vector";
+                  environmentFile = "/run/secrets/oof-collector.env";
+                  otelBridge.enable = true;
+                  otelBridge.httpListen = "[0:0:0:0:0:0:0:1]:4318";
+                  otelBridge.bridgeEndpoint = "http://[::1]:4318";
+                };
+              };
+
+              badIpv4MappedCollisionCfg = evalNixos {
+                services.oof-collector = {
+                  enable = true;
+                  collector = "vector";
+                  environmentFile = "/run/secrets/oof-collector.env";
+                  otlp.grpcListen = "127.0.0.1:4317";
+                  otlp.httpListen = "[::ffff:127.0.0.1]:4317";
+                };
+              };
+
               # Discard string context so nixpkgs#opentelemetry-collector-contrib is not compiled during flake check.
               fbUnitConfigMatch =
                 builtins.match ".* \"?-c\"? \"?([^ \"]+)\"?.*"
@@ -918,6 +1057,9 @@
                   badCollisionRejected = !(checkAssertionsPass badPortCollisionCfg);
                   badWildcardRejected = !(checkAssertionsPass badWildcardCollisionCfg);
                   badSelfLoopRejected = !(checkAssertionsPass badSelfLoopCfg);
+                  badIpv6AliasCollisionRejected = !(checkAssertionsPass badIpv6AliasCollisionCfg);
+                  badIpv6AliasSelfLoopRejected = !(checkAssertionsPass badIpv6AliasSelfLoopCfg);
+                  badIpv4MappedCollisionRejected = !(checkAssertionsPass badIpv4MappedCollisionCfg);
                 }
               );
 
@@ -971,6 +1113,9 @@
                       assert.equal(s.badCollisionRejected, true);
                       assert.equal(s.badWildcardRejected, true);
                       assert.equal(s.badSelfLoopRejected, true);
+                      assert.equal(s.badIpv6AliasCollisionRejected, true);
+                      assert.equal(s.badIpv6AliasSelfLoopRejected, true);
+                      assert.equal(s.badIpv4MappedCollisionRejected, true);
 
                       const fb = fs.readFileSync(process.env.actualFbBridgeConf, "utf8");
                       assert.match(fb, /Port               4320/);
