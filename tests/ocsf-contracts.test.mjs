@@ -619,6 +619,17 @@ test("2. Basin pipeline.sql matches OCSF schema top-level columns 1:1 in order a
   const huntingSql = fs.readFileSync(HUNTING_SQL_PATH, "utf8");
   assert.ok(huntingSql.includes("siem.ocsf_event_log_activity"));
   assert.ok(huntingSql.includes("metadata.correlation_uid"));
+
+  const tfVarsText = fs.readFileSync(path.join(TERRAFORM_DIR, "variables.tf"), "utf8");
+  assert.match(tfVarsText, /variable\s+"bucket_name"[\s\S]*?default\s*=\s*"oof-telemetry"/);
+  assert.match(tfVarsText, /variable\s+"namespace"[\s\S]*?default\s*=\s*"siem"/);
+  assert.match(tfVarsText, /variable\s+"table_name"[\s\S]*?default\s*=\s*"ocsf_event_log_activity"/);
+
+  const pulumiIndexText = fs.readFileSync(path.join(PULUMI_DIR, "index.ts"), "utf8");
+  assert.match(pulumiIndexText, /config\.get\("bucketName"\)\s*\?\?\s*"oof-telemetry"/);
+  assert.match(pulumiIndexText, /config\.get\("namespace"\)\s*\?\?\s*"siem"/);
+  assert.match(pulumiIndexText, /config\.get\("tableName"\)\s*\?\?\s*"ocsf_event_log_activity"/);
+  assert.match(pulumiIndexText, /replaceOnChanges:\s*\[\s*"sql"\s*\]/);
 });
 
 test("3. Stack manifest schema validates cloudflare-basin-ocsf.yaml and rejects invalid profiles/configs", () => {
@@ -706,6 +717,7 @@ function startMockCloudflareApiServer(expectedAccountId, expectedToken) {
   const tokens = new Map();
   const ops = [];
   let seq = 0;
+  let nextOverride = null;
 
   const cfOk = (result, extra = {}) => JSON.stringify({ success: true, errors: [], messages: [], result, ...extra });
   const cfErr = (message) => JSON.stringify({ success: false, errors: [{ code: 10000, message }], messages: [] });
@@ -718,6 +730,14 @@ function startMockCloudflareApiServer(expectedAccountId, expectedToken) {
       const parsedBody = rawBody.trim() ? JSON.parse(rawBody) : null;
       const reqUrl = new URL(req.url, "http://127.0.0.1");
       const pathname = reqUrl.pathname;
+
+      if (nextOverride && (!nextOverride.method || nextOverride.method === req.method)) {
+        const ov = nextOverride;
+        nextOverride = null;
+        res.writeHead(ov.status, { "content-type": ov.contentType || "text/plain" });
+        res.end(ov.rawBody);
+        return;
+      }
 
       if (req.headers.authorization !== `Bearer ${expectedToken}`) {
         res.writeHead(401, { "content-type": "application/json" });
@@ -836,7 +856,14 @@ function startMockCloudflareApiServer(expectedAccountId, expectedToken) {
         if (!existing) return sendJson(404, cfErr("stream not found"));
         if (req.method === "GET") return sendJson(200, cfOk(existing));
         if (req.method === "PATCH") {
-          const nextHttp = parsedBody?.http
+          if (!parsedBody || typeof parsedBody !== "object" || Array.isArray(parsedBody)) {
+            return sendJson(400, cfErr("PATCH body must be a JSON object"));
+          }
+          const disallowed = Object.keys(parsedBody).filter((k) => k !== "http" && k !== "worker_binding");
+          if (disallowed.length > 0) {
+            return sendJson(400, cfErr(`Immutable stream fields rejected in PATCH: ${disallowed.join(", ")}`));
+          }
+          const nextHttp = parsedBody.http
             ? {
                 enabled: parsedBody.http.enabled ?? existing.http.enabled,
                 authentication: parsedBody.http.authentication ?? existing.http.authentication,
@@ -979,6 +1006,9 @@ function startMockCloudflareApiServer(expectedAccountId, expectedToken) {
         baseUrl: `http://127.0.0.1:${addr.port}/client/v4`,
         ops,
         streams,
+        setNextResponse: (ov) => {
+          nextOverride = ov;
+        },
         close: () => new Promise((r) => server.close(r)),
       });
     });
@@ -1056,6 +1086,8 @@ test("5. Cloud IaC (Terraform/OpenTofu + Pulumi) CRUD lifecycle, struct schema p
 
   const mockCf = await startMockCloudflareApiServer(accountId, adminToken);
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "oof-iac-test-"));
+  const hadEnvToken = Object.hasOwn(process.env, "CLOUDFLARE_API_TOKEN");
+  const prevEnvToken = process.env.CLOUDFLARE_API_TOKEN;
 
   try {
     // --- Part A: Real OpenTofu E2E against mock Cloudflare v4 API ---
@@ -1085,16 +1117,11 @@ test("5. Cloud IaC (Terraform/OpenTofu + Pulumi) CRUD lifecycle, struct schema p
 
     const tfvarsPath = path.join(stagedTfDir, "test.tfvars.json");
     const writeTfvars = (extra = {}) => {
+      // Exercise variables.tf defaults (oof-telemetry, siem.ocsf_event_log_activity) without overriding them.
       fs.writeFileSync(
         tfvarsPath,
         JSON.stringify(
           {
-            bucket_name: "oof-telemetry",
-            namespace: "siem",
-            table_name: "ocsf_event_log_activity",
-            stream_name: "ocsf_event_log_stream",
-            sink_name: "ocsf_event_log_sink",
-            pipeline_name: "ocsf_event_log_to_iceberg",
             roll_interval_seconds: 120,
             create_ingest_token: true,
             ...extra,
@@ -1204,7 +1231,9 @@ test("5. Cloud IaC (Terraform/OpenTofu + Pulumi) CRUD lifecycle, struct schema p
     );
     assert.equal(patchRes.status, 0, `${patchRes.stdout}\n${patchRes.stderr}`);
     const patchOps = mockCf.ops.slice(opCountBeforePatch);
-    assert.ok(patchOps.some((o) => o.method === "PATCH" && o.path.startsWith("/pipelines/v1/streams/")));
+    const tfPatchCall = patchOps.find((o) => o.method === "PATCH" && o.path.startsWith("/pipelines/v1/streams/"));
+    assert.ok(tfPatchCall, "stream CORS update must use PATCH");
+    assert.deepEqual(Object.keys(tfPatchCall.body), ["http"]);
     assert.ok(!patchOps.some((o) => o.method === "POST" && o.path === "/pipelines/v1/streams"));
 
     const zeroDiffAfterPatch = await spawnAsync(
@@ -1277,7 +1306,6 @@ test("5. Cloud IaC (Terraform/OpenTofu + Pulumi) CRUD lifecycle, struct schema p
     const baseStreamInputs = {
       accountId,
       apiBaseUrl: mockCf.baseUrl,
-      apiToken: adminToken,
       name: "pulumi_ocsf_stream",
       format: { type: "json" },
       http: { enabled: true, authentication: true, cors: { origins: [] } },
@@ -1285,6 +1313,13 @@ test("5. Cloud IaC (Terraform/OpenTofu + Pulumi) CRUD lifecycle, struct schema p
       schema: { fields: loadedFields },
     };
 
+    // Without CLOUDFLARE_API_TOKEN, check/create must reject rather than permitting partial lifecycle.
+    delete process.env.CLOUDFLARE_API_TOKEN;
+    const checkNoToken = await provider.check(undefined, baseStreamInputs);
+    assert.ok(checkNoToken.failures?.some((f) => f.property === "CLOUDFLARE_API_TOKEN"));
+    await assert.rejects(() => provider.create(checkNoToken.inputs), /CLOUDFLARE_API_TOKEN/);
+
+    process.env.CLOUDFLARE_API_TOKEN = adminToken;
     const checkGood = await provider.check(undefined, baseStreamInputs);
     assert.equal(checkGood.failures, undefined);
     const checkBad = await provider.check(undefined, {
@@ -1300,11 +1335,40 @@ test("5. Cloud IaC (Terraform/OpenTofu + Pulumi) CRUD lifecycle, struct schema p
     assert.equal(created.outs.name, "pulumi_ocsf_stream");
     assert.equal(created.outs.schema.fields.find((f) => f.name === "device")?.type, "struct");
 
-    const readBack = await provider.read(created.id, { ...created.outs, apiToken: adminToken });
+    // Passing `created.outs` directly (no manual apiToken injection) proves refresh/destroy work from CLOUDFLARE_API_TOKEN.
+    const readBack = await provider.read(created.id, created.outs);
     assert.equal(readBack.id, created.id);
     // Server injects format.unstructured=false & schema.inferred=false; diff must stay clean (changes: false)
     const cleanDiff = await provider.diff(created.id, readBack.props, checkGood.inputs);
     assert.equal(cleanDiff.changes, false);
+
+    // Missing CLOUDFLARE_API_TOKEN must fail loudly during read and delete as well.
+    delete process.env.CLOUDFLARE_API_TOKEN;
+    await assert.rejects(() => provider.read(created.id, created.outs), /CLOUDFLARE_API_TOKEN/);
+    await assert.rejects(() => provider.delete(created.id, created.outs), /CLOUDFLARE_API_TOKEN/);
+    process.env.CLOUDFLARE_API_TOKEN = adminToken;
+
+    // Malformed upstream HTTP 200 / 404 HTML or missing result envelopes must reject loudly (Finding #2).
+    mockCf.setNextResponse({ method: "GET", status: 200, rawBody: "<html>upstream temporarily unavailable</html>" });
+    await assert.rejects(() => provider.read(created.id, created.outs), /non-JSON/);
+
+    mockCf.setNextResponse({ method: "GET", status: 200, rawBody: JSON.stringify({ success: true, result: null }) });
+    await assert.rejects(() => provider.read(created.id, created.outs), /missing result/);
+
+    mockCf.setNextResponse({ method: "PATCH", status: 200, rawBody: "<html>bad gateway</html>" });
+    await assert.rejects(() => provider.update(created.id, readBack.props, checkGood.inputs), /non-JSON/);
+
+    mockCf.setNextResponse({ method: "PATCH", status: 200, rawBody: JSON.stringify({ success: true, result: null }) });
+    await assert.rejects(() => provider.update(created.id, readBack.props, checkGood.inputs), /missing result/);
+
+    mockCf.setNextResponse({ method: "POST", status: 200, rawBody: JSON.stringify({ success: true, result: null }) });
+    await assert.rejects(() => provider.create(checkGood.inputs), /missing result/);
+
+    mockCf.setNextResponse({ method: "GET", status: 404, rawBody: "<html>proxy 404</html>" });
+    await assert.rejects(() => provider.read(created.id, created.outs), /non-JSON 404/);
+
+    mockCf.setNextResponse({ method: "DELETE", status: 404, rawBody: "<html>proxy 404</html>" });
+    await assert.rejects(() => provider.delete(created.id, created.outs), /non-JSON 404/);
 
     const corsUpdateInputs = {
       ...checkGood.inputs,
@@ -1331,20 +1395,29 @@ test("5. Cloud IaC (Terraform/OpenTofu + Pulumi) CRUD lifecycle, struct schema p
 
     // Token must be scrubbed from error messages on failure
     const secretSentinel = "super_secret_token_never_echo_40chars_0000";
+    process.env.CLOUDFLARE_API_TOKEN = secretSentinel;
     await assert.rejects(
-      () => provider.create({ ...checkGood.inputs, apiToken: secretSentinel }),
+      () => provider.create(checkGood.inputs),
       (err) => {
         assert.ok(!err.message.includes(secretSentinel), "API errors must scrub Bearer token");
         return true;
       }
     );
 
-    // Delete + idempotent delete (404) + read on deleted (404 -> {})
-    await provider.delete(created.id, { ...updated.outs, apiToken: adminToken });
-    await provider.delete(created.id, { ...updated.outs, apiToken: adminToken });
-    const missingRead = await provider.read(created.id, { ...updated.outs, apiToken: adminToken });
+    process.env.CLOUDFLARE_API_TOKEN = adminToken;
+    // Empty 204 DELETE response is valid HTTP
+    mockCf.setNextResponse({ method: "DELETE", status: 204, rawBody: "" });
+    await provider.delete(created.id, updated.outs);
+    // Genuine JSON 404 delete stays idempotent; genuine JSON 404 read returns {}
+    await provider.delete(created.id, updated.outs);
+    const missingRead = await provider.read(created.id, updated.outs);
     assert.deepEqual(missingRead, {});
   } finally {
+    if (hadEnvToken) {
+      process.env.CLOUDFLARE_API_TOKEN = prevEnvToken;
+    } else {
+      delete process.env.CLOUDFLARE_API_TOKEN;
+    }
     await mockCf.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

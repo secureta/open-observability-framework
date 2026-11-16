@@ -172,7 +172,8 @@
             nativeBuildInputs = [ pkgs.makeWrapper ];
             postBuild = ''
               wrapProgram "$out/bin/vector" \
-                --add-flags "--dangerously-allow-env-var-interpolation --config ${oofVectorConfig}"
+                --set VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION "true" \
+                --set-default VECTOR_CONFIG "${oofVectorConfig}"
             '';
             meta = pkgs.vector.meta // {
               mainProgram = "vector";
@@ -203,14 +204,75 @@
             ;
         };
 
-      parseHostPort =
+      isValidIpv4 =
+        s:
+        let
+          m = builtins.match "^([0-9]{1,3})\\.([0-9]{1,3})\\.([0-9]{1,3})\\.([0-9]{1,3})$" s;
+          validOctet =
+            o:
+            (o == "0" || !(lib.hasPrefix "0" o))
+            && (lib.toInt o) <= 255;
+        in
+        m != null && lib.all validOctet m;
+
+      isValidHextet = tok: builtins.match "^[0-9a-fA-F]{1,4}$" tok != null;
+
+      isValidIpv6 =
+        s:
+        if s == "" || lib.hasInfix ":::" s then
+          false
+        else
+          let
+            halves = lib.splitString "::" s;
+            halfCount = lib.length halves;
+          in
+          if halfCount > 2 then
+            false
+          else
+            let
+              leftStr = builtins.elemAt halves 0;
+              rightStr = if halfCount == 2 then builtins.elemAt halves 1 else "";
+              leftTokens = if leftStr == "" then [ ] else lib.splitString ":" leftStr;
+              rightTokens = if rightStr == "" then [ ] else lib.splitString ":" rightStr;
+              rightLast = if rightTokens == [ ] then null else lib.last rightTokens;
+              leftLast = if leftTokens == [ ] then null else lib.last leftTokens;
+              ipv4InRight = halfCount == 2 && rightLast != null && lib.hasInfix "." rightLast;
+              ipv4InLeft = halfCount == 1 && leftLast != null && lib.hasInfix "." leftLast;
+              hasTrailingIpv4 = ipv4InRight || ipv4InLeft;
+              ipv4Token =
+                if ipv4InRight then
+                  rightLast
+                else if ipv4InLeft then
+                  leftLast
+                else
+                  "";
+              leftHextets = if ipv4InLeft then lib.init leftTokens else leftTokens;
+              rightHextets = if ipv4InRight then lib.init rightTokens else rightTokens;
+              allHextets = leftHextets ++ rightHextets;
+              groupCount = lib.length allHextets + (if hasTrailingIpv4 then 2 else 0);
+              groupsValid =
+                lib.all isValidHextet allHextets
+                && (!hasTrailingIpv4 || isValidIpv4 ipv4Token);
+              countValid = if halfCount == 1 then groupCount == 8 else groupCount <= 7;
+            in
+            groupsValid && countValid;
+
+      parseSocketAddr =
         addr:
         let
-          m = builtins.match "^(\\[[0-9a-fA-F:]+]|[A-Za-z0-9._-]+):([1-9][0-9]{0,4})$" addr;
+          m = builtins.match "^(\\[[0-9a-fA-F:.]+]|[0-9.]+):([1-9][0-9]{0,4})$" addr;
           rawHost = if m == null then null else builtins.elemAt m 0;
           port = if m == null then null else lib.toInt (builtins.elemAt m 1);
-          valid = m != null && port >= 1 && port <= 65535;
-          bareHost = if !valid then "" else lib.removePrefix "[" (lib.removeSuffix "]" rawHost);
+          isBracketed = rawHost != null && lib.hasPrefix "[" rawHost && lib.hasSuffix "]" rawHost;
+          bareHost = if rawHost == null then "" else lib.removePrefix "[" (lib.removeSuffix "]" rawHost);
+          hostValid =
+            if rawHost == null then
+              false
+            else if isBracketed then
+              isValidIpv6 bareHost
+            else
+              isValidIpv4 bareHost;
+          valid = m != null && port >= 1 && port <= 65535 && hostValid;
         in
         {
           inherit
@@ -338,10 +400,10 @@
           cfg = config.services.oof-collector;
           assets = mkCollectorAssets pkgs;
 
-          httpParsed = parseHostPort cfg.otlp.httpListen;
-          grpcParsed = parseHostPort cfg.otlp.grpcListen;
-          bridgeGrpcParsed = parseHostPort cfg.otelBridge.grpcListen;
-          bridgeHttpParsed = parseHostPort cfg.otelBridge.httpListen;
+          httpParsed = parseSocketAddr cfg.otlp.httpListen;
+          grpcParsed = parseSocketAddr cfg.otlp.grpcListen;
+          bridgeGrpcParsed = parseSocketAddr cfg.otelBridge.grpcListen;
+          bridgeHttpParsed = parseSocketAddr cfg.otelBridge.httpListen;
           bridgeTargetParsed = parseHttpUrlHostPort cfg.otelBridge.bridgeEndpoint;
 
           customFluentBitConfig = assets.mkFluentBitConfig {
@@ -519,15 +581,15 @@
               }
               {
                 assertion = httpParsed.valid;
-                message = "services.oof-collector.otlp.httpListen ('${cfg.otlp.httpListen}') must be a valid host:port.";
+                message = "services.oof-collector.otlp.httpListen ('${cfg.otlp.httpListen}') must be a valid IPv4/IPv6 socket address (ip:port, e.g. 127.0.0.1:4318 or [::1]:4318; DNS hostnames are rejected by Vector).";
               }
               {
                 assertion = (cfg.collector != "vector") || grpcParsed.valid;
-                message = "services.oof-collector.otlp.grpcListen ('${cfg.otlp.grpcListen}') must be a valid host:port when using Vector.";
+                message = "services.oof-collector.otlp.grpcListen ('${cfg.otlp.grpcListen}') must be a valid IPv4/IPv6 socket address (ip:port, e.g. 127.0.0.1:4317 or [::1]:4317) when using Vector.";
               }
               {
                 assertion = (!cfg.otelBridge.enable) || (bridgeGrpcParsed.valid && bridgeHttpParsed.valid);
-                message = "services.oof-collector.otelBridge.grpcListen/httpListen must be valid host:port values.";
+                message = "services.oof-collector.otelBridge.grpcListen/httpListen must be valid IPv4/IPv6 socket addresses (ip:port).";
               }
               {
                 assertion = (!cfg.otelBridge.enable) || bridgeTargetParsed.valid;
@@ -745,6 +807,44 @@
                 };
               };
 
+              vecIpv6Cfg = evalNixos {
+                services.oof-collector = {
+                  enable = true;
+                  collector = "vector";
+                  environmentFile = "/run/secrets/oof-collector.env";
+                  otlp.grpcListen = "[::1]:4319";
+                  otlp.httpListen = "[::]:4320";
+                  otelBridge.enable = true;
+                };
+              };
+
+              badHostnameListenerCfg = evalNixos {
+                services.oof-collector = {
+                  enable = true;
+                  collector = "vector";
+                  environmentFile = "/run/secrets/oof-collector.env";
+                  otlp.grpcListen = "localhost:4317";
+                };
+              };
+
+              badIpv4OctetCfg = evalNixos {
+                services.oof-collector = {
+                  enable = true;
+                  collector = "vector";
+                  environmentFile = "/run/secrets/oof-collector.env";
+                  otlp.httpListen = "999.0.0.1:4318";
+                };
+              };
+
+              badIpv6SyntaxCfg = evalNixos {
+                services.oof-collector = {
+                  enable = true;
+                  collector = "fluent-bit";
+                  environmentFile = "/run/secrets/oof-collector.env";
+                  otlp.httpListen = "[:::]:4318";
+                };
+              };
+
               badStoreEnvCfg = evalNixos {
                 services.oof-collector = {
                   enable = true;
@@ -808,6 +908,12 @@
                   fbCustomOk = checkAssertionsPass fbCustomBindCfg;
                   fbCustomBridgeEndpoint = fbCustomBindCfg.config.systemd.services.oof-otel-bridge.environment.OOF_OTLP_BRIDGE_ENDPOINT;
 
+                  vecIpv6Ok = checkAssertionsPass vecIpv6Cfg;
+                  vecIpv6BridgeEndpoint = vecIpv6Cfg.config.systemd.services.oof-otel-bridge.environment.OOF_OTLP_BRIDGE_ENDPOINT;
+
+                  badHostnameRejected = !(checkAssertionsPass badHostnameListenerCfg);
+                  badIpv4OctetRejected = !(checkAssertionsPass badIpv4OctetCfg);
+                  badIpv6SyntaxRejected = !(checkAssertionsPass badIpv6SyntaxCfg);
                   badStoreRejected = !(checkAssertionsPass badStoreEnvCfg);
                   badCollisionRejected = !(checkAssertionsPass badPortCollisionCfg);
                   badWildcardRejected = !(checkAssertionsPass badWildcardCollisionCfg);
@@ -855,6 +961,12 @@
                       assert.equal(s.fbCustomOk, true);
                       assert.equal(s.fbCustomBridgeEndpoint, "http://127.0.0.1:4322");
 
+                      assert.equal(s.vecIpv6Ok, true);
+                      assert.equal(s.vecIpv6BridgeEndpoint, "http://[::1]:4320");
+
+                      assert.equal(s.badHostnameRejected, true);
+                      assert.equal(s.badIpv4OctetRejected, true);
+                      assert.equal(s.badIpv6SyntaxRejected, true);
                       assert.equal(s.badStoreRejected, true);
                       assert.equal(s.badCollisionRejected, true);
                       assert.equal(s.badWildcardRejected, true);
@@ -882,16 +994,18 @@
                   ''
                     export HOME="$TMPDIR/home"
                     mkdir -p "$HOME"
-                    # Validate packaged collector configs too
-                    VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true \
-                      OOF_VECTOR_DATA_DIR="$TMPDIR/vec-data" \
+                    # Validate packaged collector configs and wrapper binaries too
+                    OOF_VECTOR_DATA_DIR="$TMPDIR/vec-data" \
                       OOF_BASIN_ENDPOINT="https://example-stream.ingest.cloudflare.com" \
                       OOF_INGEST_TOKEN="dummy-basin-token" \
-                      vector validate --no-environment --dangerously-allow-env-var-interpolation ${assets.oofVectorConfig}
+                      OOF_OTLP_GRPC_LISTEN="[::1]:4319" \
+                      ${assets.oofVector}/bin/vector validate --no-environment
+
+                    ${assets.oofVector}/bin/vector --version
 
                     OOF_BASIN_HOST="example-stream.ingest.cloudflare.com" \
                       OOF_INGEST_TOKEN="dummy-basin-token" \
-                      fluent-bit --dry-run -c ${assets.oofFluentBitConfig}
+                      ${assets.oofFluentBit}/bin/fluent-bit --dry-run
 
                     node --test ${self}/tests/ocsf-contracts.test.mjs
                     touch "$out"

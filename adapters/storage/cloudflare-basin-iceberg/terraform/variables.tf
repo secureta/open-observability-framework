@@ -46,7 +46,7 @@ variable "cloudflare_api_base_url" {
 
 variable "bucket_name" {
   type        = string
-  default     = "oof-security-lake"
+  default     = "oof-telemetry"
   description = "Target Cloudflare R2 bucket name for Iceberg table storage."
 
   validation {
@@ -69,7 +69,7 @@ variable "enable_catalog" {
 
 variable "namespace" {
   type        = string
-  default     = "ocsf"
+  default     = "siem"
   description = "Apache Iceberg namespace in R2 Data Catalog."
 
   validation {
@@ -80,7 +80,7 @@ variable "namespace" {
 
 variable "table_name" {
   type        = string
-  default     = "event_log_activity"
+  default     = "ocsf_event_log_activity"
   description = "Apache Iceberg table name for OCSF v1.3.0 Event Log Activity (1008)."
 
   validation {
@@ -91,7 +91,7 @@ variable "table_name" {
 
 variable "stream_name" {
   type        = string
-  default     = "oof_ocsf_event_log_activity_stream"
+  default     = "ocsf_event_log_stream"
   description = "Basin SQL stream identifier (must match SQL identifier rules and differ from sink_name)."
 
   validation {
@@ -102,7 +102,7 @@ variable "stream_name" {
 
 variable "sink_name" {
   type        = string
-  default     = "oof_ocsf_event_log_activity_sink"
+  default     = "ocsf_event_log_sink"
   description = "Basin SQL sink identifier (must match SQL identifier rules and differ from stream_name)."
 
   validation {
@@ -113,7 +113,7 @@ variable "sink_name" {
 
 variable "pipeline_name" {
   type        = string
-  default     = "oof_ocsf_event_log_activity_pipeline"
+  default     = "ocsf_event_log_to_iceberg"
   description = "Basin Pipeline name."
 
   validation {
