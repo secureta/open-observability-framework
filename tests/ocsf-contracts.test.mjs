@@ -7,7 +7,7 @@ import http from "node:http";
 import net from "node:net";
 import zlib from "node:zlib";
 import { spawn, spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..");
@@ -15,7 +15,10 @@ const REPO_ROOT = path.resolve(__dirname, "..");
 const BASIN_SCHEMA_PATH = path.join(REPO_ROOT, "contracts/ocsf/event-log-activity.basin.json");
 const PIPELINE_SQL_PATH = path.join(REPO_ROOT, "adapters/storage/cloudflare-basin-iceberg/pipeline.sql");
 const HUNTING_SQL_PATH = path.join(REPO_ROOT, "adapters/storage/cloudflare-basin-iceberg/queries/siem_hunting.sql");
-const PROVISION_SCRIPT_PATH = path.join(REPO_ROOT, "adapters/storage/cloudflare-basin-iceberg/provision-basin.sh");
+const TERRAFORM_DIR = path.join(REPO_ROOT, "adapters/storage/cloudflare-basin-iceberg/terraform");
+const PULUMI_DIR = path.join(REPO_ROOT, "adapters/storage/cloudflare-basin-iceberg/pulumi");
+const PULUMI_CORE_PATH = path.join(PULUMI_DIR, "basin-core.ts");
+const FLAKE_NIX_PATH = path.join(REPO_ROOT, "flake.nix");
 const STACK_SCHEMA_PATH = path.join(REPO_ROOT, "manifest/stack.schema.json");
 const STACK_EXAMPLE_PATH = path.join(REPO_ROOT, "manifest/examples/cloudflare-basin-ocsf.yaml");
 const VECTOR_CONFIG_PATH = path.join(REPO_ROOT, "adapters/collect/vector-journald/vector.yaml");
@@ -39,11 +42,19 @@ const ALLOWED_BASIN_TYPES = new Set([
 const ALLOWED_TIMESTAMP_UNITS = new Set(["second", "millisecond", "microsecond", "nanosecond"]);
 
 function requireBinary(name) {
-  const res = spawnSync("which", [name], { encoding: "utf8" });
-  if (res.status !== 0) {
-    throw new Error(`Required test runtime binary '${name}' is not in PATH`);
+  const pathEntries = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
+  for (const dir of pathEntries) {
+    const candidate = path.join(dir, name);
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      if (fs.statSync(candidate).isFile()) {
+        return candidate;
+      }
+    } catch {
+      // Continue searching PATH
+    }
   }
-  return res.stdout.trim();
+  throw new Error(`Required test runtime binary '${name}' is not in PATH`);
 }
 
 function validateBasinFields(fields, depth = 0) {
@@ -66,12 +77,12 @@ function validateBasinFields(fields, depth = 0) {
     }
 
     if (field.type === "struct") {
-      assert.ok(depth < 2, `struct field '${field.name}' exceeds Wrangler max nesting depth <= 2`);
+      assert.ok(depth < 2, `struct field '${field.name}' exceeds Basin max nesting depth <= 2`);
       validateBasinFields(field.fields, depth + 1);
     }
 
     if (field.type === "list") {
-      assert.ok(depth < 2, `list field '${field.name}' exceeds Wrangler max nesting depth <= 2`);
+      assert.ok(depth < 2, `list field '${field.name}' exceeds Basin max nesting depth <= 2`);
       assert.ok(field.items && typeof field.items === "object", `list field '${field.name}' requires items`);
       validateBasinFields([{ name: `${field.name}[]`, required: true, ...field.items }], depth + 1);
     }
@@ -558,7 +569,7 @@ async function terminateProcess(proc) {
   clearTimeout(timer);
 }
 
-test("1. OCSF v1.3.0 Basin stream schema conforms to Wrangler SchemaField limits and OCSF invariants", () => {
+test("1. OCSF v1.3.0 Basin stream schema conforms to Basin SchemaField limits and OCSF invariants", () => {
   const schema = JSON.parse(fs.readFileSync(BASIN_SCHEMA_PATH, "utf8"));
   validateBasinFields(schema.fields, 0);
 
@@ -637,13 +648,351 @@ test("3. Stack manifest schema validates cloudflare-basin-ocsf.yaml and rejects 
   assert.ok(validateAgainstJsonSchema(incompleteDetect, stackSchema).length > 0);
 });
 
-test("4. Repository link integrity and zero stale worker/YARA/proprietary schema references", () => {
-  const gitList = spawnSync("git", ["ls-files", "--cached", "--others", "--exclude-standard"], {
-    cwd: REPO_ROOT,
-    encoding: "utf8",
+function listRepoFiles(rootDir) {
+  if (fs.existsSync(path.join(rootDir, ".git"))) {
+    const gitList = spawnSync("git", ["ls-files", "--cached", "--others", "--exclude-standard"], {
+      cwd: rootDir,
+      encoding: "utf8",
+    });
+    if (gitList.status === 0) {
+      return gitList.stdout.trim().split("\n").filter(Boolean);
+    }
+  }
+
+  const out = [];
+  const skipDirs = new Set([".git", "node_modules", ".terraform", ".pulumi"]);
+  const walk = (relDir) => {
+    const absDir = relDir ? path.join(rootDir, relDir) : rootDir;
+    for (const entry of fs.readdirSync(absDir, { withFileTypes: true })) {
+      if (skipDirs.has(entry.name) || entry.name === "result" || entry.name.startsWith("result-")) {
+        continue;
+      }
+      const relPath = relDir ? path.posix.join(relDir, entry.name) : entry.name;
+      if (entry.isDirectory()) {
+        walk(relPath);
+      } else if (entry.isFile()) {
+        out.push(relPath);
+      }
+    }
+  };
+  walk("");
+  return out;
+}
+
+function spawnAsync(bin, args, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(bin, args, { ...opts, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => {
+      stdout += d.toString("utf8");
+    });
+    child.stderr.on("data", (d) => {
+      stderr += d.toString("utf8");
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      resolve({ status: code ?? -1, stdout, stderr });
+    });
   });
-  assert.equal(gitList.status, 0);
-  const trackedFiles = gitList.stdout.trim().split("\n").filter(Boolean);
+}
+
+function startMockCloudflareApiServer(expectedAccountId, expectedToken) {
+  const buckets = new Map();
+  const catalogs = new Map();
+  const streams = new Map();
+  const sinks = new Map();
+  const pipelines = new Map();
+  const tokens = new Map();
+  const ops = [];
+  let seq = 0;
+
+  const cfOk = (result, extra = {}) => JSON.stringify({ success: true, errors: [], messages: [], result, ...extra });
+  const cfErr = (message) => JSON.stringify({ success: false, errors: [{ code: 10000, message }], messages: [] });
+
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const rawBody = Buffer.concat(chunks).toString("utf8");
+      const parsedBody = rawBody.trim() ? JSON.parse(rawBody) : null;
+      const reqUrl = new URL(req.url, "http://127.0.0.1");
+      const pathname = reqUrl.pathname;
+
+      if (req.headers.authorization !== `Bearer ${expectedToken}`) {
+        res.writeHead(401, { "content-type": "application/json" });
+        res.end(cfErr("unauthorized"));
+        return;
+      }
+
+      const prefix = `/client/v4/accounts/${expectedAccountId}`;
+      if (!pathname.startsWith(prefix)) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(cfErr(`unexpected account prefix for ${pathname}`));
+        return;
+      }
+
+      const rel = pathname.slice(prefix.length);
+      ops.push({ method: req.method, path: rel, body: parsedBody });
+
+      const sendJson = (statusCode, payload) => {
+        res.writeHead(statusCode, { "content-type": "application/json" });
+        res.end(payload);
+      };
+
+      // R2 Buckets: /r2/buckets and /r2/buckets/:name
+      if (rel === "/r2/buckets" && req.method === "POST") {
+        const name = parsedBody?.name;
+        const rec = {
+          name,
+          creation_date: "2026-01-01T00:00:00Z",
+          location: parsedBody?.location ?? "wnam",
+          storage_class: parsedBody?.storage_class ?? "Standard",
+          jurisdiction: parsedBody?.jurisdiction ?? "default",
+        };
+        buckets.set(name, rec);
+        return sendJson(200, cfOk(rec));
+      }
+      const bucketMatch = /^\/r2\/buckets\/([^/]+)$/.exec(rel);
+      if (bucketMatch) {
+        const bName = decodeURIComponent(bucketMatch[1]);
+        if (req.method === "GET") {
+          const rec = buckets.get(bName);
+          return rec ? sendJson(200, cfOk(rec)) : sendJson(404, cfErr("bucket not found"));
+        }
+        if (req.method === "DELETE") {
+          if (!buckets.has(bName)) return sendJson(404, cfErr("bucket not found"));
+          buckets.delete(bName);
+          return sendJson(200, cfOk({}));
+        }
+      }
+
+      // R2 Data Catalog: /r2-catalog/:name(/enable|/disable) and /r2/buckets/:name/catalog(/enable|/disable)
+      const catalogMatch =
+        /^\/r2-catalog\/([^/]+)(?:\/(enable|disable))?$/.exec(rel) ??
+        /^\/r2\/buckets\/([^/]+)\/catalog(?:\/(enable|disable))?$/.exec(rel);
+      if (catalogMatch) {
+        const bName = decodeURIComponent(catalogMatch[1]);
+        const action = catalogMatch[2];
+        if ((req.method === "POST" || req.method === "PUT") && (!action || action === "enable")) {
+          const rec = {
+            id: `cat-${++seq}`,
+            bucket: bName,
+            name: `${expectedAccountId}_${bName}`,
+            status: "active",
+            credential_status: "present",
+            maintenance_config: {
+              compaction: { state: "enabled", target_size_mb: "128" },
+              interval: "1h",
+              snapshot_expiration: { max_snapshot_age: "7d", min_snapshots_to_keep: 100, state: "enabled" },
+            },
+          };
+          catalogs.set(bName, rec);
+          return sendJson(200, cfOk(rec));
+        }
+        if (req.method === "GET" && !action) {
+          const rec = catalogs.get(bName);
+          return rec ? sendJson(200, cfOk(rec)) : sendJson(404, cfErr("catalog not found"));
+        }
+        if (req.method === "DELETE" || (req.method === "POST" && action === "disable")) {
+          if (!catalogs.has(bName)) return sendJson(404, cfErr("catalog not found"));
+          catalogs.delete(bName);
+          return sendJson(200, cfOk({}));
+        }
+      }
+
+      // Basin Streams: /pipelines/v1/streams and /pipelines/v1/streams/:id
+      if (rel === "/pipelines/v1/streams" && req.method === "POST") {
+        const id = `stream0000${++seq}`.slice(0, 16);
+        const rec = {
+          id,
+          name: parsedBody.name,
+          endpoint: `https://${id}.ingest.cloudflare.com`,
+          version: 1,
+          created_at: "2026-01-01T00:00:00Z",
+          modified_at: "2026-01-01T00:00:00Z",
+          format: {
+            ...parsedBody.format,
+            unstructured: parsedBody.format?.unstructured ?? false,
+          },
+          http: {
+            enabled: parsedBody.http?.enabled ?? true,
+            authentication: parsedBody.http?.authentication ?? true,
+            cors: { origins: parsedBody.http?.cors?.origins ?? [] },
+          },
+          worker_binding: { enabled: parsedBody.worker_binding?.enabled ?? false },
+          schema: {
+            fields: parsedBody.schema?.fields ?? [],
+            inferred: parsedBody.schema?.inferred ?? false,
+          },
+        };
+        streams.set(id, rec);
+        return sendJson(200, cfOk(rec));
+      }
+      const streamMatch = /^\/pipelines\/v1\/streams\/([^/]+)$/.exec(rel);
+      if (streamMatch) {
+        const id = decodeURIComponent(streamMatch[1]);
+        const existing = streams.get(id);
+        if (!existing) return sendJson(404, cfErr("stream not found"));
+        if (req.method === "GET") return sendJson(200, cfOk(existing));
+        if (req.method === "PATCH") {
+          const nextHttp = parsedBody?.http
+            ? {
+                enabled: parsedBody.http.enabled ?? existing.http.enabled,
+                authentication: parsedBody.http.authentication ?? existing.http.authentication,
+                cors: parsedBody.http.cors
+                  ? { origins: parsedBody.http.cors.origins ?? existing.http.cors.origins }
+                  : existing.http.cors,
+              }
+            : existing.http;
+          const nextWb = parsedBody?.worker_binding
+            ? { ...existing.worker_binding, ...parsedBody.worker_binding }
+            : existing.worker_binding;
+          const updated = {
+            ...existing,
+            http: nextHttp,
+            worker_binding: nextWb,
+            version: existing.version + 1,
+            modified_at: "2026-01-01T00:01:00Z",
+          };
+          streams.set(id, updated);
+          return sendJson(200, cfOk(updated));
+        }
+        if (req.method === "DELETE") {
+          streams.delete(id);
+          return sendJson(200, cfOk({}));
+        }
+      }
+
+      // Basin Sinks: /pipelines/v1/sinks and /pipelines/v1/sinks/:id
+      if (rel === "/pipelines/v1/sinks" && req.method === "POST") {
+        const id = `sink-${++seq}`;
+        const rec = {
+          id,
+          name: parsedBody.name,
+          type: parsedBody.type,
+          format: parsedBody.format,
+          config: parsedBody.config,
+          created_at: "2026-01-01T00:00:00Z",
+          modified_at: "2026-01-01T00:00:00Z",
+        };
+        sinks.set(id, rec);
+        return sendJson(200, cfOk(rec));
+      }
+      const sinkMatch = /^\/pipelines\/v1\/sinks\/([^/]+)$/.exec(rel);
+      if (sinkMatch) {
+        const id = decodeURIComponent(sinkMatch[1]);
+        const existing = sinks.get(id);
+        if (!existing) return sendJson(404, cfErr("sink not found"));
+        if (req.method === "GET") return sendJson(200, cfOk(existing));
+        if (req.method === "DELETE") {
+          sinks.delete(id);
+          return sendJson(200, cfOk({}));
+        }
+      }
+
+      // Basin Pipelines: /pipelines/v1/pipelines and /pipelines/v1/pipelines/:id
+      if (rel === "/pipelines/v1/pipelines" && req.method === "POST") {
+        const id = `pipe-${++seq}`;
+        const rec = {
+          id,
+          name: parsedBody.name,
+          sql: parsedBody.sql,
+          status: "active",
+          tables: [],
+          created_at: "2026-01-01T00:00:00Z",
+          modified_at: "2026-01-01T00:00:00Z",
+        };
+        pipelines.set(id, rec);
+        return sendJson(200, cfOk(rec));
+      }
+      const pipeMatch = /^\/pipelines\/v1\/pipelines\/([^/]+)$/.exec(rel);
+      if (pipeMatch) {
+        const id = decodeURIComponent(pipeMatch[1]);
+        const existing = pipelines.get(id);
+        if (!existing) return sendJson(404, cfErr("pipeline not found"));
+        if (req.method === "GET") return sendJson(200, cfOk(existing));
+        if (req.method === "PUT" || req.method === "PATCH") {
+          const updated = { ...existing, ...parsedBody, modified_at: "2026-01-01T00:01:00Z" };
+          pipelines.set(id, updated);
+          return sendJson(200, cfOk(updated));
+        }
+        if (req.method === "DELETE") {
+          pipelines.delete(id);
+          return sendJson(200, cfOk({}));
+        }
+      }
+
+      // Account API Token permission groups + tokens
+      if (rel === "/tokens/permission_groups" && req.method === "GET") {
+        return sendJson(
+          200,
+          cfOk(
+            [
+              {
+                id: "pg-pipelines-send",
+                name: "Pipelines Send",
+                category: "analytics_and_logs",
+                is_selectable: true,
+                scopes: ["com.cloudflare.api.account"],
+              },
+            ],
+            { result_info: { page: 1, per_page: 100, count: 1, total_count: 1, total_pages: 1 } }
+          )
+        );
+      }
+      if (rel === "/tokens" && req.method === "POST") {
+        const id = `tok-${++seq}`;
+        const rec = {
+          id,
+          name: parsedBody.name,
+          status: "active",
+          policies: parsedBody.policies,
+          issued_on: "2026-01-01T00:00:00Z",
+          modified_on: "2026-01-01T00:00:00Z",
+        };
+        tokens.set(id, rec);
+        return sendJson(200, cfOk({ ...rec, value: "cf-mock-ingest-token-value-0123456789abcdef" }));
+      }
+      const tokMatch = /^\/tokens\/([^/]+)$/.exec(rel);
+      if (tokMatch) {
+        const id = decodeURIComponent(tokMatch[1]);
+        const existing = tokens.get(id);
+        if (!existing) return sendJson(404, cfErr("token not found"));
+        if (req.method === "GET") return sendJson(200, cfOk(existing));
+        if (req.method === "DELETE") {
+          tokens.delete(id);
+          return sendJson(200, cfOk({ id }));
+        }
+      }
+
+      return sendJson(404, cfErr(`unmatched mock route: ${req.method} ${rel}`));
+    });
+  });
+
+  return new Promise((resolve, reject) => {
+    server.on("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      resolve({
+        port: addr.port,
+        baseUrl: `http://127.0.0.1:${addr.port}/client/v4`,
+        ops,
+        streams,
+        close: () => new Promise((r) => server.close(r)),
+      });
+    });
+  });
+}
+
+test("4. Repository link integrity, zero shell scripts, and zero stale references", () => {
+  const trackedFiles = listRepoFiles(REPO_ROOT);
+  assert.ok(trackedFiles.length > 0, "Repository file list must not be empty");
+  assert.ok(fs.existsSync(FLAKE_NIX_PATH), "flake.nix must exist at repository root");
+
+  for (const relPath of trackedFiles) {
+    assert.ok(!relPath.endsWith(".sh"), `Shell scripts are forbidden in repository: '${relPath}'`);
+  }
 
   // Construct forbidden tokens dynamically so this test file never triggers self-matches even if checked
   const staleTerms = [
@@ -656,6 +1005,11 @@ test("4. Repository link integrity and zero stale worker/YARA/proprietary schema
     ["manage", "yara", "detection"].join("-"),
     ["INGEST", "AUTH", "TOKEN"].join("_"),
     ["yara", "matched"].join("_"),
+    ["provision", "basin.sh"].join("-"),
+    ["wrangler", "pipelines"].join(" "),
+    ["wrangler", "r2"].join(" "),
+    ["wrangler", "basin"].join(" "),
+    ["npx", "wrangler"].join(" "),
   ];
 
   for (const relPath of trackedFiles) {
@@ -674,12 +1028,15 @@ test("4. Repository link integrity and zero stale worker/YARA/proprietary schema
     "AGENTS.md",
     "contracts/ocsf/README.md",
     "manifest/examples/cloudflare-basin-ocsf.yaml",
+    "adapters/storage/cloudflare-basin-iceberg/terraform/README.md",
+    "adapters/storage/cloudflare-basin-iceberg/pulumi/README.md",
     "skills/compose-observability-stack/SKILL.md",
     "skills/compose-observability-stack/references/component-catalog.md",
     "skills/setup-cloudflare-basin-iceberg/SKILL.md",
     "skills/setup-cloudflare-basin-iceberg/references/basin-troubleshooting.md",
   ];
-  const pathRefRe = /\b(?:adapters|contracts|manifest|skills|tests)\/[a-zA-Z0-9._\/-]+\.(?:yaml|yml|json|sql|sh|lua|conf|md|mjs)\b/g;
+  const pathRefRe =
+    /\b(?:adapters|contracts|manifest|skills|tests)\/[a-zA-Z0-9._\/-]+\.(?:yaml|yml|json|sql|sh|lua|conf|md|mjs|tf|ts|nix)\b/g;
   for (const doc of docFiles) {
     const text = fs.readFileSync(path.join(REPO_ROOT, doc), "utf8");
     for (const match of text.matchAll(pathRefRe)) {
@@ -689,58 +1046,308 @@ test("4. Repository link integrity and zero stale worker/YARA/proprietary schema
   }
 });
 
-test("5. provision-basin.sh dry-run plan, secret redaction, and argument validation", () => {
-  const sentinelSecret = "secret-catalog-token-do-not-leak-987";
-  const dryRun = spawnSync(
-    PROVISION_SCRIPT_PATH,
-    ["--dry-run", "--bucket", "oof-telemetry", "--namespace", "siem", "--table", "ocsf_event_log_activity"],
-    {
-      cwd: REPO_ROOT,
-      env: { ...process.env, BASIN_CATALOG_TOKEN: sentinelSecret },
-      encoding: "utf8",
+test("5. Cloud IaC (Terraform/OpenTofu + Pulumi) CRUD lifecycle, struct schema preservation, secret hygiene, and validation", async () => {
+  const tofuBin = requireBinary("tofu");
+  const accountId = "0123456789abcdef0123456789abcdef";
+  const adminToken = "cf_admin_mock_token_0123456789abcdef01234567";
+  const catalogToken = "secret-catalog-token-do-not-leak-987654";
+  const basinSchema = JSON.parse(fs.readFileSync(BASIN_SCHEMA_PATH, "utf8"));
+  const pipelineSqlRaw = fs.readFileSync(PIPELINE_SQL_PATH, "utf8");
+
+  const mockCf = await startMockCloudflareApiServer(accountId, adminToken);
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "oof-iac-test-"));
+
+  try {
+    // --- Part A: Real OpenTofu E2E against mock Cloudflare v4 API ---
+    const stagedContractsDir = path.join(tmpDir, "contracts/ocsf");
+    const stagedStorageDir = path.join(tmpDir, "adapters/storage/cloudflare-basin-iceberg");
+    const stagedTfDir = path.join(stagedStorageDir, "terraform");
+    fs.mkdirSync(stagedContractsDir, { recursive: true });
+    fs.mkdirSync(stagedTfDir, { recursive: true });
+    fs.copyFileSync(BASIN_SCHEMA_PATH, path.join(stagedContractsDir, "event-log-activity.basin.json"));
+    fs.copyFileSync(PIPELINE_SQL_PATH, path.join(stagedStorageDir, "pipeline.sql"));
+    for (const entry of fs.readdirSync(TERRAFORM_DIR)) {
+      if (entry.endsWith(".tf") || entry.endsWith(".tfvars.example")) {
+        fs.copyFileSync(path.join(TERRAFORM_DIR, entry), path.join(stagedTfDir, entry));
+      }
     }
-  );
-  assert.equal(dryRun.status, 0, dryRun.stderr);
-  assert.ok(!dryRun.stdout.includes(sentinelSecret), "dry-run must never echo BASIN_CATALOG_TOKEN");
-  assert.ok(dryRun.stdout.includes("--http-enabled true"));
-  assert.ok(dryRun.stdout.includes("--http-auth true"));
-  assert.ok(dryRun.stdout.includes("--type r2-data-catalog"));
-  assert.ok(dryRun.stdout.includes("contracts/ocsf/event-log-activity.basin.json"));
-  assert.ok(dryRun.stdout.includes("<BASIN_CATALOG_TOKEN>"));
-  assert.ok(dryRun.stdout.includes("INSERT INTO ocsf_event_log_sink"));
 
-  // Custom schema path acceptance
-  const customSchema = spawnSync(PROVISION_SCRIPT_PATH, ["--dry-run", "--schema-file", BASIN_SCHEMA_PATH], {
-    cwd: REPO_ROOT,
-    encoding: "utf8",
-  });
-  assert.equal(customSchema.status, 0, customSchema.stderr);
+    const tfHome = path.join(tmpDir, "tf-home");
+    fs.mkdirSync(tfHome, { recursive: true });
+    const tfEnv = {
+      ...process.env,
+      HOME: tfHome,
+      TF_VAR_cloudflare_account_id: accountId,
+      TF_VAR_cloudflare_api_token: adminToken,
+      TF_VAR_catalog_token: catalogToken,
+      TF_VAR_cloudflare_api_base_url: mockCf.baseUrl,
+    };
 
-  // Negative validations
-  const badTable = spawnSync(PROVISION_SCRIPT_PATH, ["--dry-run", "--table", "foo; DROP TABLE bar"], {
-    cwd: REPO_ROOT,
-    encoding: "utf8",
-  });
-  assert.notEqual(badTable.status, 0);
+    const tfvarsPath = path.join(stagedTfDir, "test.tfvars.json");
+    const writeTfvars = (extra = {}) => {
+      fs.writeFileSync(
+        tfvarsPath,
+        JSON.stringify(
+          {
+            bucket_name: "oof-telemetry",
+            namespace: "siem",
+            table_name: "ocsf_event_log_activity",
+            stream_name: "ocsf_event_log_stream",
+            sink_name: "ocsf_event_log_sink",
+            pipeline_name: "ocsf_event_log_to_iceberg",
+            roll_interval_seconds: 120,
+            create_ingest_token: true,
+            ...extra,
+          },
+          null,
+          2
+        )
+      );
+    };
+    writeTfvars();
 
-  const badBucket = spawnSync(PROVISION_SCRIPT_PATH, ["--dry-run", "--bucket", "Bad_Bucket"], {
-    cwd: REPO_ROOT,
-    encoding: "utf8",
-  });
-  assert.notEqual(badBucket.status, 0);
+    const initRes = await spawnAsync(
+      tofuBin,
+      [`-chdir=${stagedTfDir}`, "init", "-backend=false", "-input=false"],
+      { env: tfEnv }
+    );
+    assert.equal(initRes.status, 0, `${initRes.stdout}\n${initRes.stderr}`);
 
-  const badRoll = spawnSync(PROVISION_SCRIPT_PATH, ["--dry-run", "--roll-interval", "30"], {
-    cwd: REPO_ROOT,
-    encoding: "utf8",
-  });
-  assert.notEqual(badRoll.status, 0);
+    const valRes = await spawnAsync(tofuBin, [`-chdir=${stagedTfDir}`, "validate"], { env: tfEnv });
+    assert.equal(valRes.status, 0, `${valRes.stdout}\n${valRes.stderr}`);
 
-  const missingTokenLive = spawnSync(PROVISION_SCRIPT_PATH, [], {
-    cwd: REPO_ROOT,
-    env: { ...process.env, BASIN_CATALOG_TOKEN: "" },
-    encoding: "utf8",
-  });
-  assert.notEqual(missingTokenLive.status, 0);
+    // Negative variable validations before apply (input validation runs without mutating state)
+    const invalidCases = [
+      ["bad table_name SQLi", ["-var=table_name=foo; DROP TABLE bar"]],
+      ["bad bucket_name", ["-var=bucket_name=Bad_Bucket"]],
+      ["bad roll_interval_seconds", ["-var=roll_interval_seconds=30"]],
+      ["bad non-HTTPS remote URL", ["-var=cloudflare_api_base_url=http://api.cloudflare.com/client/v4"]],
+      ["stream_name equals sink_name", ["-var=stream_name=same_ident", "-var=sink_name=same_ident"]],
+    ];
+    for (const [label, extraFlags] of invalidCases) {
+      const badPlan = await spawnAsync(
+        tofuBin,
+        [`-chdir=${stagedTfDir}`, "plan", "-input=false", "-refresh=false", `-var-file=${tfvarsPath}`, ...extraFlags],
+        { env: tfEnv }
+      );
+      assert.notEqual(badPlan.status, 0, `Expected OpenTofu validation failure for: ${label}`);
+    }
+
+    const applyRes = await spawnAsync(
+      tofuBin,
+      [`-chdir=${stagedTfDir}`, "apply", "-auto-approve", "-input=false", `-var-file=${tfvarsPath}`],
+      { env: tfEnv }
+    );
+    assert.equal(applyRes.status, 0, `${applyRes.stdout}\n${applyRes.stderr}`);
+    assert.ok(!applyRes.stdout.includes(adminToken), "apply output must never echo cloudflare_api_token");
+    assert.ok(!applyRes.stdout.includes(catalogToken), "apply output must never echo catalog_token");
+
+    // Verify zero-diff plan right after apply
+    const zeroDiffPlan = await spawnAsync(
+      tofuBin,
+      [`-chdir=${stagedTfDir}`, "plan", "-detailed-exitcode", "-input=false", `-var-file=${tfvarsPath}`],
+      { env: tfEnv }
+    );
+    assert.equal(zeroDiffPlan.status, 0, `Expected zero-diff plan, got:\n${zeroDiffPlan.stdout}\n${zeroDiffPlan.stderr}`);
+
+    // Inspect recorded HTTP operations from apply
+    const isCatalogPath = (p) => p.startsWith("/r2-catalog/oof-telemetry") || p.startsWith("/r2/buckets/oof-telemetry/catalog");
+    const createOps = mockCf.ops.filter((o) => o.method === "POST" || o.method === "PUT");
+    const streamCreateIdx = createOps.findIndex((o) => o.path === "/pipelines/v1/streams");
+    const bucketCreateIdx = createOps.findIndex((o) => o.path === "/r2/buckets");
+    const catalogCreateIdx = createOps.findIndex((o) => isCatalogPath(o.path));
+    const sinkCreateIdx = createOps.findIndex((o) => o.path === "/pipelines/v1/sinks");
+    const pipeCreateIdx = createOps.findIndex((o) => o.path === "/pipelines/v1/pipelines");
+
+    assert.ok(bucketCreateIdx >= 0 && catalogCreateIdx > bucketCreateIdx, "catalog must be enabled after bucket");
+    assert.ok(sinkCreateIdx > catalogCreateIdx, "sink must be created after bucket and catalog");
+    assert.ok(pipeCreateIdx > streamCreateIdx && pipeCreateIdx > sinkCreateIdx, "pipeline must be created after stream & sink");
+
+    const streamCreateBody = createOps[streamCreateIdx].body;
+    assert.equal(streamCreateBody.http?.enabled, true);
+    assert.equal(streamCreateBody.http?.authentication, true);
+    assert.equal(streamCreateBody.schema?.fields?.length, basinSchema.fields.length);
+    const createdMeta = streamCreateBody.schema.fields.find((f) => f.name === "metadata");
+    const createdDevice = streamCreateBody.schema.fields.find((f) => f.name === "device");
+    const createdActor = streamCreateBody.schema.fields.find((f) => f.name === "actor");
+    assert.equal(createdMeta?.type, "struct", "metadata struct type must be preserved verbatim");
+    assert.equal(createdDevice?.type, "struct", "device struct type must be preserved verbatim");
+    assert.equal(createdActor?.type, "struct", "actor struct type must be preserved verbatim");
+
+    const sinkCreateBody = createOps[sinkCreateIdx].body;
+    assert.equal(sinkCreateBody.type, "r2_data_catalog");
+    assert.equal(sinkCreateBody.config?.namespace, "siem");
+    assert.equal(sinkCreateBody.config?.table_name, "ocsf_event_log_activity");
+
+    const expectedSql = pipelineSqlRaw
+      .replaceAll("__SINK_NAME__", "ocsf_event_log_sink")
+      .replaceAll("__STREAM_NAME__", "ocsf_event_log_stream");
+    assert.equal(createOps[pipeCreateIdx].body.sql, expectedSql);
+
+    // Check outputs
+    const outRes = await spawnAsync(tofuBin, [`-chdir=${stagedTfDir}`, "output", "-json"], { env: tfEnv });
+    assert.equal(outRes.status, 0, outRes.stderr);
+    const outputs = JSON.parse(outRes.stdout);
+    assert.equal(outputs.bucket_name.value, "oof-telemetry");
+    assert.match(outputs.stream_endpoint.value, /^https:\/\/stream[0-9]+\.ingest\.cloudflare\.com$/);
+    assert.match(outputs.stream_host.value, /^stream[0-9]+\.ingest\.cloudflare\.com$/);
+    assert.equal(outputs.ingest_token.sensitive, true);
+    assert.ok(typeof outputs.ingest_token.value === "string" && outputs.ingest_token.value.length > 0);
+
+    // Update CORS origins -> must use PATCH in-place without replacing stream
+    const opCountBeforePatch = mockCf.ops.length;
+    writeTfvars({ stream_cors_origins: ["https://siem.example.com"] });
+    const patchRes = await spawnAsync(
+      tofuBin,
+      [`-chdir=${stagedTfDir}`, "apply", "-auto-approve", "-input=false", `-var-file=${tfvarsPath}`],
+      { env: tfEnv }
+    );
+    assert.equal(patchRes.status, 0, `${patchRes.stdout}\n${patchRes.stderr}`);
+    const patchOps = mockCf.ops.slice(opCountBeforePatch);
+    assert.ok(patchOps.some((o) => o.method === "PATCH" && o.path.startsWith("/pipelines/v1/streams/")));
+    assert.ok(!patchOps.some((o) => o.method === "POST" && o.path === "/pipelines/v1/streams"));
+
+    const zeroDiffAfterPatch = await spawnAsync(
+      tofuBin,
+      [`-chdir=${stagedTfDir}`, "plan", "-detailed-exitcode", "-input=false", `-var-file=${tfvarsPath}`],
+      { env: tfEnv }
+    );
+    assert.equal(zeroDiffAfterPatch.status, 0, zeroDiffAfterPatch.stdout + zeroDiffAfterPatch.stderr);
+
+    // Destroy ordering: pipeline before stream & sink, and sink before catalog & bucket
+    const opCountBeforeDestroy = mockCf.ops.length;
+    const destroyRes = await spawnAsync(
+      tofuBin,
+      [`-chdir=${stagedTfDir}`, "destroy", "-auto-approve", "-input=false", `-var-file=${tfvarsPath}`],
+      { env: tfEnv }
+    );
+    assert.equal(destroyRes.status, 0, `${destroyRes.stdout}\n${destroyRes.stderr}`);
+    const destroyOps = mockCf.ops
+      .slice(opCountBeforeDestroy)
+      .filter((o) => o.method === "DELETE" || (o.method === "POST" && o.path.endsWith("/disable")));
+    const delPipeIdx = destroyOps.findIndex((o) => o.path.startsWith("/pipelines/v1/pipelines/"));
+    const delStreamIdx = destroyOps.findIndex((o) => o.path.startsWith("/pipelines/v1/streams/"));
+    const delSinkIdx = destroyOps.findIndex((o) => o.path.startsWith("/pipelines/v1/sinks/"));
+    const delCatIdx = destroyOps.findIndex((o) => isCatalogPath(o.path));
+    const delBucketIdx = destroyOps.findIndex((o) => o.path === "/r2/buckets/oof-telemetry");
+    assert.ok(delPipeIdx >= 0 && delStreamIdx > delPipeIdx && delSinkIdx > delPipeIdx);
+    assert.ok(delCatIdx > delSinkIdx && delBucketIdx > delSinkIdx);
+
+    // --- Part B: Pulumi basin-core.ts runtime validation & BasinStructuredStreamProvider CRUD ---
+    const basinCore = await import(pathToFileURL(PULUMI_CORE_PATH).href);
+    const loadedFields = basinCore.loadBasinSchemaFields(BASIN_SCHEMA_PATH);
+    assert.equal(loadedFields.length, basinSchema.fields.length);
+    assert.equal(loadedFields.find((f) => f.name === "metadata")?.type, "struct");
+    assert.equal(
+      basinCore.renderPipelineSql(PIPELINE_SQL_PATH, "ocsf_event_log_sink", "ocsf_event_log_stream"),
+      expectedSql
+    );
+    assert.equal(
+      basinCore.extractHostFromEndpoint("https://abc123.ingest.cloudflare.com"),
+      "abc123.ingest.cloudflare.com"
+    );
+
+    const validSettings = {
+      accountId,
+      catalogToken,
+      apiBaseUrl: mockCf.baseUrl,
+      bucketName: "oof-telemetry",
+      namespace: "siem",
+      tableName: "ocsf_event_log_activity",
+      streamName: "ocsf_event_log_stream",
+      sinkName: "ocsf_event_log_sink",
+      pipelineName: "ocsf_event_log_to_iceberg",
+      rollIntervalSeconds: 300,
+      ingestTokenName: "oof-ingest",
+    };
+    basinCore.validateBasinSettings(validSettings);
+    for (const badOverride of [
+      { accountId: "not-hex" },
+      { catalogToken: "   " },
+      { apiBaseUrl: "http://api.cloudflare.com/client/v4" },
+      { bucketName: "Bad_Bucket" },
+      { tableName: "foo; DROP TABLE bar" },
+      { streamName: "dup", sinkName: "dup" },
+      { rollIntervalSeconds: 30 },
+    ]) {
+      assert.throws(() => basinCore.validateBasinSettings({ ...validSettings, ...badOverride }));
+    }
+
+    const provider = new basinCore.BasinStructuredStreamProvider();
+    const baseStreamInputs = {
+      accountId,
+      apiBaseUrl: mockCf.baseUrl,
+      apiToken: adminToken,
+      name: "pulumi_ocsf_stream",
+      format: { type: "json" },
+      http: { enabled: true, authentication: true, cors: { origins: [] } },
+      workerBinding: { enabled: false },
+      schema: { fields: loadedFields },
+    };
+
+    const checkGood = await provider.check(undefined, baseStreamInputs);
+    assert.equal(checkGood.failures, undefined);
+    const checkBad = await provider.check(undefined, {
+      ...baseStreamInputs,
+      accountId: "bad",
+      name: "bad;name",
+      schema: { fields: [] },
+    });
+    assert.equal(checkBad.failures?.length, 3);
+
+    const created = await provider.create(checkGood.inputs);
+    assert.ok(!Object.hasOwn(created.outs, "apiToken"), "Pulumi dynamic state outs must NEVER persist apiToken");
+    assert.equal(created.outs.name, "pulumi_ocsf_stream");
+    assert.equal(created.outs.schema.fields.find((f) => f.name === "device")?.type, "struct");
+
+    const readBack = await provider.read(created.id, { ...created.outs, apiToken: adminToken });
+    assert.equal(readBack.id, created.id);
+    // Server injects format.unstructured=false & schema.inferred=false; diff must stay clean (changes: false)
+    const cleanDiff = await provider.diff(created.id, readBack.props, checkGood.inputs);
+    assert.equal(cleanDiff.changes, false);
+
+    const corsUpdateInputs = {
+      ...checkGood.inputs,
+      http: { enabled: true, authentication: true, cors: { origins: ["https://siem.example.com"] } },
+    };
+    const patchDiff = await provider.diff(created.id, readBack.props, corsUpdateInputs);
+    assert.equal(patchDiff.changes, true);
+    assert.equal(patchDiff.replaces, undefined);
+
+    const pulumiOpsBeforePatch = mockCf.ops.length;
+    const updated = await provider.update(created.id, readBack.props, corsUpdateInputs);
+    assert.ok(!Object.hasOwn(updated.outs, "apiToken"), "update outs must NEVER persist apiToken");
+    assert.deepEqual(updated.outs.http.cors.origins, ["https://siem.example.com"]);
+    const pulumiPatchCall = mockCf.ops.slice(pulumiOpsBeforePatch).find((o) => o.method === "PATCH");
+    assert.deepEqual(Object.keys(pulumiPatchCall.body).sort(), ["http", "worker_binding"]);
+
+    const schemaReplaceDiff = await provider.diff(created.id, updated.outs, {
+      ...corsUpdateInputs,
+      schema: { fields: loadedFields.slice(0, 1) },
+    });
+    assert.equal(schemaReplaceDiff.changes, true);
+    assert.deepEqual(schemaReplaceDiff.replaces, ["schema"]);
+    assert.equal(schemaReplaceDiff.deleteBeforeReplace, true);
+
+    // Token must be scrubbed from error messages on failure
+    const secretSentinel = "super_secret_token_never_echo_40chars_0000";
+    await assert.rejects(
+      () => provider.create({ ...checkGood.inputs, apiToken: secretSentinel }),
+      (err) => {
+        assert.ok(!err.message.includes(secretSentinel), "API errors must scrub Bearer token");
+        return true;
+      }
+    );
+
+    // Delete + idempotent delete (404) + read on deleted (404 -> {})
+    await provider.delete(created.id, { ...updated.outs, apiToken: adminToken });
+    await provider.delete(created.id, { ...updated.outs, apiToken: adminToken });
+    const missingRead = await provider.read(created.id, { ...updated.outs, apiToken: adminToken });
+    assert.deepEqual(missingRead, {});
+  } finally {
+    await mockCf.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
 
 test("6. Vector config passes validate and built-in VRL unit tests with zero warnings", () => {

@@ -23,52 +23,55 @@ flowchart LR
 
 | Slot | Default Choice | Alternatives / Extensions |
 | :--- | :--- | :--- |
-| `schema` | [OCSF v1.3.0 Event Log Activity (`1008`)](file:///home/reta/.herdr/worktrees/open-observability-framework/contracts/ocsf/event-log-activity.basin.json) | Extensible via `schema.profile` (`ecs`, `cim`) — zero proprietary fields |
-| `collect` | [Vector (`journald` + `otlp`)](file:///home/reta/.herdr/worktrees/open-observability-framework/adapters/collect/vector-journald/vector.yaml) | [Fluent Bit (`systemd` + `opentelemetry`)](file:///home/reta/.herdr/worktrees/open-observability-framework/adapters/collect/fluent-bit-journald/fluent-bit.conf), [OTel Collector Bridge](file:///home/reta/.herdr/worktrees/open-observability-framework/adapters/collect/otel-collector-journald/otelcol.yaml) |
+| `schema` | [OCSF v1.3.0 Event Log Activity (`1008`)](./contracts/ocsf/event-log-activity.basin.json) | Extensible via `schema.profile` (`ecs`, `cim`) — zero proprietary fields |
+| `collect` | [Vector (`journald` + `otlp`)](./adapters/collect/vector-journald/vector.yaml) | [Fluent Bit (`systemd` + `opentelemetry`)](./adapters/collect/fluent-bit-journald/fluent-bit.conf), [OTel Collector Bridge](./adapters/collect/otel-collector-journald/otelcol.yaml), [NixOS Flake Module](./flake.nix) |
 | `detect` | Disabled by default (`detect.enabled: false`) | Host-agent (`yara-x` / `kunai`) or lakehouse-batch SQL rules |
-| `ingest` | `direct-basin-http` (`--http-enabled true --http-auth true`) | Authenticated via Cloudflare Account API Token (`Basin Pipelines Send`) |
-| `storage` | [Cloudflare Basin Iceberg](file:///home/reta/.herdr/worktrees/open-observability-framework/adapters/storage/cloudflare-basin-iceberg/provision-basin.sh) | [Pipeline SQL](file:///home/reta/.herdr/worktrees/open-observability-framework/adapters/storage/cloudflare-basin-iceberg/pipeline.sql) |
+| `ingest` | `direct-basin-http` (`http.enabled = true`, `http.authentication = true`) | Authenticated via Cloudflare Account API Token (`Pipelines Send` / `Basin Pipelines Send`) |
+| `storage` | Cloudflare Basin Iceberg ([Terraform/OpenTofu](./adapters/storage/cloudflare-basin-iceberg/terraform/README.md) · [Pulumi TS](./adapters/storage/cloudflare-basin-iceberg/pulumi/README.md)) | [Pipeline SQL](./adapters/storage/cloudflare-basin-iceberg/pipeline.sql), inspected via Cloudflare `cf` CLI |
 | `apm` | `metadata.correlation_uid` (`trace_id`) + `unmapped.span_id` | Full OTLP Traces + Metrics exporters via `otelcol.yaml` |
-| `query` | Basin SQL & DuckDB | [Hunting SQL](file:///home/reta/.herdr/worktrees/open-observability-framework/adapters/storage/cloudflare-basin-iceberg/queries/siem_hunting.sql), PyIceberg, Spark |
+| `query` | Basin SQL & DuckDB | [Hunting SQL](./adapters/storage/cloudflare-basin-iceberg/queries/siem_hunting.sql), PyIceberg, Spark |
 
 ---
 
 ## Repository Map
 
-- [manifest/stack.schema.json](file:///home/reta/.herdr/worktrees/open-observability-framework/manifest/stack.schema.json) & [manifest/examples/cloudflare-basin-ocsf.yaml](file:///home/reta/.herdr/worktrees/open-observability-framework/manifest/examples/cloudflare-basin-ocsf.yaml) — Declarative stack manifest schema & OCSF example
-- [contracts/ocsf/event-log-activity.basin.json](file:///home/reta/.herdr/worktrees/open-observability-framework/contracts/ocsf/event-log-activity.basin.json) & [contracts/ocsf/README.md](file:///home/reta/.herdr/worktrees/open-observability-framework/contracts/ocsf/README.md) — Official OCSF v1.3.0 Event Log Activity (`1008`) Basin schema & field mapping specification
-- [adapters/collect/vector-journald/vector.yaml](file:///home/reta/.herdr/worktrees/open-observability-framework/adapters/collect/vector-journald/vector.yaml) — Vector `journald` + `otlp` collector with VRL OCSF v1.3.0 normalization & built-in unit tests
-- [adapters/collect/fluent-bit-journald/fluent-bit.conf](file:///home/reta/.herdr/worktrees/open-observability-framework/adapters/collect/fluent-bit-journald/fluent-bit.conf) & [adapters/collect/fluent-bit-journald/ocsf.lua](file:///home/reta/.herdr/worktrees/open-observability-framework/adapters/collect/fluent-bit-journald/ocsf.lua) — Fluent Bit `systemd` + `opentelemetry` collector with Lua OCSF v1.3.0 normalization
-- [adapters/collect/otel-collector-journald/otelcol.yaml](file:///home/reta/.herdr/worktrees/open-observability-framework/adapters/collect/otel-collector-journald/otelcol.yaml) — OpenTelemetry Collector (`otlp` -> `otlphttp` protobuf bridge)
-- [adapters/storage/cloudflare-basin-iceberg/](file:///home/reta/.herdr/worktrees/open-observability-framework/adapters/storage/cloudflare-basin-iceberg/provision-basin.sh) — Wrangler provisioning script, OCSF Iceberg pipeline SQL, and SIEM/APM hunting queries
-- [tests/ocsf-contracts.test.mjs](file:///home/reta/.herdr/worktrees/open-observability-framework/tests/ocsf-contracts.test.mjs) — Zero-dependency contract, CLI, and live E2E wire/schema test suite
-- [skills/](file:///home/reta/.herdr/worktrees/open-observability-framework/skills/compose-observability-stack/SKILL.md) — Agent skills (`compose-observability-stack`, `setup-cloudflare-basin-iceberg`)
+- [flake.nix](./flake.nix) — Nix Flake exposing `oof-tofu`, wrapped `oof-vector`/`oof-fluent-bit` configs & binaries, `devShells.default`, offline `checks`, and `nixosModules.default` (`services.oof-collector`)
+- [manifest/stack.schema.json](./manifest/stack.schema.json) & [manifest/examples/cloudflare-basin-ocsf.yaml](./manifest/examples/cloudflare-basin-ocsf.yaml) — Declarative stack manifest schema & OCSF example
+- [contracts/ocsf/event-log-activity.basin.json](./contracts/ocsf/event-log-activity.basin.json) & [contracts/ocsf/README.md](./contracts/ocsf/README.md) — Official OCSF v1.3.0 Event Log Activity (`1008`) Basin schema & field mapping specification
+- [adapters/collect/vector-journald/vector.yaml](./adapters/collect/vector-journald/vector.yaml) — Vector `journald` + `otlp` collector with VRL OCSF v1.3.0 normalization & built-in unit tests
+- [adapters/collect/fluent-bit-journald/fluent-bit.conf](./adapters/collect/fluent-bit-journald/fluent-bit.conf) & [adapters/collect/fluent-bit-journald/ocsf.lua](./adapters/collect/fluent-bit-journald/ocsf.lua) — Fluent Bit `systemd` + `opentelemetry` collector with Lua OCSF v1.3.0 normalization
+- [adapters/collect/otel-collector-journald/otelcol.yaml](./adapters/collect/otel-collector-journald/otelcol.yaml) — OpenTelemetry Collector (`otlp` -> `otlphttp` protobuf bridge)
+- [adapters/storage/cloudflare-basin-iceberg/terraform/](./adapters/storage/cloudflare-basin-iceberg/terraform/README.md) & [adapters/storage/cloudflare-basin-iceberg/pulumi/](./adapters/storage/cloudflare-basin-iceberg/pulumi/README.md) — Declarative Cloud IaC (`OpenTofu/Terraform` and `Pulumi TypeScript`), [pipeline.sql](./adapters/storage/cloudflare-basin-iceberg/pipeline.sql), and [siem_hunting.sql](./adapters/storage/cloudflare-basin-iceberg/queries/siem_hunting.sql)
+- [tests/ocsf-contracts.test.mjs](./tests/ocsf-contracts.test.mjs) — Zero-dependency contract, Cloud IaC mock-API lifecycle, and live Vector & Fluent Bit E2E wire/schema test suite
+- [skills/](./skills/compose-observability-stack/SKILL.md) — Agent skills (`compose-observability-stack`, `setup-cloudflare-basin-iceberg`)
 
 ---
 
 ## Quick Verification (Local)
 
 ```bash
-# 1. Lint provisioning script
-shellcheck adapters/storage/cloudflare-basin-iceberg/provision-basin.sh
+# 1. Run full Nix Flake checks (Terraform validate, Pulumi typecheck, NixOS module eval, OCSF E2E suite)
+nix flake check
 
-# 2. Validate Basin provisioning plan without touching Cloudflare
-./adapters/storage/cloudflare-basin-iceberg/provision-basin.sh --dry-run
+# 2. Validate Vector config + VRL OCSF unit tests inside the dev shell
+nix develop -c bash -c '
+  VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true \
+  OOF_VECTOR_DATA_DIR="$(mktemp -d)" \
+  OOF_BASIN_ENDPOINT="https://example.ingest.cloudflare.com" \
+  OOF_INGEST_TOKEN="dummy" \
+    vector validate --no-environment adapters/collect/vector-journald/vector.yaml
+  VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true \
+  OOF_VECTOR_DATA_DIR="$(mktemp -d)" \
+  OOF_BASIN_ENDPOINT="https://example.ingest.cloudflare.com" \
+  OOF_INGEST_TOKEN="dummy" \
+    vector test adapters/collect/vector-journald/vector.yaml
+'
 
-# 3. Validate Vector config + VRL OCSF unit tests
-VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true \
-OOF_BASIN_ENDPOINT="https://example.ingest.cloudflare.com" \
-OOF_INGEST_TOKEN="dummy" \
-  vector validate --no-environment adapters/collect/vector-journald/vector.yaml
-VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true \
-OOF_BASIN_ENDPOINT="https://example.ingest.cloudflare.com" \
-OOF_INGEST_TOKEN="dummy" \
-  vector test adapters/collect/vector-journald/vector.yaml
-
-# 4. Run full contract + Vector & Fluent Bit E2E wire conformance suite
-nix shell nixpkgs#vector nixpkgs#fluent-bit -c node --test tests/ocsf-contracts.test.mjs
+# 3. Run full contract + IaC + live Vector & Fluent Bit E2E wire conformance suite directly
+nix develop -c node --test tests/ocsf-contracts.test.mjs
 ```
 
-## Deploying to Cloudflare Basin
+## Deploying to Cloudflare Basin & Linux Hosts
 
-See [skills/setup-cloudflare-basin-iceberg/SKILL.md](file:///home/reta/.herdr/worktrees/open-observability-framework/skills/setup-cloudflare-basin-iceberg/SKILL.md) for the complete provisioning and sender token setup runbook.
+- **Cloud IaC (Terraform / OpenTofu or Pulumi)** + **`cf` CLI verification**: see [skills/setup-cloudflare-basin-iceberg/SKILL.md](./skills/setup-cloudflare-basin-iceberg/SKILL.md) (and module READMEs under `terraform/` and `pulumi/`).
+- **NixOS host collectors (`services.oof-collector`)**: import `oof.nixosModules.default` from [flake.nix](./flake.nix) and supply an out-of-store `environmentFile` (`OOF_BASIN_ENDPOINT` / `OOF_BASIN_HOST`, `OOF_INGEST_TOKEN`).

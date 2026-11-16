@@ -3,3 +3,36 @@
 !.agents/skills.json
 .wrangler/
 .DS_Store
+*.log
+
+# Nix build outputs
+result
+result-*
+
+# Node / Pulumi dependencies & local stack secrets
+node_modules/
+.pulumi/
+Pulumi.*.yaml
+!Pulumi.yaml
+
+# Terraform / OpenTofu state, provider cache, and variable secrets
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+
+# Local environment & Cloudflare state
+.cloudflare/
+.env
+.env.*

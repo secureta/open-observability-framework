@@ -1,0 +1,19 @@
+{
+  "name": "@oof/cloudflare-basin-iceberg-pulumi",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pulumi TypeScript IaC for Open Observability Framework (Cloudflare R2 + Basin Catalog + OCSF v1.3.0 Stream/Sink/Pipeline)",
+  "main": "index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@pulumi/cloudflare": "^6.24.0",
+    "@pulumi/pulumi": "^3.276.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}

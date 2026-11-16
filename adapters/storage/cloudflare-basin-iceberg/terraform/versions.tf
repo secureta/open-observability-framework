@@ -1,0 +1,14 @@
+terraform {
+  required_version = ">= 1.6.0"
+
+  required_providers {
+    cloudflare = {
+      source  = "cloudflare/cloudflare"
+      version = ">= 5.19.0, < 6.0.0"
+    }
+    restful = {
+      source  = "magodo/restful"
+      version = "~> 0.25"
+    }
+  }
+}
