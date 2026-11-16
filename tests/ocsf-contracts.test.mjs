@@ -1438,6 +1438,29 @@ test("5. Cloud IaC (Terraform/OpenTofu + Pulumi) CRUD lifecycle, struct schema p
       }
     );
 
+    // 403 JSON error without `errors` array exercises the `trimmed` fallback redaction before 300-char slicing.
+    const rawFallbackBody = JSON.stringify({
+      success: false,
+      message: "z".repeat(245) + secretSentinel,
+    });
+    assert.ok(
+      rawFallbackBody.indexOf(secretSentinel) < 300 &&
+        rawFallbackBody.indexOf(secretSentinel) + secretSentinel.length > 300
+    );
+    mockCf.setNextResponse({
+      method: "GET",
+      status: 403,
+      rawBody: rawFallbackBody,
+    });
+    await assert.rejects(
+      () => provider.read(created.id, created.outs),
+      (err) => {
+        assert.ok(!err.message.includes(secretSentinel.slice(0, 10)), "403 raw JSON fallback slice must not leak token prefix");
+        assert.ok(err.message.includes("[REDACTED]"));
+        return true;
+      }
+    );
+
     process.env.CLOUDFLARE_API_TOKEN = adminToken;
     // Empty 204 DELETE response is valid HTTP
     mockCf.setNextResponse({ method: "DELETE", status: 204, rawBody: "" });
