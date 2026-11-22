@@ -1,0 +1,594 @@
+# Open Observability Framework — Vector GitHub Actions Webhook Collector (OCSF v1.3.0 -> Direct Basin HTTP)
+#
+# Receives GitHub Webhooks (`workflow_run`, `workflow_job`, `secret_scanning_alert`,
+# `code_scanning_alert`, `dependabot_alert`, etc.) over HTTP, verifies HMAC-SHA256
+# signatures (`x-hub-signature-256`), normalizes payloads into official OCSF v1.3.0
+# `Event Log Activity` (`category_uid: 1`, `class_uid: 1008`, `activity_id: 99`),
+# and ships gzipped JSON arrays directly to Cloudflare Basin HTTP (`direct-basin-http`).
+#
+# Required environment variables:
+#   OOF_BASIN_ENDPOINT          (e.g. https://<STREAM_ID>.ingest.cloudflare.com)
+#   OOF_INGEST_TOKEN            (Cloudflare Account API Token with `Basin Pipelines Send`)
+#   OOF_GITHUB_WEBHOOK_SECRET   (Shared secret configured on the GitHub repository/org webhook)
+#
+# Optional environment variables:
+#   OOF_VECTOR_DATA_DIR         (default: /var/lib/vector)
+#   OOF_GHA_WEBHOOK_LISTEN      (default: 127.0.0.1:8088)
+#
+# Vector >= 0.60 note:
+#   Interpolating environment variables (e.g. `$OOF_BASIN_ENDPOINT` with braces) requires `--dangerously-allow-env-var-interpolation`
+#   (or `VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true`):
+#     vector validate --no-environment --dangerously-allow-env-var-interpolation adapters/collect/vector-github-actions/vector.yaml
+#     VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true OOF_GITHUB_WEBHOOK_SECRET=test-secret vector test adapters/collect/vector-github-actions/vector.yaml
+
+data_dir: "${OOF_VECTOR_DATA_DIR:-/var/lib/vector}"
+
+sources:
+  github_webhook:
+    type: http_server
+    address: "${OOF_GHA_WEBHOOK_LISTEN:-127.0.0.1:8088}"
+    path: "/webhook/github"
+    strict_path: true
+    decoding:
+      codec: bytes
+    headers:
+      - x-github-event
+      - x-github-delivery
+      - x-hub-signature-256
+
+transforms:
+  verify_github_signature:
+    type: filter
+    inputs:
+      - github_webhook
+    condition:
+      type: vrl
+      source: |
+        secret, s_err = get_env_var("OOF_GITHUB_WEBHOOK_SECRET")
+        if s_err != null || !is_string(secret) || secret == "" {
+          false
+        } else if !exists(."x-hub-signature-256") || !is_string(."x-hub-signature-256") {
+          false
+        } else if !exists(.message) || .message == null {
+          false
+        } else {
+          raw_body, b_err = string(.message)
+          if b_err != null {
+            false
+          } else {
+            expected = "sha256=" + downcase(encode_base16(hmac(raw_body, secret, algorithm: "SHA-256")))
+            provided = downcase(string!(."x-hub-signature-256"))
+            expected == provided
+          }
+        }
+
+  ocsf_github_actions:
+    type: remap
+    inputs:
+      - verify_github_signature
+    source: |
+      now_ts = now()
+      logged_ms = to_unix_timestamp(now_ts, unit: "milliseconds")
+
+      gh_event = if exists(."x-github-event") && is_string(."x-github-event") && string!(."x-github-event") != "" {
+        string!(."x-github-event")
+      } else {
+        "unknown"
+      }
+      gh_delivery = if exists(."x-github-delivery") && is_string(."x-github-delivery") && string!(."x-github-delivery") != "" {
+        string!(."x-github-delivery")
+      } else {
+        null
+      }
+
+      raw_body = if exists(.message) && .message != null { string!(.message) } else { "{}" }
+      payload, parse_err = parse_json(raw_body)
+      if parse_err != null || !is_object(payload) {
+        abort
+      }
+      p = object!(payload)
+
+      action = if exists(p.action) && is_string(p.action) && string!(p.action) != "" { string!(p.action) } else { null }
+      repo_full = if exists(p.repository.full_name) && is_string(p.repository.full_name) && string!(p.repository.full_name) != "" {
+        string!(p.repository.full_name)
+      } else {
+        null
+      }
+      org_login = if exists(p.organization.login) && is_string(p.organization.login) && string!(p.organization.login) != "" {
+        string!(p.organization.login)
+      } else {
+        null
+      }
+
+      # Extract event-specific fields
+      workflow_name = null
+      workflow_path = null
+      job_name = null
+      run_id = null
+      run_number = null
+      run_attempt = null
+      job_id = null
+      status = null
+      conclusion = null
+      trigger_event = null
+      head_branch = null
+      head_sha = null
+      html_url = null
+      runner_name = null
+      runner_id = null
+      runner_group_name = null
+      runner_labels = null
+      is_self_hosted = null
+      is_fork_pr = null
+      raw_ts_str = null
+      start_ts_str = null
+      created_ts_str = null
+      alert_severity = null
+      alert_number = null
+      alert_rule = null
+
+      if gh_event == "workflow_run" && exists(p.workflow_run) && is_object(p.workflow_run) {
+        wr = object!(p.workflow_run)
+        if exists(wr.name) && is_string(wr.name) && string!(wr.name) != "" { workflow_name = string!(wr.name) }
+        if exists(wr.path) && is_string(wr.path) && string!(wr.path) != "" { workflow_path = string!(wr.path) }
+        if exists(wr.id) && is_integer(wr.id) { run_id = int!(wr.id) }
+        if exists(wr.run_number) && is_integer(wr.run_number) { run_number = int!(wr.run_number) }
+        if exists(wr.run_attempt) && is_integer(wr.run_attempt) { run_attempt = int!(wr.run_attempt) }
+        if exists(wr.status) && is_string(wr.status) && string!(wr.status) != "" { status = string!(wr.status) }
+        if exists(wr.conclusion) && is_string(wr.conclusion) && string!(wr.conclusion) != "" { conclusion = string!(wr.conclusion) }
+        if exists(wr.event) && is_string(wr.event) && string!(wr.event) != "" { trigger_event = string!(wr.event) }
+        if exists(wr.head_branch) && is_string(wr.head_branch) && string!(wr.head_branch) != "" { head_branch = string!(wr.head_branch) }
+        if exists(wr.head_sha) && is_string(wr.head_sha) && string!(wr.head_sha) != "" { head_sha = string!(wr.head_sha) }
+        if exists(wr.html_url) && is_string(wr.html_url) && string!(wr.html_url) != "" { html_url = string!(wr.html_url) }
+        if exists(wr.updated_at) && is_string(wr.updated_at) && string!(wr.updated_at) != "" {
+          raw_ts_str = string!(wr.updated_at)
+        } else if exists(wr.created_at) && is_string(wr.created_at) && string!(wr.created_at) != "" {
+          raw_ts_str = string!(wr.created_at)
+        }
+        if exists(wr.run_started_at) && is_string(wr.run_started_at) && string!(wr.run_started_at) != "" {
+          start_ts_str = string!(wr.run_started_at)
+        }
+        if exists(wr.created_at) && is_string(wr.created_at) && string!(wr.created_at) != "" {
+          created_ts_str = string!(wr.created_at)
+        }
+        if exists(wr.head_repository.full_name) && is_string(wr.head_repository.full_name) && repo_full != null {
+          is_fork_pr = string!(wr.head_repository.full_name) != repo_full
+        }
+      } else if gh_event == "workflow_job" && exists(p.workflow_job) && is_object(p.workflow_job) {
+        wj = object!(p.workflow_job)
+        if exists(wj.workflow_name) && is_string(wj.workflow_name) && string!(wj.workflow_name) != "" { workflow_name = string!(wj.workflow_name) }
+        if exists(wj.name) && is_string(wj.name) && string!(wj.name) != "" { job_name = string!(wj.name) }
+        if exists(wj.run_id) && is_integer(wj.run_id) { run_id = int!(wj.run_id) }
+        if exists(wj.run_attempt) && is_integer(wj.run_attempt) { run_attempt = int!(wj.run_attempt) }
+        if exists(wj.id) && is_integer(wj.id) { job_id = int!(wj.id) }
+        if exists(wj.status) && is_string(wj.status) && string!(wj.status) != "" { status = string!(wj.status) }
+        if exists(wj.conclusion) && is_string(wj.conclusion) && string!(wj.conclusion) != "" { conclusion = string!(wj.conclusion) }
+        if exists(wj.head_branch) && is_string(wj.head_branch) && string!(wj.head_branch) != "" { head_branch = string!(wj.head_branch) }
+        if exists(wj.head_sha) && is_string(wj.head_sha) && string!(wj.head_sha) != "" { head_sha = string!(wj.head_sha) }
+        if exists(wj.html_url) && is_string(wj.html_url) && string!(wj.html_url) != "" { html_url = string!(wj.html_url) }
+        if exists(wj.runner_name) && is_string(wj.runner_name) && string!(wj.runner_name) != "" { runner_name = string!(wj.runner_name) }
+        if exists(wj.runner_id) && is_integer(wj.runner_id) { runner_id = int!(wj.runner_id) }
+        if exists(wj.runner_group_name) && is_string(wj.runner_group_name) && string!(wj.runner_group_name) != "" { runner_group_name = string!(wj.runner_group_name) }
+        if exists(wj.labels) && is_array(wj.labels) {
+          runner_labels = array!(wj.labels)
+          is_self_hosted = includes(runner_labels, "self-hosted")
+        }
+        if exists(wj.completed_at) && is_string(wj.completed_at) && string!(wj.completed_at) != "" {
+          raw_ts_str = string!(wj.completed_at)
+        } else if exists(wj.started_at) && is_string(wj.started_at) && string!(wj.started_at) != "" {
+          raw_ts_str = string!(wj.started_at)
+        } else if exists(wj.created_at) && is_string(wj.created_at) && string!(wj.created_at) != "" {
+          raw_ts_str = string!(wj.created_at)
+        }
+        if exists(wj.started_at) && is_string(wj.started_at) && string!(wj.started_at) != "" {
+          start_ts_str = string!(wj.started_at)
+        }
+        if exists(wj.created_at) && is_string(wj.created_at) && string!(wj.created_at) != "" {
+          created_ts_str = string!(wj.created_at)
+        }
+      } else if (gh_event == "secret_scanning_alert" || gh_event == "code_scanning_alert" || gh_event == "dependabot_alert") && exists(p.alert) && is_object(p.alert) {
+        al = object!(p.alert)
+        if exists(al.number) && is_integer(al.number) { alert_number = int!(al.number) }
+        if exists(al.html_url) && is_string(al.html_url) && string!(al.html_url) != "" { html_url = string!(al.html_url) }
+        if exists(al.state) && is_string(al.state) && string!(al.state) != "" { status = string!(al.state) }
+        if exists(al.secret_type) && is_string(al.secret_type) && string!(al.secret_type) != "" { alert_rule = string!(al.secret_type) }
+        if alert_rule == null && exists(al.rule.id) && is_string(al.rule.id) && string!(al.rule.id) != "" { alert_rule = string!(al.rule.id) }
+        if exists(al.rule.security_severity_level) && is_string(al.rule.security_severity_level) {
+          alert_severity = downcase(string!(al.rule.security_severity_level))
+        } else if exists(al.security_advisory.severity) && is_string(al.security_advisory.severity) {
+          alert_severity = downcase(string!(al.security_advisory.severity))
+        } else if gh_event == "secret_scanning_alert" {
+          alert_severity = "high"
+        }
+        if exists(al.updated_at) && is_string(al.updated_at) && string!(al.updated_at) != "" {
+          raw_ts_str = string!(al.updated_at)
+        } else if exists(al.created_at) && is_string(al.created_at) && string!(al.created_at) != "" {
+          raw_ts_str = string!(al.created_at)
+        }
+      }
+
+      # Resolve event_ts within 4-digit UTC RFC 3339 bounds ([1, 253402300799999] ms)
+      event_ts = now_ts
+      if raw_ts_str != null {
+        parsed_ev, t_err = parse_timestamp(raw_ts_str, "%+")
+        if t_err == null {
+          tms = to_unix_timestamp(parsed_ev, unit: "milliseconds")
+          if tms >= 1 && tms <= 253402300799999 {
+            event_ts = parsed_ev
+          }
+        }
+      }
+      time_ms = to_unix_timestamp(event_ts, unit: "milliseconds")
+      time_dt = format_timestamp!(event_ts, "%Y-%m-%dT%H:%M:%S%.3fZ")
+
+      # Compute optional duration_ms and queue_duration_ms
+      duration_ms = null
+      queue_duration_ms = null
+      if start_ts_str != null && raw_ts_str != null && (status == "completed" || conclusion != null) {
+        st_parsed, st_err = parse_timestamp(start_ts_str, "%+")
+        if st_err == null {
+          st_ms = to_unix_timestamp(st_parsed, unit: "milliseconds")
+          if time_ms >= st_ms { duration_ms = time_ms - st_ms }
+        }
+      }
+      if created_ts_str != null && start_ts_str != null {
+        cr_parsed, cr_err = parse_timestamp(created_ts_str, "%+")
+        st_parsed2, st_err2 = parse_timestamp(start_ts_str, "%+")
+        if cr_err == null && st_err2 == null {
+          cr_ms = to_unix_timestamp(cr_parsed, unit: "milliseconds")
+          st_ms2 = to_unix_timestamp(st_parsed2, unit: "milliseconds")
+          if st_ms2 >= cr_ms { queue_duration_ms = st_ms2 - cr_ms }
+        }
+      }
+
+      # Map conclusion / status / security alert severity to OCSF v1.3.0 severity_id / severity
+      severity_id = 0
+      severity = "Unknown"
+      if alert_severity != null {
+        if alert_severity == "critical" {
+          severity_id = 5
+          severity = "Critical"
+        } else if alert_severity == "high" || alert_severity == "error" {
+          severity_id = 4
+          severity = "High"
+        } else if alert_severity == "medium" || alert_severity == "moderate" || alert_severity == "warning" {
+          severity_id = 3
+          severity = "Medium"
+        } else if alert_severity == "low" || alert_severity == "note" {
+          severity_id = 2
+          severity = "Low"
+        } else {
+          severity_id = 1
+          severity = "Informational"
+        }
+      } else if conclusion != null {
+        c_lc = downcase(string!(conclusion))
+        if c_lc == "failure" || c_lc == "startup_failure" {
+          severity_id = 4
+          severity = "High"
+        } else if c_lc == "timed_out" || c_lc == "action_required" || c_lc == "stale" {
+          severity_id = 3
+          severity = "Medium"
+        } else if c_lc == "cancelled" || c_lc == "skipped" || c_lc == "neutral" {
+          severity_id = 2
+          severity = "Low"
+        } else if c_lc == "success" {
+          severity_id = 1
+          severity = "Informational"
+        }
+      } else if status != null {
+        st_lc = downcase(string!(status))
+        if st_lc == "queued" || st_lc == "in_progress" || st_lc == "requested" || st_lc == "waiting" || st_lc == "completed" {
+          severity_id = 1
+          severity = "Informational"
+        }
+      }
+
+      # Actor user (triggering_actor -> actor -> sender)
+      user_name = null
+      uid_str = null
+      uid_num = null
+      if exists(p.workflow_run.triggering_actor.login) && is_string(p.workflow_run.triggering_actor.login) && string!(p.workflow_run.triggering_actor.login) != "" {
+        user_name = string!(p.workflow_run.triggering_actor.login)
+        if exists(p.workflow_run.triggering_actor.id) && is_integer(p.workflow_run.triggering_actor.id) {
+          uv = int!(p.workflow_run.triggering_actor.id)
+          if uv >= 0 && uv <= 9007199254740991 {
+            uid_str = to_string(uv)
+            uid_num = uv
+          }
+        }
+      } else if exists(p.workflow_run.actor.login) && is_string(p.workflow_run.actor.login) && string!(p.workflow_run.actor.login) != "" {
+        user_name = string!(p.workflow_run.actor.login)
+        if exists(p.workflow_run.actor.id) && is_integer(p.workflow_run.actor.id) {
+          uv = int!(p.workflow_run.actor.id)
+          if uv >= 0 && uv <= 9007199254740991 {
+            uid_str = to_string(uv)
+            uid_num = uv
+          }
+        }
+      } else if exists(p.sender.login) && is_string(p.sender.login) && string!(p.sender.login) != "" {
+        user_name = string!(p.sender.login)
+        if exists(p.sender.id) && is_integer(p.sender.id) {
+          uv = int!(p.sender.id)
+          if uv >= 0 && uv <= 9007199254740991 {
+            uid_str = to_string(uv)
+            uid_num = uv
+          }
+        }
+      }
+
+      usr = {}
+      if uid_str != null { usr.uid = uid_str }
+      if uid_num != null { usr.uid_numeric = uid_num }
+      if user_name != null { usr.name = user_name }
+
+      proc = {}
+      proc_name = if job_name != null { job_name } else { workflow_name }
+      if proc_name != null { proc.name = proc_name }
+      if workflow_path != null { proc.path = workflow_path }
+
+      act = {}
+      if length(proc) > 0 { act.process = proc }
+      if length(usr) > 0 { act.user = usr }
+
+      # Device (runner metadata; OCSF device.os requires both name and type_id)
+      dev_type_id = 0
+      dev_type = "Unknown"
+      if is_self_hosted == true {
+        dev_type_id = 1
+        dev_type = "Server"
+      } else if is_self_hosted == false || runner_name != null {
+        dev_type_id = 6
+        dev_type = "Virtual"
+      }
+
+      dev = {
+        "type_id": dev_type_id,
+        "type": dev_type
+      }
+      if runner_name != null {
+        dev.hostname = runner_name
+      } else if repo_full != null {
+        dev.hostname = repo_full
+      }
+      if runner_id != null { dev.uid = to_string(runner_id) }
+
+      os_obj = null
+      if runner_labels != null {
+        labels_lc = downcase(encode_json(runner_labels))
+        if contains(labels_lc, "linux") || contains(labels_lc, "ubuntu") {
+          os_obj = { "name": "Linux", "type_id": 200 }
+        } else if contains(labels_lc, "windows") {
+          os_obj = { "name": "Windows", "type_id": 100 }
+        } else if contains(labels_lc, "macos") || contains(labels_lc, "darwin") {
+          os_obj = { "name": "macOS", "type_id": 300 }
+        }
+      }
+      if os_obj != null { dev.os = os_obj }
+
+      # Log name, provider, correlation_uid, and message
+      log_provider = "github-actions"
+      log_name = if repo_full != null && workflow_name != null {
+        repo_full + ":" + workflow_name
+      } else if repo_full != null {
+        repo_full
+      } else if workflow_name != null {
+        workflow_name
+      } else {
+        gh_event
+      }
+
+      log_level = if conclusion != null {
+        conclusion
+      } else if alert_severity != null {
+        alert_severity
+      } else if status != null {
+        status
+      } else {
+        action
+      }
+
+      correlation_uid = if run_id != null && int!(run_id) > 0 { to_string(int!(run_id)) } else { null }
+      original_event_uid = if gh_delivery != null {
+        gh_delivery
+      } else if job_id != null {
+        to_string(job_id)
+      } else if run_id != null {
+        to_string(run_id)
+      } else if alert_number != null {
+        to_string(alert_number)
+      } else {
+        null
+      }
+
+      state_str = if conclusion != null {
+        conclusion
+      } else if status != null {
+        status
+      } else if action != null {
+        action
+      } else {
+        "event"
+      }
+      subject_str = if job_name != null {
+        job_name
+      } else if workflow_name != null {
+        workflow_name
+      } else if alert_rule != null {
+        alert_rule
+      } else {
+        gh_event
+      }
+      repo_str = if repo_full != null { repo_full } else { "unknown-repo" }
+      msg = gh_event + " " + state_str + ": " + subject_str + " on " + repo_str
+
+      meta = {
+        "version": "1.3.0",
+        "product": {
+          "name": "Vector",
+          "vendor_name": "Datadog"
+        },
+        "logged_time": logged_ms,
+        "log_provider": log_provider,
+        "log_name": log_name
+      }
+      if original_event_uid != null { meta.original_event_uid = original_event_uid }
+      if correlation_uid != null { meta.correlation_uid = correlation_uid }
+      if log_level != null { meta.log_level = log_level }
+
+      unmapped = {
+        "github_event": gh_event
+      }
+      if action != null { unmapped.action = action }
+      if repo_full != null { unmapped.repository = repo_full }
+      if org_login != null { unmapped.organization = org_login }
+      if workflow_name != null { unmapped.workflow = workflow_name }
+      if workflow_path != null { unmapped.workflow_path = workflow_path }
+      if job_name != null { unmapped.job = job_name }
+      if run_id != null { unmapped.run_id = run_id }
+      if run_number != null { unmapped.run_number = run_number }
+      if run_attempt != null { unmapped.run_attempt = run_attempt }
+      if job_id != null { unmapped.job_id = job_id }
+      if status != null { unmapped.status = status }
+      if conclusion != null { unmapped.conclusion = conclusion }
+      if trigger_event != null { unmapped.trigger_event = trigger_event }
+      if head_branch != null { unmapped.head_branch = head_branch }
+      if head_sha != null { unmapped.head_sha = head_sha }
+      if html_url != null { unmapped.html_url = html_url }
+      if runner_name != null { unmapped.runner_name = runner_name }
+      if runner_group_name != null { unmapped.runner_group_name = runner_group_name }
+      if runner_labels != null { unmapped.runner_labels = runner_labels }
+      if is_self_hosted != null { unmapped.is_self_hosted = is_self_hosted }
+      if is_fork_pr != null { unmapped.is_fork_pr = is_fork_pr }
+      if duration_ms != null { unmapped.duration_ms = duration_ms }
+      if queue_duration_ms != null { unmapped.queue_duration_ms = queue_duration_ms }
+      if alert_number != null { unmapped.alert_number = alert_number }
+      if alert_rule != null { unmapped.alert_rule = alert_rule }
+
+      out = {
+        "category_uid": 1,
+        "category_name": "System Activity",
+        "class_uid": 1008,
+        "class_name": "Event Log Activity",
+        "type_uid": 100899,
+        "type_name": "Event Log Activity: Other",
+        "activity_id": 99,
+        "activity_name": "Other",
+        "severity_id": severity_id,
+        "severity": severity,
+        "time": time_ms,
+        "time_dt": time_dt,
+        "message": msg,
+        "log_name": log_name,
+        "log_provider": log_provider,
+        "metadata": meta,
+        "device": dev,
+        "unmapped": unmapped
+      }
+      if length(act) > 0 { out.actor = act }
+
+      . = out
+
+sinks:
+  basin_http:
+    type: http
+    inputs:
+      - ocsf_github_actions
+    uri: "${OOF_BASIN_ENDPOINT}"
+    method: post
+    compression: gzip
+    encoding:
+      codec: json
+    auth:
+      strategy: bearer
+      token: "${OOF_INGEST_TOKEN}"
+    batch:
+      max_events: 500
+      max_bytes: 5000000
+      timeout_secs: 5
+    buffer:
+      type: disk
+      max_size: 268435488
+      when_full: block
+    request:
+      retry_attempts: 5
+      retry_initial_backoff_secs: 1
+      retry_max_duration_secs: 30
+
+tests:
+  - name: ocsf_github_workflow_run_failure
+    inputs:
+      - insert_at: ocsf_github_actions
+        type: log
+        log_fields:
+          x-github-event: "workflow_run"
+          x-github-delivery: "deliv-run-001"
+          message: '{"action":"completed","repository":{"full_name":"acme/platform"},"organization":{"login":"acme"},"workflow_run":{"id":987654321,"name":"CI","path":".github/workflows/ci.yml","run_number":42,"run_attempt":2,"status":"completed","conclusion":"failure","event":"pull_request_target","head_branch":"feat/risky","head_sha":"abcdef1234567890","html_url":"https://github.com/acme/platform/actions/runs/987654321","created_at":"2025-02-01T10:00:00Z","run_started_at":"2025-02-01T10:00:10Z","updated_at":"2025-02-01T10:02:10Z","head_repository":{"full_name":"external/platform"},"triggering_actor":{"login":"octocat","id":583231}}}'
+    outputs:
+      - extract_from: ocsf_github_actions
+        conditions:
+          - type: vrl
+            source: |
+              .category_uid == 1 &&
+              .class_uid == 1008 &&
+              .activity_id == 99 &&
+              .type_uid == 100899 &&
+              .severity_id == 4 &&
+              .severity == "High" &&
+              .log_provider == "github-actions" &&
+              .log_name == "acme/platform:CI" &&
+              .metadata.correlation_uid == "987654321" &&
+              .metadata.original_event_uid == "deliv-run-001" &&
+              .actor.user.name == "octocat" &&
+              .actor.user.uid == "583231" &&
+              .actor.user.uid_numeric == 583231 &&
+              .unmapped.duration_ms == 120000 &&
+              .unmapped.queue_duration_ms == 10000 &&
+              .unmapped.is_fork_pr == true &&
+              .unmapped.trigger_event == "pull_request_target"
+
+  - name: ocsf_github_workflow_job_self_hosted
+    inputs:
+      - insert_at: ocsf_github_actions
+        type: log
+        log_fields:
+          x-github-event: "workflow_job"
+          x-github-delivery: "deliv-job-002"
+          message: '{"action":"completed","repository":{"full_name":"acme/platform"},"sender":{"login":"bob","id":77},"workflow_job":{"id":555001,"run_id":987654321,"run_attempt":1,"workflow_name":"Deploy","name":"build-nix","status":"completed","conclusion":"success","head_branch":"main","head_sha":"11112222","created_at":"2025-02-01T11:00:00Z","started_at":"2025-02-01T11:00:05Z","completed_at":"2025-02-01T11:01:05Z","runner_id":12,"runner_name":"nix-runner-01","runner_group_name":"prod-runners","labels":["self-hosted","linux","x64"]}}'
+    outputs:
+      - extract_from: ocsf_github_actions
+        conditions:
+          - type: vrl
+            source: |
+              .severity_id == 1 &&
+              .severity == "Informational" &&
+              .device.type_id == 1 &&
+              .device.type == "Server" &&
+              .device.hostname == "nix-runner-01" &&
+              .device.uid == "12" &&
+              .device.os.name == "Linux" &&
+              .device.os.type_id == 200 &&
+              .metadata.correlation_uid == "987654321" &&
+              .unmapped.is_self_hosted == true &&
+              .unmapped.duration_ms == 60000 &&
+              .unmapped.queue_duration_ms == 5000
+
+  - name: ocsf_github_secret_scanning_alert
+    inputs:
+      - insert_at: ocsf_github_actions
+        type: log
+        log_fields:
+          x-github-event: "secret_scanning_alert"
+          x-github-delivery: "deliv-sec-003"
+          message: '{"action":"created","repository":{"full_name":"acme/platform"},"sender":{"login":"dev1","id":99},"alert":{"number":7,"state":"open","secret_type":"cloudflare_api_token","created_at":"2025-02-01T12:00:00Z","html_url":"https://github.com/acme/platform/security/secret-scanning/7"}}'
+    outputs:
+      - extract_from: ocsf_github_actions
+        conditions:
+          - type: vrl
+            source: |
+              .severity_id == 4 &&
+              .severity == "High" &&
+              .log_provider == "github-actions" &&
+              .unmapped.github_event == "secret_scanning_alert" &&
+              .unmapped.alert_rule == "cloudflare_api_token" &&
+              .unmapped.alert_number == 7
