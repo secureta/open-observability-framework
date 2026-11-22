@@ -1,0 +1,34 @@
+name: "OOF Direct Basin OCSF Telemetry"
+description: "Normalize GitHub Actions run/job telemetry into OCSF v1.3.0 (Event Log Activity, 1008) and ship directly to Cloudflare Basin HTTP (gzipped JSON)."
+inputs:
+  basin_endpoint:
+    description: "Cloudflare Basin HTTPS ingest endpoint (e.g. https://<STREAM_ID>.ingest.cloudflare.com). Falls back to OOF_BASIN_ENDPOINT env var."
+    required: false
+  ingest_token:
+    description: "Cloudflare Account API Token with Basin Pipelines Send permission. Falls back to OOF_INGEST_TOKEN env var."
+    required: false
+  status:
+    description: "Job or workflow status (e.g. completed, in_progress, queued)."
+    required: false
+    default: "completed"
+  conclusion:
+    description: "Job or workflow conclusion (e.g. success, failure, cancelled, skipped, timed_out)."
+    required: false
+  duration_ms:
+    description: "Optional execution duration in milliseconds."
+    required: false
+  trace_id:
+    description: "Optional OpenTelemetry trace_id stored in metadata.correlation_uid (falls back to GITHUB_RUN_ID)."
+    required: false
+  is_self_hosted:
+    description: "Optional boolean ('true' or 'false') indicating whether the runner is self-hosted."
+    required: false
+  message:
+    description: "Optional custom summary message."
+    required: false
+  extra_json:
+    description: "Optional JSON object merged into OCSF unmapped fields."
+    required: false
+runs:
+  using: "node20"
+  main: "emit-ocsf.mjs"
