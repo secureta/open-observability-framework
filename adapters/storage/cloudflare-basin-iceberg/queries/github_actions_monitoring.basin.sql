@@ -64,20 +64,41 @@ ORDER BY time DESC
 LIMIT 200;
 
 -- 4. Runner utilization breakdown (GitHub-hosted Virtual vs Self-hosted Server vs Unknown)
+-- Deduplicates by (run_id, run_attempt, job) so enabling both webhook and direct Action does not double-count jobs.
+WITH dedup_jobs AS (
+  SELECT
+    device.type AS runner_type,
+    device.hostname AS runner_name,
+    device.os.name AS runner_os,
+    severity_id,
+    CAST(json_get_int(unmapped, 'duration_ms') AS DOUBLE) AS duration_ms,
+    CAST(json_get_int(unmapped, 'queue_duration_ms') AS DOUBLE) AS queue_duration_ms,
+    ROW_NUMBER() OVER (
+      PARTITION BY
+        json_get_int(unmapped, 'run_id'),
+        COALESCE(json_get_int(unmapped, 'run_attempt'), 1),
+        COALESCE(json_get_str(unmapped, 'job'), metadata.original_event_uid)
+      ORDER BY
+        CASE WHEN metadata.product.name = 'Vector' THEN 0 ELSE 1 END,
+        time DESC
+    ) AS rn
+  FROM siem.ocsf_event_log_activity
+  WHERE class_uid = 1008
+    AND log_provider = 'github-actions'
+    AND json_get_str(unmapped, 'github_event') = 'workflow_job'
+    AND json_get_str(unmapped, 'status') = 'completed'
+)
 SELECT
-  device.type AS runner_type,
-  device.hostname AS runner_name,
-  device.os.name AS runner_os,
+  runner_type,
+  runner_name,
+  runner_os,
   COUNT(*) AS completed_jobs,
   SUM(CASE WHEN severity_id >= 4 THEN 1 ELSE 0 END) AS failed_jobs,
-  AVG(CAST(json_get_int(unmapped, 'duration_ms') AS DOUBLE)) AS avg_duration_ms,
-  AVG(CAST(json_get_int(unmapped, 'queue_duration_ms') AS DOUBLE)) AS avg_queue_ms
-FROM siem.ocsf_event_log_activity
-WHERE class_uid = 1008
-  AND log_provider = 'github-actions'
-  AND json_get_str(unmapped, 'github_event') = 'workflow_job'
-  AND json_get_str(unmapped, 'status') = 'completed'
-GROUP BY device.type, device.hostname, device.os.name
+  AVG(duration_ms) AS avg_duration_ms,
+  AVG(queue_duration_ms) AS avg_queue_ms
+FROM dedup_jobs
+WHERE rn = 1
+GROUP BY runner_type, runner_name, runner_os
 ORDER BY completed_jobs DESC
 LIMIT 100;
 
