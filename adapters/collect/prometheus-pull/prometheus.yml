@@ -1,0 +1,39 @@
+# Open Observability Framework — Prometheus Pull Metrics Collector
+#
+# Pull-based Prometheus /metrics scraper with strict metric and label allowlists.
+# This reference configuration is intentionally limited to loopback endpoints and
+# is NOT enabled by default (see flake.nix: services.oof-collector.prometheus.enable = false).
+#
+# Verified against cloudflared 2026.10.7:
+#   # HELP cloudflared_tunnel_ha_connections Number of active ha connections
+#   # TYPE cloudflared_tunnel_ha_connections gauge
+#   cloudflared_tunnel_ha_connections 4
+#
+# Note: if `cloudflared` runs with `--metrics 127.0.0.1:0` (ephemeral port),
+# pin it to a fixed loopback port (e.g. 127.0.0.1:20241) before enabling scraping.
+
+global:
+  scrape_interval: 30s
+  scrape_timeout: 5s
+
+scrape_configs:
+  - job_name: cloudflared
+    metrics_path: /metrics
+    scheme: http
+    honor_labels: false
+    static_configs:
+      - targets:
+          - 127.0.0.1:20241
+    # Replace the auto-generated `instance` label (which contains IP:port or hostname)
+    # with the logical job name so neither `up` nor scraped metrics retain IPs/hostnames.
+    relabel_configs:
+      - target_label: instance
+        replacement: cloudflared
+    # Strict allowlist: ingest only the active tunnel connection count and strip all
+    # unnecessary labels (tunnel ID, IP, hostname, edge_location, connection_id, instance, etc.).
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: ^(cloudflared_tunnel_ha_connections)$
+        action: keep
+      - regex: ^(__name__|job)$
+        action: labelkeep
