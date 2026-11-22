@@ -14,6 +14,10 @@ inputs:
   conclusion:
     description: "Job or workflow conclusion (e.g. success, failure, cancelled, skipped, timed_out)."
     required: false
+  event_kind:
+    description: "Telemetry event kind stored in unmapped.github_event (default: workflow_job). GITHUB_EVENT_NAME is stored in unmapped.trigger_event."
+    required: false
+    default: "workflow_job"
   duration_ms:
     description: "Optional execution duration in milliseconds."
     required: false

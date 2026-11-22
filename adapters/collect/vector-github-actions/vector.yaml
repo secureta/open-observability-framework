@@ -32,6 +32,7 @@ sources:
     decoding:
       codec: bytes
     headers:
+      - content-type
       - x-github-event
       - x-github-delivery
       - x-hub-signature-256
@@ -82,7 +83,15 @@ transforms:
       }
 
       raw_body = if exists(.message) && .message != null { string!(.message) } else { "{}" }
-      payload, parse_err = parse_json(raw_body)
+      json_str = raw_body
+      ct = if exists(."content-type") && is_string(."content-type") { downcase(string!(."content-type")) } else { "" }
+      if contains(ct, "application/x-www-form-urlencoded") || starts_with(raw_body, "payload=") {
+        form_obj = parse_query_string(raw_body)
+        if is_object(form_obj) && exists(form_obj.payload) && is_string(form_obj.payload) {
+          json_str = string!(form_obj.payload)
+        }
+      }
+      payload, parse_err = parse_json(json_str)
       if parse_err != null || !is_object(payload) {
         abort
       }
@@ -171,7 +180,17 @@ transforms:
         if exists(wj.runner_group_name) && is_string(wj.runner_group_name) && string!(wj.runner_group_name) != "" { runner_group_name = string!(wj.runner_group_name) }
         if exists(wj.labels) && is_array(wj.labels) {
           runner_labels = array!(wj.labels)
-          is_self_hosted = includes(runner_labels, "self-hosted")
+          if includes(runner_labels, "self-hosted") {
+            is_self_hosted = true
+          } else if includes(runner_labels, "ubuntu-latest") || includes(runner_labels, "ubuntu-24.04") || includes(runner_labels, "ubuntu-22.04") || includes(runner_labels, "windows-latest") || includes(runner_labels, "macos-latest") {
+            is_self_hosted = false
+          }
+        }
+        if is_self_hosted == null && runner_name != null {
+          rn_str = string!(runner_name)
+          if starts_with(rn_str, "GitHub Actions ") || rn_str == "Hosted Agent" {
+            is_self_hosted = false
+          }
         }
         if exists(wj.completed_at) && is_string(wj.completed_at) && string!(wj.completed_at) != "" {
           raw_ts_str = string!(wj.completed_at)
@@ -195,6 +214,8 @@ transforms:
         if alert_rule == null && exists(al.rule.id) && is_string(al.rule.id) && string!(al.rule.id) != "" { alert_rule = string!(al.rule.id) }
         if exists(al.rule.security_severity_level) && is_string(al.rule.security_severity_level) {
           alert_severity = downcase(string!(al.rule.security_severity_level))
+        } else if gh_event == "code_scanning_alert" && exists(al.rule.severity) && is_string(al.rule.severity) {
+          alert_severity = downcase(string!(al.rule.severity))
         } else if exists(al.security_advisory.severity) && is_string(al.security_advisory.severity) {
           alert_severity = downcase(string!(al.security_advisory.severity))
         } else if gh_event == "secret_scanning_alert" {
@@ -337,7 +358,7 @@ transforms:
       if is_self_hosted == true {
         dev_type_id = 1
         dev_type = "Server"
-      } else if is_self_hosted == false || runner_name != null {
+      } else if is_self_hosted == false {
         dev_type_id = 6
         dev_type = "Virtual"
       }
@@ -497,6 +518,9 @@ sinks:
     uri: "${OOF_BASIN_ENDPOINT}"
     method: post
     compression: gzip
+    tls:
+      verify_certificate: true
+      verify_hostname: true
     encoding:
       codec: json
     auth:
@@ -592,3 +616,41 @@ tests:
               .unmapped.github_event == "secret_scanning_alert" &&
               .unmapped.alert_rule == "cloudflare_api_token" &&
               .unmapped.alert_number == 7
+
+  - name: ocsf_github_code_scanning_rule_severity_fallback
+    inputs:
+      - insert_at: ocsf_github_actions
+        type: log
+        log_fields:
+          x-github-event: "code_scanning_alert"
+          x-github-delivery: "deliv-cs-004"
+          message: '{"action":"created","repository":{"full_name":"acme/platform"},"sender":{"login":"dev1","id":99},"alert":{"number":11,"state":"open","rule":{"id":"js/sql-injection","severity":"error"},"created_at":"2025-02-01T12:10:00Z"}}'
+    outputs:
+      - extract_from: ocsf_github_actions
+        conditions:
+          - type: vrl
+            source: |
+              .severity_id == 4 &&
+              .severity == "High" &&
+              .unmapped.alert_rule == "js/sql-injection"
+
+  - name: ocsf_github_form_encoded_scale_set_runner
+    inputs:
+      - insert_at: ocsf_github_actions
+        type: log
+        log_fields:
+          content-type: "application/x-www-form-urlencoded"
+          x-github-event: "workflow_job"
+          x-github-delivery: "deliv-form-005"
+          message: 'payload=%7B%22action%22%3A%22completed%22%2C%22repository%22%3A%7B%22full_name%22%3A%22acme%2Fplatform%22%7D%2C%22workflow_job%22%3A%7B%22id%22%3A7001%2C%22run_id%22%3A8001%2C%22workflow_name%22%3A%22CI%22%2C%22name%22%3A%22arc-job%22%2C%22status%22%3A%22completed%22%2C%22conclusion%22%3A%22success%22%2C%22runner_name%22%3A%22arc-runner-set-xyz%22%2C%22labels%22%3A%5B%22arc-runner-set%22%5D%7D%7D'
+    outputs:
+      - extract_from: ocsf_github_actions
+        conditions:
+          - type: vrl
+            source: |
+              .severity_id == 1 &&
+              .device.type_id == 0 &&
+              .device.type == "Unknown" &&
+              .device.hostname == "arc-runner-set-xyz" &&
+              !exists(.unmapped.is_self_hosted) &&
+              .unmapped.run_id == 8001

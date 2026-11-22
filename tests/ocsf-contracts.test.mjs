@@ -27,6 +27,7 @@ const VECTOR_GHA_CONFIG_PATH = path.join(REPO_ROOT, "adapters/collect/vector-git
 const GHA_DIRECT_MODULE_PATH = path.join(REPO_ROOT, "adapters/collect/github-actions-direct/emit-ocsf.mjs");
 const GHA_DIRECT_ACTION_PATH = path.join(REPO_ROOT, "adapters/collect/github-actions-direct/action.yml");
 const GHA_MONITORING_SQL_PATH = path.join(REPO_ROOT, "adapters/storage/cloudflare-basin-iceberg/queries/github_actions_monitoring.sql");
+const GHA_MONITORING_BASIN_SQL_PATH = path.join(REPO_ROOT, "adapters/storage/cloudflare-basin-iceberg/queries/github_actions_monitoring.basin.sql");
 const FLUENT_BIT_CONF_PATH = path.join(REPO_ROOT, "adapters/collect/fluent-bit-journald/fluent-bit.conf");
 const FLUENT_BIT_LUA_PATH = path.join(REPO_ROOT, "adapters/collect/fluent-bit-journald/ocsf.lua");
 const OTELCOL_CONF_PATH = path.join(REPO_ROOT, "adapters/collect/otel-collector-journald/otelcol.yaml");
@@ -2018,12 +2019,21 @@ test("9. GitHub Actions monitoring: Vector webhook E2E, direct Action E2E, and S
   const vectorBin = requireBinary("vector");
   const basinSchema = JSON.parse(fs.readFileSync(BASIN_SCHEMA_PATH, "utf8"));
 
-  // Verify SQL query file targets siem.ocsf_event_log_activity and OCSF class_uid = 1008
+  // Verify both DuckDB and Basin SQL query files target siem.ocsf_event_log_activity and OCSF class_uid = 1008
   const ghaSql = fs.readFileSync(GHA_MONITORING_SQL_PATH, "utf8");
   assert.match(ghaSql, /FROM\s+siem\.ocsf_event_log_activity/i);
   assert.match(ghaSql, /class_uid\s*=\s*1008/);
   assert.match(ghaSql, /log_provider\s*=\s*'github-actions'/);
   assert.match(ghaSql, /actions\.runner\.%/);
+  assert.match(ghaSql, /json_extract\(unmapped,\s*'\$\.run_id'\)/);
+
+  const ghaBasinSql = fs.readFileSync(GHA_MONITORING_BASIN_SQL_PATH, "utf8");
+  assert.match(ghaBasinSql, /FROM\s+siem\.ocsf_event_log_activity/i);
+  assert.match(ghaBasinSql, /class_uid\s*=\s*1008/);
+  assert.match(ghaBasinSql, /json_get_str\(unmapped,/);
+  assert.match(ghaBasinSql, /json_get_int\(unmapped,\s*'run_id'\)/);
+  assert.match(ghaBasinSql, /json_get_bool\(unmapped,\s*'is_fork_pr'\)/);
+  assert.doesNotMatch(ghaBasinSql, /json_extract/);
 
   // Verify action.yml uses node20 (zero shell scripts)
   const actionYml = fs.readFileSync(GHA_DIRECT_ACTION_PATH, "utf8");
@@ -2170,15 +2180,34 @@ test("9. GitHub Actions monitoring: Vector webhook E2E, direct Action E2E, and S
     });
     assert.ok(badRes.ok);
 
-    // Send 2 valid HMAC-signed webhooks
-    for (const [ev, delivery, raw] of [
-      ["workflow_run", "deliv-e2e-run", runPayload],
-      ["workflow_job", "deliv-e2e-job", jobPayload],
+    // Send 2 valid JSON HMAC-signed webhooks + 1 valid default form-encoded (payload=...) webhook
+    const formJobJson = JSON.stringify({
+      action: "completed",
+      repository: { full_name: "acme/core" },
+      sender: { login: "arc-bot", id: 5150 },
+      workflow_job: {
+        id: 777001,
+        run_id: 100200300,
+        run_attempt: 1,
+        workflow_name: "Release",
+        name: "arc-scale-job",
+        status: "completed",
+        conclusion: "success",
+        runner_name: "arc-runner-set-01",
+        labels: ["arc-runner-set"],
+      },
+    });
+    const formEncodedBody = `payload=${encodeURIComponent(formJobJson)}`;
+
+    for (const [ev, delivery, contentType, raw] of [
+      ["workflow_run", "deliv-e2e-run", "application/json", runPayload],
+      ["workflow_job", "deliv-e2e-job", "application/json", jobPayload],
+      ["workflow_job", "deliv-e2e-form-job", "application/x-www-form-urlencoded", formEncodedBody],
     ]) {
       const r = await fetch(`http://127.0.0.1:${ghaPort}/webhook/github`, {
         method: "POST",
         headers: {
-          "content-type": "application/json",
+          "content-type": contentType,
           "x-github-event": ev,
           "x-github-delivery": delivery,
           "x-hub-signature-256": signBody(raw),
@@ -2188,16 +2217,23 @@ test("9. GitHub Actions monitoring: Vector webhook E2E, direct Action E2E, and S
       assert.ok(r.ok, `Vector webhook rejected ${ev}: ${r.status}`);
     }
 
-    await waitForCondition(() => mockBasin.records.length >= 2, 15000);
+    await waitForCondition(() => mockBasin.records.length >= 3, 15000);
     await terminateProcess(vecProc);
     assert.equal(vecStderr.includes("ERROR "), false, `Vector webhook stderr errors:\n${vecStderr}`);
 
     const ghaWebhookRecords = mockBasin.records.splice(0, mockBasin.records.length);
-    assert.equal(ghaWebhookRecords.length, 2, `Expected exactly 2 valid webhook records (invalid dropped), got ${ghaWebhookRecords.length}`);
+    assert.equal(ghaWebhookRecords.length, 3, `Expected exactly 3 valid webhook records (invalid dropped), got ${ghaWebhookRecords.length}`);
     for (const rec of ghaWebhookRecords) {
       assertConformsToOcsfContract(rec, basinSchema);
       assert.equal(rec.log_provider, "github-actions");
     }
+
+    const formJobRec = ghaWebhookRecords.find((r) => r.metadata.original_event_uid === "deliv-e2e-form-job");
+    assert.ok(formJobRec, "missing form-encoded workflow_job webhook OCSF record");
+    assert.equal(formJobRec.device.type_id, 0, "ambiguous scale-set runner must stay Unknown (0), not Virtual");
+    assert.equal(formJobRec.device.type, "Unknown");
+    assert.equal(formJobRec.unmapped.is_self_hosted, undefined);
+    assert.equal(formJobRec.unmapped.run_id, 100200300);
 
     const runRec = ghaWebhookRecords.find((r) => r.metadata.original_event_uid === "deliv-e2e-run");
     assert.ok(runRec, "missing workflow_run webhook OCSF record");
@@ -2230,12 +2266,11 @@ test("9. GitHub Actions monitoring: Vector webhook E2E, direct Action E2E, and S
       INPUT_INGEST_TOKEN: testToken,
       INPUT_CONCLUSION: "failure",
       INPUT_DURATION_MS: "45000",
-      INPUT_IS_SELF_HOSTED: "true",
       INPUT_EXTRA_JSON: JSON.stringify({ environment: "staging" }),
       GITHUB_REPOSITORY: "acme/core",
       GITHUB_WORKFLOW: "CI",
       GITHUB_JOB: "unit-tests",
-      GITHUB_EVENT_NAME: "push",
+      GITHUB_EVENT_NAME: "workflow_dispatch",
       GITHUB_ACTOR: "alice",
       GITHUB_ACTOR_ID: "1001",
       GITHUB_RUN_ID: "777888999",
@@ -2245,6 +2280,7 @@ test("9. GitHub Actions monitoring: Vector webhook E2E, direct Action E2E, and S
       GITHUB_SHA: "cafebabe",
       RUNNER_NAME: "self-hosted-02",
       RUNNER_OS: "Linux",
+      RUNNER_ENVIRONMENT: "self-hosted",
       OTEL_TRACE_ID: "0af7651916cd43dd8448eb211c80319c",
     });
 
@@ -2255,10 +2291,34 @@ test("9. GitHub Actions monitoring: Vector webhook E2E, direct Action E2E, and S
     assert.equal(event.log_name, "acme/core:CI");
     assert.equal(event.metadata.correlation_uid, "0af7651916cd43dd8448eb211c80319c");
     assert.equal(event.device.type_id, 1);
+    assert.equal(event.device.type, "Server");
     assert.equal(event.device.os.type_id, 200);
+    assert.equal(event.unmapped.github_event, "workflow_job");
+    assert.equal(event.unmapped.trigger_event, "workflow_dispatch");
+    assert.equal(event.unmapped.run_id, 777888999);
+    assert.equal(event.unmapped.is_self_hosted, true);
     assert.equal(event.unmapped.environment, "staging");
 
-    const sendRes = await directMod.sendToBasin([event], { endpoint, token });
+    // Ambiguous named runner without RUNNER_ENVIRONMENT or explicit override stays Unknown (0)
+    const ambiguousEvent = directMod.buildOcsfEvent({
+      repository: "acme/core",
+      workflow: "CI",
+      job: "build",
+      runnerName: "custom-runner-01",
+      conclusion: "success",
+    });
+    assertConformsToOcsfContract(ambiguousEvent, basinSchema);
+    assert.equal(ambiguousEvent.device.type_id, 0);
+    assert.equal(ambiguousEvent.device.type, "Unknown");
+    assert.equal(ambiguousEvent.unmapped.is_self_hosted, undefined);
+
+    // Must reject plaintext http:// endpoint by default to protect ingest token
+    await assert.rejects(
+      () => directMod.sendToBasin([event], { endpoint, token }),
+      /must use https:\/\//
+    );
+
+    const sendRes = await directMod.sendToBasin([event], { endpoint, token, allowInsecureHttp: true });
     assert.equal(sendRes.status, 200);
     assert.equal(sendRes.count, 1);
 

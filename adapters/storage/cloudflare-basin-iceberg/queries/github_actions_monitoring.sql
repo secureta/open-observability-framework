@@ -1,5 +1,6 @@
--- Open Observability Framework — GitHub Actions CI/CD Observability & SIEM Queries
+-- Open Observability Framework — GitHub Actions CI/CD Observability & SIEM Queries (DuckDB dialect)
 -- Target Iceberg table: siem.ocsf_event_log_activity (OCSF v1.3.0 class_uid = 1008)
+-- For Cloudflare Basin SQL (`json_get_str` / `json_get_int` / `json_get_bool`), see github_actions_monitoring.basin.sql.
 
 -- ============================================================================
 -- Part 1: CI/CD Observability (Reliability, Latency, Retries, Runner Capacity)
@@ -31,7 +32,8 @@ SELECT
   device.hostname AS runner_or_repo,
   device.type AS runner_type,
   actor.user.name AS actor,
-  metadata.correlation_uid AS run_id,
+  CAST(json_extract(unmapped, '$.run_id') AS BIGINT) AS run_id,
+  metadata.correlation_uid AS correlation_uid,
   metadata.log_level AS conclusion,
   CAST(json_extract(unmapped, '$.duration_ms') AS BIGINT) AS duration_ms,
   CAST(json_extract(unmapped, '$.queue_duration_ms') AS BIGINT) AS queue_duration_ms,
@@ -47,7 +49,8 @@ LIMIT 100;
 SELECT
   time_dt,
   log_name,
-  metadata.correlation_uid AS run_id,
+  CAST(json_extract(unmapped, '$.run_id') AS BIGINT) AS run_id,
+  metadata.correlation_uid AS correlation_uid,
   CAST(json_extract(unmapped, '$.run_attempt') AS BIGINT) AS run_attempt,
   metadata.log_level AS conclusion,
   actor.user.name AS actor,
@@ -87,7 +90,8 @@ SELECT
   log_name,
   actor.user.name AS triggering_actor,
   actor.user.uid AS actor_uid,
-  metadata.correlation_uid AS run_id,
+  CAST(json_extract(unmapped, '$.run_id') AS BIGINT) AS run_id,
+  metadata.correlation_uid AS correlation_uid,
   json_extract_string(unmapped, '$.trigger_event') AS trigger_event,
   json_extract_string(unmapped, '$.head_branch') AS head_branch,
   json_extract_string(unmapped, '$.head_sha') AS head_sha,
@@ -155,6 +159,7 @@ ORDER BY time DESC
 LIMIT 200;
 
 -- 8. Correlate all jobs & webhook events for a specific GitHub Actions run_id
+-- Filters by numeric unmapped.run_id so trace-linked direct jobs (where metadata.correlation_uid holds trace_id) are included.
 SELECT
   time_dt,
   log_provider,
@@ -163,10 +168,12 @@ SELECT
   device.hostname AS runner_host,
   actor.user.name AS actor,
   actor.process.name AS job_or_workflow,
+  metadata.correlation_uid AS correlation_uid,
   metadata.original_event_uid AS event_uid,
   message,
   unmapped
 FROM siem.ocsf_event_log_activity
 WHERE class_uid = 1008
-  AND metadata.correlation_uid = '<RUN_ID>'
+  AND log_provider = 'github-actions'
+  AND CAST(json_extract(unmapped, '$.run_id') AS BIGINT) = 100200300
 ORDER BY time ASC;
