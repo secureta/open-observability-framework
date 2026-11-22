@@ -62,25 +62,26 @@ WHERE class_uid = 1008
 ORDER BY time DESC
 LIMIT 200;
 
--- 4. Runner utilization breakdown (GitHub-hosted Virtual vs Self-hosted Server vs Unknown)
--- Deduplicates by (run_id, run_attempt, job) so enabling both webhook and direct Action does not double-count jobs.
+-- 4. Runner utilization breakdown by collector source (Vector webhook vs GitHub Actions direct)
+-- Deduplicates webhook retries by numeric unmapped.job_id, preserves all direct Action matrix rows,
+-- and separates totals by collector_source (`metadata.product.name`) so enabling both collectors never double-counts.
 WITH dedup_jobs AS (
   SELECT
+    metadata.product.name AS collector_source,
     device.type AS runner_type,
     device.hostname AS runner_name,
     device.os.name AS runner_os,
     severity_id,
     CAST(json_extract(unmapped, '$.duration_ms') AS DOUBLE) AS duration_ms,
     CAST(json_extract(unmapped, '$.queue_duration_ms') AS DOUBLE) AS queue_duration_ms,
-    ROW_NUMBER() OVER (
-      PARTITION BY
-        CAST(json_extract(unmapped, '$.run_id') AS BIGINT),
-        COALESCE(CAST(json_extract(unmapped, '$.run_attempt') AS BIGINT), 1),
-        COALESCE(json_extract_string(unmapped, '$.job'), metadata.original_event_uid)
-      ORDER BY
-        CASE WHEN metadata.product.name = 'Vector' THEN 0 ELSE 1 END,
-        time DESC
-    ) AS rn
+    CASE
+      WHEN json_extract(unmapped, '$.job_id') IS NOT NULL THEN
+        ROW_NUMBER() OVER (
+          PARTITION BY metadata.product.name, CAST(json_extract(unmapped, '$.job_id') AS BIGINT)
+          ORDER BY time DESC
+        )
+      ELSE 1
+    END AS rn
   FROM siem.ocsf_event_log_activity
   WHERE class_uid = 1008
     AND log_provider = 'github-actions'
@@ -88,6 +89,7 @@ WITH dedup_jobs AS (
     AND json_extract_string(unmapped, '$.status') = 'completed'
 )
 SELECT
+  collector_source,
   runner_type,
   runner_name,
   runner_os,
@@ -97,7 +99,7 @@ SELECT
   AVG(queue_duration_ms) AS avg_queue_ms
 FROM dedup_jobs
 WHERE rn = 1
-GROUP BY runner_type, runner_name, runner_os
+GROUP BY collector_source, runner_type, runner_name, runner_os
 ORDER BY completed_jobs DESC
 LIMIT 100;
 
