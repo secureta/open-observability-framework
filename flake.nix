@@ -98,6 +98,7 @@
         let
           ocsfLuaStore = ./adapters/collect/fluent-bit-journald/ocsf.lua;
           vectorYamlSrc = ./adapters/collect/vector-journald/vector.yaml;
+          vectorGhaYamlSrc = ./adapters/collect/vector-github-actions/vector.yaml;
           fluentBitConfRaw = builtins.readFile ./adapters/collect/fluent-bit-journald/fluent-bit.conf;
           otelcolYamlSrc = ./adapters/collect/otel-collector-journald/otelcol.yaml;
 
@@ -159,6 +160,11 @@
               cp ${vectorYamlSrc} "$out"
             '';
 
+          oofVectorGhaConfig =
+            pkgs.runCommand "oof-vector-github-actions.yaml" { } ''
+              cp ${vectorGhaYamlSrc} "$out"
+            '';
+
           oofFluentBitConfig = mkFluentBitConfig { };
 
           oofOtelcolConfig =
@@ -174,6 +180,20 @@
               wrapProgram "$out/bin/vector" \
                 --set VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION "true" \
                 --set-default VECTOR_CONFIG "${oofVectorConfig}"
+            '';
+            meta = pkgs.vector.meta // {
+              mainProgram = "vector";
+            };
+          };
+
+          oofVectorGha = pkgs.symlinkJoin {
+            name = "oof-vector-github-actions-${pkgs.vector.version}";
+            paths = [ pkgs.vector ];
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            postBuild = ''
+              wrapProgram "$out/bin/vector" \
+                --set VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION "true" \
+                --set-default VECTOR_CONFIG "${oofVectorGhaConfig}"
             '';
             meta = pkgs.vector.meta // {
               mainProgram = "vector";
@@ -197,9 +217,11 @@
           inherit
             mkFluentBitConfig
             oofVectorConfig
+            oofVectorGhaConfig
             oofFluentBitConfig
             oofOtelcolConfig
             oofVector
+            oofVectorGha
             oofFluentBit
             ;
         };
@@ -464,9 +486,11 @@
             in
             {
               oof-vector-config = assets.oofVectorConfig;
+              oof-vector-github-actions-config = assets.oofVectorGhaConfig;
               oof-fluent-bit-config = assets.oofFluentBitConfig;
               oof-otelcol-config = assets.oofOtelcolConfig;
               oof-vector = assets.oofVector;
+              oof-vector-github-actions = assets.oofVectorGha;
               oof-fluent-bit = assets.oofFluentBit;
             }
           )
@@ -510,6 +534,7 @@
           bridgeGrpcParsed = parseSocketAddr cfg.otelBridge.grpcListen;
           bridgeHttpParsed = parseSocketAddr cfg.otelBridge.httpListen;
           bridgeTargetParsed = parseHttpUrlHostPort cfg.otelBridge.bridgeEndpoint;
+          ghaWebhookParsed = parseSocketAddr cfg.githubActionsWebhook.listen;
 
           customFluentBitConfig = assets.mkFluentBitConfig {
             listenHost = if httpParsed.valid then httpParsed.bareHost else "127.0.0.1";
@@ -557,7 +582,11 @@
                 name = "services.oof-collector.otelBridge.httpListen";
                 parsed = bridgeHttpParsed;
               }
-            ]);
+            ])
+            ++ (lib.optional cfg.githubActionsWebhook.enable {
+              name = "services.oof-collector.githubActionsWebhook.listen";
+              parsed = ghaWebhookParsed;
+            });
 
           listenerPairs =
             let
@@ -674,6 +703,22 @@
               };
             };
 
+            githubActionsWebhook = {
+              enable = lib.mkEnableOption "co-located Vector GitHub Actions webhook collector normalizing webhook events into OCSF v1.3.0";
+
+              listen = lib.mkOption {
+                type = lib.types.str;
+                default = "127.0.0.1:8088";
+                description = "Host:port for the GitHub Actions webhook HTTP server (/webhook/github).";
+              };
+
+              environmentFile = lib.mkOption {
+                type = lib.types.nullOr (lib.types.strMatching "^/[^[:space:]]+$");
+                default = null;
+                description = "Optional separate systemd EnvironmentFile containing OOF_GITHUB_WEBHOOK_SECRET (defaults to services.oof-collector.environmentFile). Must point outside /nix/store.";
+              };
+            };
+
             extraConfigFiles = lib.mkOption {
               type = lib.types.listOf (lib.types.strMatching "^/[^[:space:]]+$");
               default = [ ];
@@ -721,6 +766,17 @@
               {
                 assertion = !selfLoopDetected;
                 message = "services.oof-collector.otelBridge.bridgeEndpoint ('${cfg.otelBridge.bridgeEndpoint}') must not point to its own otelBridge.httpListen (${cfg.otelBridge.httpListen}).";
+              }
+              {
+                assertion = (!cfg.githubActionsWebhook.enable) || ghaWebhookParsed.valid;
+                message = "services.oof-collector.githubActionsWebhook.listen ('${cfg.githubActionsWebhook.listen}') must be a valid IPv4/IPv6 socket address (ip:port, e.g. 127.0.0.1:8088).";
+              }
+              {
+                assertion =
+                  (!cfg.githubActionsWebhook.enable)
+                  || cfg.githubActionsWebhook.environmentFile == null
+                  || !(lib.hasPrefix builtins.storeDir cfg.githubActionsWebhook.environmentFile);
+                message = "services.oof-collector.githubActionsWebhook.environmentFile must NOT point inside /nix/store.";
               }
             ];
 
@@ -808,6 +864,45 @@
                   ]
                   ++ map (f: "--config=file:${f}") cfg.otelBridge.extraConfigFiles
                 );
+              };
+            };
+
+            systemd.services.oof-github-actions-webhook = lib.mkIf cfg.githubActionsWebhook.enable {
+              description = "Open Observability Framework GitHub Actions Webhook Collector (Vector)";
+              wantedBy = [ "multi-user.target" ];
+              after = [ "network-online.target" ];
+              wants = [ "network-online.target" ];
+
+              environment = {
+                VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION = "true";
+                OOF_VECTOR_DATA_DIR = "/var/lib/oof-github-actions-webhook";
+                OOF_GHA_WEBHOOK_LISTEN = cfg.githubActionsWebhook.listen;
+              };
+
+              serviceConfig = {
+                Type = "simple";
+                DynamicUser = true;
+                StateDirectory = "oof-github-actions-webhook";
+                EnvironmentFile =
+                  if cfg.githubActionsWebhook.environmentFile != null then
+                    [
+                      cfg.environmentFile
+                      cfg.githubActionsWebhook.environmentFile
+                    ]
+                  else
+                    cfg.environmentFile;
+                Restart = "on-failure";
+                RestartSec = "5s";
+                NoNewPrivileges = true;
+                ProtectSystem = "strict";
+                ProtectHome = true;
+                PrivateTmp = true;
+                ExecStart = utils.escapeSystemdExecArgs [
+                  (lib.getExe cfg.vectorPackage)
+                  "--dangerously-allow-env-var-interpolation"
+                  "--config"
+                  assets.oofVectorGhaConfig
+                ];
               };
             };
           };
@@ -929,6 +1024,32 @@
                   otlp.grpcListen = "[::1]:4319";
                   otlp.httpListen = "[::]:4320";
                   otelBridge.enable = true;
+                };
+              };
+
+              ghaWebhookCfg = evalNixos {
+                services.oof-collector = {
+                  enable = true;
+                  collector = "vector";
+                  environmentFile = "/run/secrets/oof-collector.env";
+                  githubActionsWebhook = {
+                    enable = true;
+                    listen = "127.0.0.1:8088";
+                    environmentFile = "/run/secrets/oof-gha-webhook.env";
+                  };
+                };
+              };
+
+              badGhaPortCollisionCfg = evalNixos {
+                services.oof-collector = {
+                  enable = true;
+                  collector = "vector";
+                  environmentFile = "/run/secrets/oof-collector.env";
+                  otlp.httpListen = "127.0.0.1:8088";
+                  githubActionsWebhook = {
+                    enable = true;
+                    listen = "127.0.0.1:8088";
+                  };
                 };
               };
 
@@ -1078,6 +1199,11 @@
                   vecIpv6Ok = checkAssertionsPass vecIpv6Cfg;
                   vecIpv6BridgeEndpoint = vecIpv6Cfg.config.systemd.services.oof-otel-bridge.environment.OOF_OTLP_BRIDGE_ENDPOINT;
 
+                  ghaWebhookOk = checkAssertionsPass ghaWebhookCfg;
+                  ghaWebhookExec = ghaWebhookCfg.config.systemd.services.oof-github-actions-webhook.serviceConfig.ExecStart;
+                  ghaWebhookListen = ghaWebhookCfg.config.systemd.services.oof-github-actions-webhook.environment.OOF_GHA_WEBHOOK_LISTEN;
+                  badGhaCollisionRejected = !(checkAssertionsPass badGhaPortCollisionCfg);
+
                   badHostnameRejected = !(checkAssertionsPass badHostnameListenerCfg);
                   badIpv4OctetRejected = !(checkAssertionsPass badIpv4OctetCfg);
                   badIpv6SyntaxRejected = !(checkAssertionsPass badIpv6SyntaxCfg);
@@ -1136,6 +1262,11 @@
                       assert.equal(s.vecIpv6Ok, true);
                       assert.equal(s.vecIpv6BridgeEndpoint, "http://[::1]:4320");
 
+                      assert.equal(s.ghaWebhookOk, true);
+                      assert.match(s.ghaWebhookExec, /--dangerously-allow-env-var-interpolation/);
+                      assert.equal(s.ghaWebhookListen, "127.0.0.1:8088");
+                      assert.equal(s.badGhaCollisionRejected, true);
+
                       assert.equal(s.badHostnameRejected, true);
                       assert.equal(s.badIpv4OctetRejected, true);
                       assert.equal(s.badIpv6SyntaxRejected, true);
@@ -1177,6 +1308,13 @@
                       OOF_INGEST_TOKEN="dummy-basin-token" \
                       OOF_OTLP_GRPC_LISTEN="[::1]:4319" \
                       ${assets.oofVector}/bin/vector validate --no-environment
+
+                    OOF_VECTOR_DATA_DIR="$TMPDIR/vec-gha-data" \
+                      OOF_BASIN_ENDPOINT="https://example-stream.ingest.cloudflare.com" \
+                      OOF_INGEST_TOKEN="dummy-basin-token" \
+                      OOF_GITHUB_WEBHOOK_SECRET="dummy-webhook-secret" \
+                      OOF_GHA_WEBHOOK_LISTEN="127.0.0.1:8088" \
+                      ${assets.oofVectorGha}/bin/vector validate --no-environment
 
                     ${assets.oofVector}/bin/vector --version
 

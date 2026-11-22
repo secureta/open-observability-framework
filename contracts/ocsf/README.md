@@ -70,3 +70,22 @@ Both [Vector](../../adapters/collect/vector-journald/vector.yaml) and [Fluent Bi
 | `actor.user.uid_numeric` (`int64`) | `_UID` (parsed int if `^[0-9]{1,15}$`) | `user.id` (parsed int if `^[0-9]{1,15}$`) | Only populated alongside `actor.user.uid` |
 | `actor.user.name` (`string`) | — | `attributes["user.name"]` -> `attributes["user.full_name"]` | Username if present |
 | `unmapped` (`json`) | Non-consumed fields + valid `span_id` | Non-consumed `attributes` / `resources` + valid `span_id` | Omitted (`null`) when empty; never serialized as `[]` |
+
+---
+
+## GitHub Actions Telemetry Mapping
+
+Both [Vector GitHub Actions Webhook Collector](../../adapters/collect/vector-github-actions/vector.yaml) (`vector-github-actions`) and [GitHub Actions Direct Action](../../adapters/collect/github-actions-direct/emit-ocsf.mjs) (`github-actions-direct`) emit standard OCSF v1.3.0 `Event Log Activity` (`1008`, `activity_id = 99`, `type_uid = 100899`) with `log_provider = "github-actions"`:
+
+| OCSF Path | GitHub Actions Source | Notes |
+| :--- | :--- | :--- |
+| `severity_id` / `severity` | `conclusion` / `status` / alert severity | `critical`=`5`, `failure`/`startup_failure`/`high`=`4`, `timed_out`/`action_required`/`medium`=`3`, `cancelled`/`skipped`/`low`=`2`, `success`/`queued`/`in_progress`=`1`, unknown=`0` |
+| `log_name` | `"<owner>/<repo>:<workflow>"` | Falls back to `<owner>/<repo>` or webhook event name |
+| `log_provider` | `"github-actions"` | Identifies CI/CD telemetry in `siem.ocsf_event_log_activity` |
+| `metadata.original_event_uid` | `X-GitHub-Delivery` / `<run_id>:<run_attempt>:<job>` | Unique delivery or job execution identifier |
+| `metadata.correlation_uid` | `OTEL_TRACE_ID` -> `run_id` | Links workflow runs, jobs, and optional APM traces |
+| `device.type_id` / `type` | `1` / `"Server"` (self-hosted), `6` / `"Virtual"` (GitHub-hosted), `0` / `"Unknown"` | Runner execution environment |
+| `device.hostname` | `runner_name` -> `repository.full_name` | Runner or repository identifier |
+| `device.os` | Runner labels / `RUNNER_OS` | `linux`/`ubuntu`=`200`, `windows`=`100`, `macos`/`darwin`=`300`; omitted if unknown |
+| `actor.user.name` / `uid` | `triggering_actor` -> `actor` -> `sender` -> `GITHUB_ACTOR` | Triggering user login and numeric ID |
+| `unmapped` | `github_event`, `repository`, `workflow`, `job`, `run_id`, `run_attempt`, `trigger_event`, `is_fork_pr`, `is_self_hosted`, `duration_ms`, `queue_duration_ms`, `alert_rule`, `html_url` | Structured CI/CD observability & SIEM fields |
