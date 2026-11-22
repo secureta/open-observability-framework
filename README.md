@@ -29,7 +29,7 @@ flowchart LR
 | `ingest` | `direct-basin-http` (`http.enabled = true`, `http.authentication = true`) | Authenticated via Cloudflare Account API Token (`Pipelines Send` / `Basin Pipelines Send`) |
 | `storage` | Cloudflare Basin Iceberg ([Terraform/OpenTofu](./adapters/storage/cloudflare-basin-iceberg/terraform/README.md) · [Pulumi TS](./adapters/storage/cloudflare-basin-iceberg/pulumi/README.md)) | [Pipeline SQL](./adapters/storage/cloudflare-basin-iceberg/pipeline.sql), inspected via Cloudflare `cf` CLI |
 | `apm` | `metadata.correlation_uid` (`trace_id`) + `unmapped.span_id` | Full OTLP Traces + Metrics exporters via `otelcol.yaml` |
-| `query` | Basin SQL & DuckDB | [Hunting SQL](./adapters/storage/cloudflare-basin-iceberg/queries/siem_hunting.sql), [GitHub Actions Monitoring SQL](./adapters/storage/cloudflare-basin-iceberg/queries/github_actions_monitoring.sql), PyIceberg, Spark |
+| `query` | Basin SQL & DuckDB | [Hunting SQL](./adapters/storage/cloudflare-basin-iceberg/queries/siem_hunting.sql), [GitHub Actions SQL (DuckDB)](./adapters/storage/cloudflare-basin-iceberg/queries/github_actions_monitoring.sql) · [(Basin SQL)](./adapters/storage/cloudflare-basin-iceberg/queries/github_actions_monitoring.basin.sql), PyIceberg, Spark |
 
 ---
 

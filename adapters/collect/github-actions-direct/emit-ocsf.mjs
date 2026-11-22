@@ -83,7 +83,8 @@ export function buildOcsfEvent(input = {}) {
   const repository = cleanNonEmptyString(input.repository);
   const workflow = cleanNonEmptyString(input.workflow);
   const job = cleanNonEmptyString(input.job);
-  const githubEvent = cleanNonEmptyString(input.eventName) || "workflow_job";
+  const githubEvent = cleanNonEmptyString(input.eventKind) || "workflow_job";
+  const triggerEvent = cleanNonEmptyString(input.triggerEvent) || cleanNonEmptyString(input.eventName);
   const status = cleanNonEmptyString(input.status) || "completed";
   const conclusion = cleanNonEmptyString(input.conclusion);
   const actorName = cleanNonEmptyString(input.actor);
@@ -95,12 +96,15 @@ export function buildOcsfEvent(input = {}) {
   const sha = cleanNonEmptyString(input.sha);
   const runnerName = cleanNonEmptyString(input.runnerName);
   const runnerOs = mapRunnerOs(input.runnerOs);
-  const isSelfHosted =
-    typeof input.isSelfHosted === "boolean"
-      ? input.isSelfHosted
-      : runnerName !== null && !/^GitHub Actions\b/i.test(runnerName) && !/^Hosted Agent$/i.test(runnerName)
-        ? null
-        : false;
+  const runnerEnv = cleanNonEmptyString(input.runnerEnvironment)?.toLowerCase() || null;
+  let isSelfHosted = null;
+  if (typeof input.isSelfHosted === "boolean") {
+    isSelfHosted = input.isSelfHosted;
+  } else if (runnerEnv === "self-hosted") {
+    isSelfHosted = true;
+  } else if (runnerEnv === "github-hosted") {
+    isSelfHosted = false;
+  }
   const durationMs = parseNonNegativeInt(input.durationMs);
   const serverUrl = cleanNonEmptyString(input.serverUrl) || "https://github.com";
   const htmlUrl =
@@ -142,8 +146,8 @@ export function buildOcsfEvent(input = {}) {
   if (stateStr) metadata.log_level = stateStr;
 
   const device = {
-    type_id: isSelfHosted === true ? 1 : isSelfHosted === false || runnerName !== null ? 6 : 0,
-    type: isSelfHosted === true ? "Server" : isSelfHosted === false || runnerName !== null ? "Virtual" : "Unknown",
+    type_id: isSelfHosted === true ? 1 : isSelfHosted === false ? 6 : 0,
+    type: isSelfHosted === true ? "Server" : isSelfHosted === false ? "Virtual" : "Unknown",
   };
   if (runnerName !== null) {
     device.hostname = runnerName;
@@ -169,6 +173,7 @@ export function buildOcsfEvent(input = {}) {
   const unmapped = {
     github_event: githubEvent,
   };
+  if (triggerEvent !== null) unmapped.trigger_event = triggerEvent;
   if (repository !== null) unmapped.repository = repository;
   if (workflow !== null) unmapped.workflow = workflow;
   if (job !== null) unmapped.job = job;
@@ -216,7 +221,7 @@ export function buildOcsfEvent(input = {}) {
   return record;
 }
 
-export async function sendToBasin(events, { endpoint, token, fetchImpl = fetch } = {}) {
+export async function sendToBasin(events, { endpoint, token, fetchImpl = fetch, allowInsecureHttp = false } = {}) {
   const cleanEndpoint = cleanNonEmptyString(endpoint);
   const cleanToken = cleanNonEmptyString(token);
   if (!cleanEndpoint) {
@@ -224,6 +229,15 @@ export async function sendToBasin(events, { endpoint, token, fetchImpl = fetch }
   }
   if (!cleanToken) {
     throw new Error("Missing OOF_INGEST_TOKEN / ingest_token");
+  }
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(cleanEndpoint);
+  } catch {
+    throw new Error("Invalid OOF_BASIN_ENDPOINT URL");
+  }
+  if (parsedUrl.protocol !== "https:" && !(allowInsecureHttp && parsedUrl.protocol === "http:")) {
+    throw new Error("OOF_BASIN_ENDPOINT must use https:// to protect the ingest token in transit");
   }
   const batch = Array.isArray(events) ? events : [events];
   const gzipped = zlib.gzipSync(Buffer.from(JSON.stringify(batch), "utf8"));
@@ -276,7 +290,8 @@ export function buildInputFromEnv(env = process.env) {
       workflow: readInput(env, "workflow", "GITHUB_WORKFLOW"),
       workflowRef: readInput(env, "workflow_ref", "GITHUB_WORKFLOW_REF"),
       job: readInput(env, "job", "GITHUB_JOB"),
-      eventName: readInput(env, "event_name", "GITHUB_EVENT_NAME"),
+      eventKind: readInput(env, "event_kind") || "workflow_job",
+      triggerEvent: readInput(env, "trigger_event", "GITHUB_EVENT_NAME"),
       status: readInput(env, "status") || "completed",
       conclusion: readInput(env, "conclusion"),
       actor: readInput(env, "actor", "GITHUB_ACTOR"),
@@ -288,6 +303,7 @@ export function buildInputFromEnv(env = process.env) {
       sha: readInput(env, "sha", "GITHUB_SHA"),
       runnerName: readInput(env, "runner_name", "RUNNER_NAME"),
       runnerOs: readInput(env, "runner_os", "RUNNER_OS"),
+      runnerEnvironment: readInput(env, "runner_environment", "RUNNER_ENVIRONMENT"),
       isSelfHosted,
       durationMs: readInput(env, "duration_ms"),
       traceId: readInput(env, "trace_id", "OTEL_TRACE_ID"),
