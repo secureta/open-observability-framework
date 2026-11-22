@@ -6,6 +6,7 @@ import os from "node:os";
 import http from "node:http";
 import net from "node:net";
 import zlib from "node:zlib";
+import crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -22,6 +23,11 @@ const FLAKE_NIX_PATH = path.join(REPO_ROOT, "flake.nix");
 const STACK_SCHEMA_PATH = path.join(REPO_ROOT, "manifest/stack.schema.json");
 const STACK_EXAMPLE_PATH = path.join(REPO_ROOT, "manifest/examples/cloudflare-basin-ocsf.yaml");
 const VECTOR_CONFIG_PATH = path.join(REPO_ROOT, "adapters/collect/vector-journald/vector.yaml");
+const VECTOR_GHA_CONFIG_PATH = path.join(REPO_ROOT, "adapters/collect/vector-github-actions/vector.yaml");
+const GHA_DIRECT_MODULE_PATH = path.join(REPO_ROOT, "adapters/collect/github-actions-direct/emit-ocsf.mjs");
+const GHA_DIRECT_ACTION_PATH = path.join(REPO_ROOT, "adapters/collect/github-actions-direct/action.yml");
+const GHA_MONITORING_SQL_PATH = path.join(REPO_ROOT, "adapters/storage/cloudflare-basin-iceberg/queries/github_actions_monitoring.sql");
+const GHA_MONITORING_BASIN_SQL_PATH = path.join(REPO_ROOT, "adapters/storage/cloudflare-basin-iceberg/queries/github_actions_monitoring.basin.sql");
 const FLUENT_BIT_CONF_PATH = path.join(REPO_ROOT, "adapters/collect/fluent-bit-journald/fluent-bit.conf");
 const FLUENT_BIT_LUA_PATH = path.join(REPO_ROOT, "adapters/collect/fluent-bit-journald/ocsf.lua");
 const OTELCOL_CONF_PATH = path.join(REPO_ROOT, "adapters/collect/otel-collector-journald/otelcol.yaml");
@@ -2004,6 +2010,324 @@ test("8. Live E2E wire conformance: Vector and Fluent Bit emit identical valid O
   } finally {
     await terminateProcess(vectorProc);
     await terminateProcess(fbProc);
+    await mockBasin.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("9. GitHub Actions monitoring: Vector webhook E2E, direct Action E2E, and SQL contract parity", async () => {
+  const vectorBin = requireBinary("vector");
+  const basinSchema = JSON.parse(fs.readFileSync(BASIN_SCHEMA_PATH, "utf8"));
+
+  // Verify both DuckDB and Basin SQL query files target siem.ocsf_event_log_activity and OCSF class_uid = 1008
+  const ghaSql = fs.readFileSync(GHA_MONITORING_SQL_PATH, "utf8");
+  assert.match(ghaSql, /FROM\s+siem\.ocsf_event_log_activity/i);
+  assert.match(ghaSql, /class_uid\s*=\s*1008/);
+  assert.match(ghaSql, /log_provider\s*=\s*'github-actions'/);
+  assert.match(ghaSql, /actions\.runner\.%/);
+  assert.match(ghaSql, /json_extract\(unmapped,\s*'\$\.run_id'\)/);
+
+  const ghaBasinSql = fs.readFileSync(GHA_MONITORING_BASIN_SQL_PATH, "utf8");
+  assert.match(ghaBasinSql, /FROM\s+siem\.ocsf_event_log_activity/i);
+  assert.match(ghaBasinSql, /class_uid\s*=\s*1008/);
+  assert.match(ghaBasinSql, /json_get_str\(unmapped,/);
+  assert.match(ghaBasinSql, /json_get_int\(unmapped,\s*'run_id'\)/);
+  assert.match(ghaBasinSql, /json_get_bool\(unmapped,\s*'is_fork_pr'\)/);
+  assert.doesNotMatch(ghaBasinSql, /json_extract/);
+
+  // Verify action.yml uses node20 (zero shell scripts)
+  const actionYml = fs.readFileSync(GHA_DIRECT_ACTION_PATH, "utf8");
+  assert.match(actionYml, /using:\s*"?node20"?/);
+  assert.match(actionYml, /main:\s*"?emit-ocsf\.mjs"?/);
+
+  const testToken = "test-basin-gha-token-xyz";
+  const webhookSecret = "super-secret-gh-webhook-key-!@#";
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "oof-gha-e2e-"));
+  const mockBasin = await startMockBasinServer(testToken);
+  let vecProc;
+
+  try {
+    // Part A: Validate and run built-in VRL tests in adapters/collect/vector-github-actions/vector.yaml
+    const vecVal = spawnSync(
+      vectorBin,
+      ["validate", "--no-environment", "--dangerously-allow-env-var-interpolation", VECTOR_GHA_CONFIG_PATH],
+      {
+        cwd: REPO_ROOT,
+        env: {
+          ...process.env,
+          OOF_VECTOR_DATA_DIR: path.join(tmpDir, "val-data"),
+          OOF_BASIN_ENDPOINT: `http://127.0.0.1:${mockBasin.port}/`,
+          OOF_INGEST_TOKEN: testToken,
+          OOF_GITHUB_WEBHOOK_SECRET: webhookSecret,
+          OOF_GHA_WEBHOOK_LISTEN: "127.0.0.1:8088",
+        },
+        encoding: "utf8",
+      }
+    );
+    assert.equal(vecVal.status, 0, `vector-github-actions validate failed:\n${vecVal.stdout}\n${vecVal.stderr}`);
+
+    const vecTest = spawnSync(
+      vectorBin,
+      ["test", VECTOR_GHA_CONFIG_PATH],
+      {
+        cwd: REPO_ROOT,
+        env: {
+          ...process.env,
+          VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION: "true",
+          OOF_VECTOR_DATA_DIR: path.join(tmpDir, "test-data"),
+          OOF_BASIN_ENDPOINT: `http://127.0.0.1:${mockBasin.port}/`,
+          OOF_INGEST_TOKEN: testToken,
+          OOF_GITHUB_WEBHOOK_SECRET: webhookSecret,
+        },
+        encoding: "utf8",
+      }
+    );
+    assert.equal(vecTest.status, 0, `vector-github-actions test failed:\n${vecTest.stdout}\n${vecTest.stderr}`);
+
+    // Part B: Live Vector GitHub Webhook E2E (HMAC-SHA256 verification + OCSF v1.3.0 -> mock Basin)
+    const [ghaPort] = await getFreePorts(1);
+    const liveDataDir = path.join(tmpDir, "live-gha-data");
+    fs.mkdirSync(liveDataDir, { recursive: true });
+
+    vecProc = spawn(
+      vectorBin,
+      ["--dangerously-allow-env-var-interpolation", "--config", VECTOR_GHA_CONFIG_PATH],
+      {
+        cwd: REPO_ROOT,
+        env: {
+          ...process.env,
+          OOF_VECTOR_DATA_DIR: liveDataDir,
+          OOF_BASIN_ENDPOINT: `http://127.0.0.1:${mockBasin.port}/`,
+          OOF_INGEST_TOKEN: testToken,
+          OOF_GITHUB_WEBHOOK_SECRET: webhookSecret,
+          OOF_GHA_WEBHOOK_LISTEN: `127.0.0.1:${ghaPort}`,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      }
+    );
+    let vecStderr = "";
+    vecProc.stderr.on("data", (d) => {
+      vecStderr += d.toString("utf8");
+    });
+    await waitForTcpReady(ghaPort);
+
+    const signBody = (raw) => "sha256=" + crypto.createHmac("sha256", webhookSecret).update(raw).digest("hex");
+
+    const runPayload = JSON.stringify({
+      action: "completed",
+      repository: { full_name: "acme/core" },
+      organization: { login: "acme" },
+      workflow_run: {
+        id: 100200300,
+        name: "Release",
+        path: ".github/workflows/release.yml",
+        run_number: 18,
+        run_attempt: 2,
+        status: "completed",
+        conclusion: "failure",
+        event: "pull_request_target",
+        head_branch: "pr-branch",
+        head_sha: "deadbeef1234",
+        html_url: "https://github.com/acme/core/actions/runs/100200300",
+        created_at: "2025-03-01T10:00:00Z",
+        run_started_at: "2025-03-01T10:00:15Z",
+        updated_at: "2025-03-01T10:03:15Z",
+        head_repository: { full_name: "fork-user/core" },
+        triggering_actor: { login: "external-dev", id: 424242 },
+      },
+    });
+
+    const jobPayload = JSON.stringify({
+      action: "completed",
+      repository: { full_name: "acme/core" },
+      sender: { login: "external-dev", id: 424242 },
+      workflow_job: {
+        id: 999888,
+        run_id: 100200300,
+        run_attempt: 2,
+        workflow_name: "Release",
+        name: "deploy-prod",
+        status: "completed",
+        conclusion: "success",
+        head_branch: "pr-branch",
+        head_sha: "deadbeef1234",
+        created_at: "2025-03-01T10:00:15Z",
+        started_at: "2025-03-01T10:00:25Z",
+        completed_at: "2025-03-01T10:02:25Z",
+        runner_id: 55,
+        runner_name: "nixos-runner-01",
+        runner_group_name: "prod",
+        labels: ["self-hosted", "linux", "x64"],
+      },
+    });
+
+    const badPayload = JSON.stringify({
+      action: "completed",
+      repository: { full_name: "attacker/evil" },
+      workflow_run: { id: 666, name: "Spoofed", status: "completed", conclusion: "success" },
+    });
+
+    // Send 1 invalid-signature webhook (must be dropped by verify_github_signature)
+    const badRes = await fetch(`http://127.0.0.1:${ghaPort}/webhook/github`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-github-event": "workflow_run",
+        "x-github-delivery": "deliv-invalid",
+        "x-hub-signature-256": "sha256=0000000000000000000000000000000000000000000000000000000000000000",
+      },
+      body: badPayload,
+    });
+    assert.ok(badRes.ok);
+
+    // Send 2 valid JSON HMAC-signed webhooks + 1 valid default form-encoded (payload=...) webhook
+    const formJobJson = JSON.stringify({
+      action: "completed",
+      repository: { full_name: "acme/core" },
+      sender: { login: "arc-bot", id: 5150 },
+      workflow_job: {
+        id: 777001,
+        run_id: 100200300,
+        run_attempt: 1,
+        workflow_name: "Release",
+        name: "arc-scale-job",
+        status: "completed",
+        conclusion: "success",
+        runner_name: "arc-runner-set-01",
+        labels: ["arc-runner-set"],
+      },
+    });
+    const formEncodedBody = `payload=${encodeURIComponent(formJobJson)}`;
+
+    for (const [ev, delivery, contentType, raw] of [
+      ["workflow_run", "deliv-e2e-run", "application/json", runPayload],
+      ["workflow_job", "deliv-e2e-job", "application/json", jobPayload],
+      ["workflow_job", "deliv-e2e-form-job", "application/x-www-form-urlencoded", formEncodedBody],
+    ]) {
+      const r = await fetch(`http://127.0.0.1:${ghaPort}/webhook/github`, {
+        method: "POST",
+        headers: {
+          "content-type": contentType,
+          "x-github-event": ev,
+          "x-github-delivery": delivery,
+          "x-hub-signature-256": signBody(raw),
+        },
+        body: raw,
+      });
+      assert.ok(r.ok, `Vector webhook rejected ${ev}: ${r.status}`);
+    }
+
+    await waitForCondition(() => mockBasin.records.length >= 3, 15000);
+    await terminateProcess(vecProc);
+    assert.equal(vecStderr.includes("ERROR "), false, `Vector webhook stderr errors:\n${vecStderr}`);
+
+    const ghaWebhookRecords = mockBasin.records.splice(0, mockBasin.records.length);
+    assert.equal(ghaWebhookRecords.length, 3, `Expected exactly 3 valid webhook records (invalid dropped), got ${ghaWebhookRecords.length}`);
+    for (const rec of ghaWebhookRecords) {
+      assertConformsToOcsfContract(rec, basinSchema);
+      assert.equal(rec.log_provider, "github-actions");
+    }
+
+    const formJobRec = ghaWebhookRecords.find((r) => r.metadata.original_event_uid === "deliv-e2e-form-job");
+    assert.ok(formJobRec, "missing form-encoded workflow_job webhook OCSF record");
+    assert.equal(formJobRec.device.type_id, 0, "ambiguous scale-set runner must stay Unknown (0), not Virtual");
+    assert.equal(formJobRec.device.type, "Unknown");
+    assert.equal(formJobRec.unmapped.is_self_hosted, undefined);
+    assert.equal(formJobRec.unmapped.run_id, 100200300);
+
+    const runRec = ghaWebhookRecords.find((r) => r.metadata.original_event_uid === "deliv-e2e-run");
+    assert.ok(runRec, "missing workflow_run webhook OCSF record");
+    assert.equal(runRec.severity_id, 4);
+    assert.equal(runRec.severity, "High");
+    assert.equal(runRec.log_name, "acme/core:Release");
+    assert.equal(runRec.metadata.correlation_uid, "100200300");
+    assert.equal(runRec.actor.user.name, "external-dev");
+    assert.equal(runRec.actor.user.uid, "424242");
+    assert.equal(runRec.actor.user.uid_numeric, 424242);
+    assert.equal(runRec.unmapped.duration_ms, 180000);
+    assert.equal(runRec.unmapped.queue_duration_ms, 15000);
+    assert.equal(runRec.unmapped.is_fork_pr, true);
+    assert.equal(runRec.unmapped.trigger_event, "pull_request_target");
+
+    const jobRec = ghaWebhookRecords.find((r) => r.metadata.original_event_uid === "deliv-e2e-job");
+    assert.ok(jobRec, "missing workflow_job webhook OCSF record");
+    assert.equal(jobRec.severity_id, 1);
+    assert.equal(jobRec.device.type_id, 1);
+    assert.equal(jobRec.device.type, "Server");
+    assert.equal(jobRec.device.hostname, "nixos-runner-01");
+    assert.equal(jobRec.device.os.name, "Linux");
+    assert.equal(jobRec.device.os.type_id, 200);
+    assert.equal(jobRec.unmapped.is_self_hosted, true);
+
+    // Part C: Direct serverless GitHub Action (emit-ocsf.mjs -> mock Basin HTTP)
+    const directMod = await import(pathToFileURL(GHA_DIRECT_MODULE_PATH).href);
+    const { endpoint, token, event } = directMod.buildInputFromEnv({
+      INPUT_BASIN_ENDPOINT: `http://127.0.0.1:${mockBasin.port}/`,
+      INPUT_INGEST_TOKEN: testToken,
+      INPUT_CONCLUSION: "failure",
+      INPUT_DURATION_MS: "45000",
+      INPUT_EXTRA_JSON: JSON.stringify({ environment: "staging" }),
+      GITHUB_REPOSITORY: "acme/core",
+      GITHUB_WORKFLOW: "CI",
+      GITHUB_JOB: "unit-tests",
+      GITHUB_EVENT_NAME: "workflow_dispatch",
+      GITHUB_ACTOR: "alice",
+      GITHUB_ACTOR_ID: "1001",
+      GITHUB_RUN_ID: "777888999",
+      GITHUB_RUN_NUMBER: "12",
+      GITHUB_RUN_ATTEMPT: "2",
+      GITHUB_REF: "refs/heads/main",
+      GITHUB_SHA: "cafebabe",
+      RUNNER_NAME: "self-hosted-02",
+      RUNNER_OS: "Linux",
+      RUNNER_ENVIRONMENT: "self-hosted",
+      OTEL_TRACE_ID: "0af7651916cd43dd8448eb211c80319c",
+    });
+
+    assertConformsToOcsfContract(event, basinSchema);
+    assert.equal(event.severity_id, 4);
+    assert.equal(event.severity, "High");
+    assert.equal(event.log_provider, "github-actions");
+    assert.equal(event.log_name, "acme/core:CI");
+    assert.equal(event.metadata.correlation_uid, "0af7651916cd43dd8448eb211c80319c");
+    assert.equal(event.device.type_id, 1);
+    assert.equal(event.device.type, "Server");
+    assert.equal(event.device.os.type_id, 200);
+    assert.equal(event.unmapped.github_event, "workflow_job");
+    assert.equal(event.unmapped.trigger_event, "workflow_dispatch");
+    assert.equal(event.unmapped.run_id, 777888999);
+    assert.equal(event.unmapped.is_self_hosted, true);
+    assert.equal(event.unmapped.environment, "staging");
+
+    // Ambiguous named runner without RUNNER_ENVIRONMENT or explicit override stays Unknown (0)
+    const ambiguousEvent = directMod.buildOcsfEvent({
+      repository: "acme/core",
+      workflow: "CI",
+      job: "build",
+      runnerName: "custom-runner-01",
+      conclusion: "success",
+    });
+    assertConformsToOcsfContract(ambiguousEvent, basinSchema);
+    assert.equal(ambiguousEvent.device.type_id, 0);
+    assert.equal(ambiguousEvent.device.type, "Unknown");
+    assert.equal(ambiguousEvent.unmapped.is_self_hosted, undefined);
+
+    // Must reject plaintext http:// endpoint by default to protect ingest token
+    await assert.rejects(
+      () => directMod.sendToBasin([event], { endpoint, token }),
+      /must use https:\/\//
+    );
+
+    const sendRes = await directMod.sendToBasin([event], { endpoint, token, allowInsecureHttp: true });
+    assert.equal(sendRes.status, 200);
+    assert.equal(sendRes.count, 1);
+
+    await waitForCondition(() => mockBasin.records.length >= 1, 5000);
+    const directRec = mockBasin.records.pop();
+    assertConformsToOcsfContract(directRec, basinSchema);
+    assert.equal(directRec.metadata.original_event_uid, "777888999:2:unit-tests");
+  } finally {
+    await terminateProcess(vecProc);
     await mockBasin.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
