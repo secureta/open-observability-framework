@@ -76,7 +76,8 @@ WITH dedup_jobs AS (
     CAST(json_get_int(unmapped, 'duration_ms') AS DOUBLE) AS duration_ms,
     CAST(json_get_int(unmapped, 'queue_duration_ms') AS DOUBLE) AS queue_duration_ms,
     CASE
-      WHEN json_get_int(unmapped, 'job_id') IS NOT NULL THEN
+      WHEN metadata.product.name = 'Vector'
+        AND json_get_int(unmapped, 'job_id') IS NOT NULL THEN
         ROW_NUMBER() OVER (
           PARTITION BY metadata.product.name, json_get_int(unmapped, 'job_id')
           ORDER BY time DESC
