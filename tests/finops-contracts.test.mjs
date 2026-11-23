@@ -1,0 +1,450 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import http from "node:http";
+import zlib from "node:zlib";
+import { fileURLToPath } from "node:url";
+import {
+  DEFAULT_CLOUDFLARE_PRICING,
+  classifyR2Action,
+  normalizeCloudflareAnalyticsToFocus,
+  normalizeGitHubBillingUsageToFocus,
+  resolveUtcDayWindow,
+  runFinopsCollection,
+  sendFocusToBasin,
+} from "../adapters/collect/finops-billing/collect-focus.mjs";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = path.resolve(__dirname, "..");
+
+const FOCUS_SCHEMA_PATH = path.join(REPO_ROOT, "contracts/focus/cost-and-usage.basin.json");
+const FOCUS_PIPELINE_SQL_PATH = path.join(REPO_ROOT, "adapters/storage/cloudflare-basin-iceberg/focus_pipeline.sql");
+const FINOPS_SQL_PATH = path.join(REPO_ROOT, "adapters/storage/cloudflare-basin-iceberg/queries/finops_monitoring.sql");
+const FINOPS_BASIN_SQL_PATH = path.join(REPO_ROOT, "adapters/storage/cloudflare-basin-iceberg/queries/finops_monitoring.basin.sql");
+const TERRAFORM_DIR = path.join(REPO_ROOT, "adapters/storage/cloudflare-basin-iceberg/terraform");
+const PULUMI_DIR = path.join(REPO_ROOT, "adapters/storage/cloudflare-basin-iceberg/pulumi");
+const STACK_SCHEMA_PATH = path.join(REPO_ROOT, "manifest/stack.schema.json");
+
+const OFFICIAL_FOCUS_V1_0_COLUMNS = new Set([
+  "AvailabilityZone",
+  "BilledCost",
+  "BillingAccountId",
+  "BillingAccountName",
+  "BillingCurrency",
+  "BillingPeriodEnd",
+  "BillingPeriodStart",
+  "ChargeCategory",
+  "ChargeClass",
+  "ChargeDescription",
+  "ChargeFrequency",
+  "ChargePeriodEnd",
+  "ChargePeriodStart",
+  "CommitmentDiscountCategory",
+  "CommitmentDiscountId",
+  "CommitmentDiscountName",
+  "CommitmentDiscountStatus",
+  "CommitmentDiscountType",
+  "ConsumedQuantity",
+  "ConsumedUnit",
+  "ContractedCost",
+  "ContractedUnitPrice",
+  "EffectiveCost",
+  "InvoiceIssuerName",
+  "ListCost",
+  "ListUnitPrice",
+  "PricingCategory",
+  "PricingQuantity",
+  "PricingUnit",
+  "ProviderName",
+  "PublisherName",
+  "RegionId",
+  "RegionName",
+  "ResourceId",
+  "ResourceName",
+  "ResourceType",
+  "ServiceCategory",
+  "ServiceName",
+  "SkuId",
+  "SkuPriceId",
+  "SubAccountId",
+  "SubAccountName",
+  "Tags",
+]);
+
+const ALLOWED_BASIN_TYPES = new Set([
+  "string",
+  "int32",
+  "int64",
+  "float32",
+  "float64",
+  "bool",
+  "timestamp",
+  "json",
+  "bytes",
+  "struct",
+  "list",
+]);
+
+function assertFocusRecordMatchesSchema(record, schemaFields) {
+  assert.equal(typeof record, "object");
+  assert.ok(record !== null && !Array.isArray(record), "FOCUS record must be a plain object");
+
+  const fieldMap = new Map(schemaFields.map((f) => [f.name, f]));
+
+  for (const key of Object.keys(record)) {
+    assert.ok(fieldMap.has(key), `Record contains non-FOCUS / unknown top-level field '${key}'`);
+  }
+
+  for (const field of schemaFields) {
+    const val = record[field.name];
+    if (val === undefined || val === null) {
+      assert.equal(field.required, false, `Missing required FOCUS field '${field.name}'`);
+      continue;
+    }
+    switch (field.type) {
+      case "string":
+        assert.equal(typeof val, "string", `Field '${field.name}' must be string`);
+        break;
+      case "float64":
+        assert.ok(typeof val === "number" && Number.isFinite(val), `Field '${field.name}' must be finite number`);
+        break;
+      case "timestamp":
+        assert.equal(typeof val, "string", `Timestamp field '${field.name}' must be RFC3339 string`);
+        assert.ok(!Number.isNaN(Date.parse(val)), `Timestamp field '${field.name}' must parse as ISO date`);
+        break;
+      case "json":
+        assert.ok(typeof val === "object" && !Array.isArray(val), `JSON field '${field.name}' must be an object`);
+        break;
+      default:
+        assert.fail(`Unexpected Basin type '${field.type}' for '${field.name}'`);
+    }
+  }
+}
+
+test("FOCUS v1.0 Basin schema contract uses only official FOCUS v1.0 columns and valid Basin types", () => {
+  const schema = JSON.parse(fs.readFileSync(FOCUS_SCHEMA_PATH, "utf8"));
+  assert.ok(Array.isArray(schema.fields) && schema.fields.length === OFFICIAL_FOCUS_V1_0_COLUMNS.size);
+
+  const seen = new Set();
+  for (const field of schema.fields) {
+    assert.ok(OFFICIAL_FOCUS_V1_0_COLUMNS.has(field.name), `Non-standard FOCUS column: ${field.name}`);
+    assert.ok(!seen.has(field.name), `Duplicate FOCUS column: ${field.name}`);
+    seen.add(field.name);
+    assert.ok(ALLOWED_BASIN_TYPES.has(field.type), `Invalid Basin type '${field.type}' on ${field.name}`);
+    assert.equal(typeof field.required, "boolean", `Field '${field.name}' missing boolean required`);
+    if (field.type === "timestamp") {
+      assert.equal(field.unit, "millisecond");
+    }
+  }
+});
+
+test("focus_pipeline.sql SELECT columns match FOCUS v1.0 Basin schema 1:1", () => {
+  const schema = JSON.parse(fs.readFileSync(FOCUS_SCHEMA_PATH, "utf8"));
+  const sql = fs.readFileSync(FOCUS_PIPELINE_SQL_PATH, "utf8");
+
+  assert.match(sql, /INSERT INTO __SINK_NAME__/);
+  assert.match(sql, /FROM __STREAM_NAME__;/);
+
+  const selectMatch = sql.match(/SELECT\s+([\s\S]*?)\s+FROM __STREAM_NAME__;/);
+  assert.ok(selectMatch, "Could not parse SELECT column list from focus_pipeline.sql");
+
+  const sqlColumns = selectMatch[1]
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const schemaColumns = schema.fields.map((f) => f.name);
+
+  assert.deepEqual(sqlColumns, schemaColumns);
+});
+
+test("FinOps monitoring SQL queries (DuckDB & Basin SQL dialects) stay aligned and dialect-clean", () => {
+  const duckdbSql = fs.readFileSync(FINOPS_SQL_PATH, "utf8");
+  const basinSql = fs.readFileSync(FINOPS_BASIN_SQL_PATH, "utf8");
+
+  for (const sql of [duckdbSql, basinSql]) {
+    assert.match(sql, /FROM siem\.ocsf_event_log_activity/);
+    assert.match(sql, /FROM finops\.focus_cost_and_usage/);
+    assert.match(sql, /estimated_usd/);
+    assert.match(sql, /estimated_waste_usd/);
+    assert.match(sql, /approx_payload_mib/);
+    assert.match(sql, /spike_ratio/);
+  }
+
+  assert.match(duckdbSql, /json_extract_string\(/);
+  assert.doesNotMatch(duckdbSql, /json_get_str\(/);
+
+  assert.match(basinSql, /json_get_str\(/);
+  assert.match(basinSql, /json_get_int\(/);
+  assert.doesNotMatch(basinSql, /json_extract\(/);
+  assert.doesNotMatch(basinSql, /TRY_CAST\(/);
+});
+
+test("Terraform and Pulumi IaC modules expose matching opt-in FinOps FOCUS resources", () => {
+  const tfMain = fs.readFileSync(path.join(TERRAFORM_DIR, "main.tf"), "utf8");
+  const tfVars = fs.readFileSync(path.join(TERRAFORM_DIR, "variables.tf"), "utf8");
+  const tfOuts = fs.readFileSync(path.join(TERRAFORM_DIR, "outputs.tf"), "utf8");
+
+  assert.match(tfVars, /variable "enable_finops"/);
+  assert.match(tfMain, /resource "restful_resource" "focus_stream"/);
+  assert.match(tfMain, /resource "cloudflare_pipeline_sink" "focus"/);
+  assert.match(tfMain, /resource "cloudflare_pipeline" "focus"/);
+  assert.match(tfMain, /contracts\/focus\/cost-and-usage\.basin\.json/);
+  assert.match(tfMain, /focus_pipeline\.sql/);
+  assert.match(tfOuts, /output "focus_stream_endpoint"/);
+
+  const pulumiIndex = fs.readFileSync(path.join(PULUMI_DIR, "index.ts"), "utf8");
+  const pulumiCore = fs.readFileSync(path.join(PULUMI_DIR, "basin-core.ts"), "utf8");
+
+  assert.match(pulumiCore, /contracts\/focus\/cost-and-usage\.basin\.json/);
+  assert.match(pulumiCore, /focus_pipeline\.sql/);
+  assert.match(pulumiIndex, /enableFinops/);
+  assert.match(pulumiIndex, /oof-focus-stream/);
+  assert.match(pulumiIndex, /oof-focus-sink/);
+  assert.match(pulumiIndex, /oof-focus-pipeline/);
+  assert.match(pulumiIndex, /export const focusStreamEndpoint/);
+});
+
+test("stack.schema.json supports focus schema profile and optional finops slot", () => {
+  const stackSchema = JSON.parse(fs.readFileSync(STACK_SCHEMA_PATH, "utf8"));
+  assert.ok(stackSchema.properties.schema.properties.profile.enum.includes("focus"));
+  assert.ok(stackSchema.properties.finops, "stack.schema.json must define optional finops slot");
+  assert.equal(stackSchema.properties.finops.properties.schema_profile.const, "focus");
+  assert.deepEqual(stackSchema.properties.finops.properties.providers.items.enum, ["cloudflare", "github"]);
+});
+
+test("Cloudflare and GitHub FOCUS normalizers compute accurate costs and conform strictly to FOCUS v1.0", () => {
+  const schema = JSON.parse(fs.readFileSync(FOCUS_SCHEMA_PATH, "utf8"));
+  const window = resolveUtcDayWindow("2026-11-22");
+
+  assert.equal(classifyR2Action("PutObject"), "A");
+  assert.equal(classifyR2Action("GetObject"), "B");
+
+  const cfRecords = normalizeCloudflareAnalyticsToFocus(
+    {
+      data: {
+        viewer: {
+          accounts: [
+            {
+              r2StorageAdaptiveGroups: [
+                {
+                  dimensions: { bucketName: "oof-telemetry" },
+                  max: { payloadSize: 30_000_000_000, metadataSize: 0 },
+                },
+              ],
+              r2OperationsAdaptiveGroups: [
+                { dimensions: { bucketName: "oof-telemetry", actionType: "PutObject" }, sum: { requests: 1_000_000 } },
+                { dimensions: { bucketName: "oof-telemetry", actionType: "GetObject" }, sum: { requests: 2_000_000 } },
+              ],
+              pipelinesAdaptiveGroups: [
+                { dimensions: { pipelineName: "ocsf_event_log_to_iceberg" }, sum: { bytesIngested: 4_000_000_000 } },
+              ],
+            },
+          ],
+        },
+      },
+    },
+    {
+      accountId: "0123456789abcdef0123456789abcdef",
+      accountName: "oof-prod",
+      window,
+      pricing: DEFAULT_CLOUDFLARE_PRICING,
+    }
+  );
+
+  assert.equal(cfRecords.length, 4);
+  for (const r of cfRecords) assertFocusRecordMatchesSchema(r, schema.fields);
+
+  const storageRec = cfRecords.find((r) => r.SkuId === "r2_storage_standard");
+  const classARec = cfRecords.find((r) => r.SkuId === "r2_class_a_ops");
+  const classBRec = cfRecords.find((r) => r.SkuId === "r2_class_b_ops");
+  const pipeRec = cfRecords.find((r) => r.SkuId === "pipelines_ingest_gb");
+
+  // 30 GB / 30 days = 1 GB-month * $0.015 = $0.015
+  assert.equal(storageRec.EffectiveCost, 0.015);
+  assert.equal(classARec.EffectiveCost, 4.5);
+  assert.equal(classBRec.EffectiveCost, 0.72);
+  assert.equal(pipeRec.EffectiveCost, 0.1);
+
+  const ghRecords = normalizeGitHubBillingUsageToFocus(
+    {
+      usageItems: [
+        {
+          date: "2026-11-22T00:00:00Z",
+          product: "actions",
+          sku: "actions_linux",
+          quantity: 120,
+          unitType: "Minutes",
+          pricePerUnit: 0.008,
+          grossAmount: 0.96,
+          discountAmount: 0.96,
+          netAmount: 0.0,
+          organizationName: "acme-org",
+          repositoryName: "open-observability-framework",
+        },
+        {
+          date: "2026-11-22T00:00:00Z",
+          product: "actions",
+          sku: "actions_macos",
+          quantity: 10,
+          unitType: "Minutes",
+          pricePerUnit: 0.08,
+          grossAmount: 0.8,
+          discountAmount: 0,
+          netAmount: 0.8,
+          organizationName: "acme-org",
+          repositoryName: "open-observability-framework",
+        },
+      ],
+    },
+    { billingAccountId: "acme-org", billingAccountName: "acme-org", window }
+  );
+
+  assert.equal(ghRecords.length, 2);
+  for (const r of ghRecords) assertFocusRecordMatchesSchema(r, schema.fields);
+  assert.equal(ghRecords[0].ListCost, 0.96);
+  assert.equal(ghRecords[0].EffectiveCost, 0);
+  assert.equal(ghRecords[1].EffectiveCost, 0.8);
+  assert.equal(ghRecords[1].ServiceName, "GitHub Actions");
+});
+
+test("E2E FinOps collector fetches Cloudflare + GitHub APIs, gzips FOCUS v1.0 batch to Basin HTTP, and enforces HTTPS + secret hygiene", async () => {
+  const schema = JSON.parse(fs.readFileSync(FOCUS_SCHEMA_PATH, "utf8"));
+  const cfToken = "test-cf-token-0123456789abcdef0123456789";
+  const ghToken = "test-github-token-0123456789abcdef";
+  const basinToken = "test-basin-token-0123456789abcdef";
+
+  let receivedBasinAuth = null;
+  let receivedBasinEncoding = null;
+  let receivedBasinRecords = null;
+
+  const server = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const rawBody = Buffer.concat(chunks);
+
+    if (req.method === "POST" && req.url === "/client/v4/graphql") {
+      assert.equal(req.headers.authorization, `Bearer ${cfToken}`);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          data: {
+            viewer: {
+              accounts: [
+                {
+                  r2StorageAdaptiveGroups: [
+                    { dimensions: { bucketName: "oof-telemetry" }, max: { payloadSize: 15_000_000_000, metadataSize: 0 } },
+                  ],
+                  r2OperationsAdaptiveGroups: [
+                    { dimensions: { bucketName: "oof-telemetry", actionType: "PutObject" }, sum: { requests: 500_000 } },
+                  ],
+                },
+              ],
+            },
+          },
+        })
+      );
+      return;
+    }
+
+    if (req.method === "GET" && req.url.startsWith("/organizations/acme-org/settings/billing/usage?")) {
+      assert.equal(req.headers.authorization, `Bearer ${ghToken}`);
+      assert.match(req.url, /year=2026&month=11&day=22/);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          usageItems: [
+            {
+              date: "2026-11-22T00:00:00Z",
+              product: "actions",
+              sku: "actions_windows",
+              quantity: 50,
+              unitType: "Minutes",
+              pricePerUnit: 0.016,
+              grossAmount: 0.8,
+              discountAmount: 0,
+              netAmount: 0.8,
+              organizationName: "acme-org",
+              repositoryName: "oof-repo",
+            },
+          ],
+        })
+      );
+      return;
+    }
+
+    if (req.method === "POST" && req.url === "/basin-focus") {
+      receivedBasinAuth = req.headers.authorization;
+      receivedBasinEncoding = req.headers["content-encoding"];
+      const unzipped = zlib.gunzipSync(rawBody).toString("utf8");
+      receivedBasinRecords = JSON.parse(unzipped);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    res.writeHead(404);
+    res.end();
+  });
+
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+  const baseUrl = `http://127.0.0.1:${port}`;
+
+  try {
+    // 1. HTTPS must be enforced by default
+    await assert.rejects(
+      sendFocusToBasin([{ ProviderName: "Cloudflare" }], {
+        endpoint: `${baseUrl}/basin-focus`,
+        token: basinToken,
+      }),
+      /must use https:\/\//
+    );
+
+    // 2. Full E2E collection & ingest with allowInsecureHttp for local loopback test
+    const result = await runFinopsCollection({
+      env: {
+        OOF_FINOPS_DATE: "2026-11-22",
+        CLOUDFLARE_ACCOUNT_ID: "0123456789abcdef0123456789abcdef",
+        CLOUDFLARE_API_TOKEN: cfToken,
+        CLOUDFLARE_API_BASE_URL: `${baseUrl}/client/v4`,
+        GITHUB_ORG: "acme-org",
+        GITHUB_TOKEN: ghToken,
+        GITHUB_API_BASE_URL: baseUrl,
+        OOF_FOCUS_BASIN_ENDPOINT: `${baseUrl}/basin-focus`,
+        OOF_INGEST_TOKEN: basinToken,
+      },
+      allowInsecureHttp: true,
+    });
+
+    assert.equal(result.status, 200);
+    assert.equal(result.count, 3);
+    assert.equal(receivedBasinAuth, `Bearer ${basinToken}`);
+    assert.equal(receivedBasinEncoding, "gzip");
+    assert.equal(receivedBasinRecords.length, 3);
+
+    for (const rec of receivedBasinRecords) {
+      assertFocusRecordMatchesSchema(rec, schema.fields);
+    }
+
+    const providers = new Set(receivedBasinRecords.map((r) => r.ProviderName));
+    assert.deepEqual(providers, new Set(["Cloudflare", "GitHub"]));
+
+    // 3. Error messages must never leak tokens
+    await assert.rejects(
+      async () => {
+        await sendFocusToBasin(receivedBasinRecords, {
+          endpoint: `${baseUrl}/nonexistent-404`,
+          token: basinToken,
+          allowInsecureHttp: true,
+        });
+      },
+      (err) => {
+        assert.ok(!err.message.includes(basinToken), "Ingest token leaked in error message");
+        return /HTTP 404/.test(err.message);
+      }
+    );
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});

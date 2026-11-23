@@ -174,3 +174,76 @@ variable "pipeline_sql_file" {
   default     = ""
   description = "Optional override path to Basin pipeline SQL template (defaults to ../pipeline.sql)."
 }
+
+variable "enable_finops" {
+  type        = bool
+  default     = false
+  description = "Provision an additional FOCUS v1.0 Basin stream, Iceberg sink, and pipeline (finops.focus_cost_and_usage) on the same R2 bucket and Data Catalog."
+}
+
+variable "finops_namespace" {
+  type        = string
+  default     = "finops"
+  description = "Apache Iceberg namespace for FOCUS v1.0 cost and usage tables when enable_finops = true."
+
+  validation {
+    condition     = can(regex("^[A-Za-z_][A-Za-z0-9_]*$", var.finops_namespace))
+    error_message = "finops_namespace must match ^[A-Za-z_][A-Za-z0-9_]*$."
+  }
+}
+
+variable "finops_table_name" {
+  type        = string
+  default     = "focus_cost_and_usage"
+  description = "Apache Iceberg table name for FOCUS v1.0 cost and usage records."
+
+  validation {
+    condition     = can(regex("^[A-Za-z_][A-Za-z0-9_]*$", var.finops_table_name))
+    error_message = "finops_table_name must match ^[A-Za-z_][A-Za-z0-9_]*$."
+  }
+}
+
+variable "finops_stream_name" {
+  type        = string
+  default     = "focus_cost_and_usage_stream"
+  description = "Basin SQL stream identifier for FOCUS v1.0 records."
+
+  validation {
+    condition     = can(regex("^[A-Za-z_][A-Za-z0-9_]*$", var.finops_stream_name))
+    error_message = "finops_stream_name must match ^[A-Za-z_][A-Za-z0-9_]*$."
+  }
+}
+
+variable "finops_sink_name" {
+  type        = string
+  default     = "focus_cost_and_usage_sink"
+  description = "Basin SQL sink identifier for FOCUS v1.0 records."
+
+  validation {
+    condition     = can(regex("^[A-Za-z_][A-Za-z0-9_]*$", var.finops_sink_name))
+    error_message = "finops_sink_name must match ^[A-Za-z_][A-Za-z0-9_]*$."
+  }
+}
+
+variable "finops_pipeline_name" {
+  type        = string
+  default     = "focus_cost_and_usage_to_iceberg"
+  description = "Basin Pipeline name for FOCUS v1.0 records."
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_]+$", var.finops_pipeline_name))
+    error_message = "finops_pipeline_name must match ^[A-Za-z0-9_]+$."
+  }
+}
+
+variable "finops_schema_file" {
+  type        = string
+  default     = ""
+  description = "Optional override path to FOCUS v1.0 Basin schema JSON (defaults to contracts/focus/cost-and-usage.basin.json)."
+}
+
+variable "finops_pipeline_sql_file" {
+  type        = string
+  default     = ""
+  description = "Optional override path to FOCUS v1.0 Basin pipeline SQL template (defaults to ../focus_pipeline.sql)."
+}

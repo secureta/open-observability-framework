@@ -87,10 +87,14 @@ export const PIPELINE_NAME_RE = /^[A-Za-z0-9_]+$/;
 export function resolveDefaultRepoPaths(fromDir: string): {
   schemaFile: string;
   pipelineSqlFile: string;
+  focusSchemaFile: string;
+  focusPipelineSqlFile: string;
 } {
   return {
     schemaFile: path.resolve(fromDir, "../../../../contracts/ocsf/event-log-activity.basin.json"),
     pipelineSqlFile: path.resolve(fromDir, "../pipeline.sql"),
+    focusSchemaFile: path.resolve(fromDir, "../../../../contracts/focus/cost-and-usage.basin.json"),
+    focusPipelineSqlFile: path.resolve(fromDir, "../focus_pipeline.sql"),
   };
 }
 
