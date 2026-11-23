@@ -326,31 +326,37 @@ test("live wire-level OTLP HTTP auth returns 401 on invalid token and delivers v
   try {
     await waitForPort(otlpPort);
 
-    const payload = JSON.stringify({
-      resourceLogs: [
-        {
-          resource: {
-            attributes: [{ key: "service.name", value: { stringValue: "claude-code" } }],
-          },
-          scopeLogs: [
-            {
-              logRecords: [
-                {
-                  timeUnixNano: "1795402902000000000",
-                  eventName: "api_request",
-                  attributes: [
-                    { key: "model", value: { stringValue: "claude-sonnet-4-6" } },
-                    { key: "input_tokens", value: { intValue: "100" } },
-                    { key: "output_tokens", value: { intValue: "50" } },
-                    { key: "session.id", value: { stringValue: "sess-wire-ok" } },
-                  ],
-                },
-              ],
+    // Send pretty-printed multiline JSON (matching OpenTelemetry Rust / Codex exporter output)
+    const payload = JSON.stringify(
+      {
+        resourceLogs: [
+          {
+            resource: {
+              attributes: [{ key: "service.name", value: { stringValue: "claude-code" } }],
             },
-          ],
-        },
-      ],
-    });
+            scopeLogs: [
+              {
+                logRecords: [
+                  {
+                    timeUnixNano: "0",
+                    observedTimeUnixNano: "1795402902000000000",
+                    eventName: "api_request",
+                    attributes: [
+                      { key: "model", value: { stringValue: "claude-sonnet-4-6" } },
+                      { key: "input_tokens", value: { intValue: "100" } },
+                      { key: "output_tokens", value: { intValue: "50" } },
+                      { key: "session.id", value: { stringValue: "sess-wire-ok" } },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+      null,
+      2
+    );
 
     const postOtlp = (headers = {}) =>
       new Promise((resolve, reject) => {
@@ -399,6 +405,7 @@ test("live wire-level OTLP HTTP auth returns 401 on invalid token and delivers v
     assert.equal(ev.event_name, "claude_code.api_request");
     assert.equal(ev.gen_ai.usage.total_tokens, 150);
     assert.equal(ev.session_id, "sess-wire-ok");
+    assert.equal(ev.time, 1795402902000);
     assert.ok(!JSON.stringify(ev).includes(localToken), "local OTLP auth token must never leak to Basin");
   } finally {
     proc.kill("SIGTERM");
