@@ -48,6 +48,42 @@ const finopsStreamNameConfig = config.get("finopsStreamName") ?? "focus_cost_and
 const finopsSinkName = config.get("finopsSinkName") ?? "focus_cost_and_usage_sink";
 const finopsPipelineName = config.get("finopsPipelineName") ?? "focus_cost_and_usage_to_iceberg";
 
+interface LogpushJobConfig {
+  scope?: "zone" | "account";
+  zoneId?: string;
+  dataset: string;
+  destinationConf: string;
+  enabled?: boolean;
+  frequency?: "high" | "low";
+  name?: string;
+  filter?: string;
+  outputOptions?: {
+    fieldNames?: string[];
+    timestampFormat?: string;
+    outputType?: string;
+  };
+}
+
+const logpushJobsConfig = config.getObject<Record<string, LogpushJobConfig>>("logpushJobs") ?? {};
+for (const [jobKey, job] of Object.entries(logpushJobsConfig)) {
+  const scope = job.scope ?? "zone";
+  if (scope !== "zone" && scope !== "account") {
+    throw new Error(`logpushJobs.${jobKey}.scope must be 'zone' or 'account'.`);
+  }
+  if (scope === "zone" && (!job.zoneId || !/^[a-fA-F0-9]{32}$/.test(job.zoneId))) {
+    throw new Error(`logpushJobs.${jobKey}.zoneId must be a 32-hex Cloudflare Zone ID when scope is 'zone'.`);
+  }
+  if (scope === "account" && job.zoneId !== undefined) {
+    throw new Error(`logpushJobs.${jobKey}.zoneId must not be set when scope is 'account'.`);
+  }
+  if (!job.dataset || job.dataset.trim() === "") {
+    throw new Error(`logpushJobs.${jobKey}.dataset must be non-empty.`);
+  }
+  if (!job.destinationConf || job.destinationConf.trim() === "") {
+    throw new Error(`logpushJobs.${jobKey}.destinationConf must be non-empty.`);
+  }
+}
+
 const enableAiUsage = config.getBoolean("enableAiUsage") ?? false;
 const aiNamespace = config.get("aiNamespace") ?? "ai";
 const aiTableName = config.get("aiTableName") ?? "genai_usage";
@@ -334,6 +370,27 @@ if (enableFinops) {
   );
 }
 
+const logpushJobResources: Record<string, pulumi.Output<string>> = {};
+for (const [jobKey, job] of Object.entries(logpushJobsConfig)) {
+  const scope = job.scope ?? "zone";
+  const lpJob = new cloudflare.LogpushJob(
+    `oof-logpush-${jobKey}`,
+    {
+      accountId: scope === "account" ? accountId : undefined,
+      zoneId: scope === "zone" ? job.zoneId : undefined,
+      name: job.name ?? jobKey,
+      dataset: job.dataset,
+      destinationConf: pulumi.secret(job.destinationConf),
+      enabled: job.enabled ?? true,
+      frequency: job.frequency ?? "high",
+      filter: job.filter,
+      outputOptions: job.outputOptions,
+    },
+    { provider: cfProvider }
+  );
+  logpushJobResources[jobKey] = lpJob.id;
+}
+
 export const bucketName = effectiveBucketName;
 export const catalogId = catalog ? catalog.id : pulumi.output(undefined);
 export const streamId = stream.id;
@@ -351,6 +408,7 @@ export const focusStreamHost = focusStream
   : pulumi.output(undefined);
 export const focusSinkId = focusSink ? focusSink.id : pulumi.output(undefined);
 export const focusPipelineId = focusPipeline ? focusPipeline.id : pulumi.output(undefined);
+export const logpushJobIds = logpushJobResources;
 
 let aiStream: BasinStructuredStream | undefined;
 let aiSink: cloudflare.PipelineSink | undefined;
