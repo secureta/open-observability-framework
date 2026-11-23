@@ -84,3 +84,7 @@ nix develop -c node --test tests/ocsf-contracts.test.mjs
 
 - **Cloud IaC (Terraform / OpenTofu or Pulumi)** + **`cf` CLI verification**: see [skills/setup-cloudflare-basin-iceberg/SKILL.md](./skills/setup-cloudflare-basin-iceberg/SKILL.md) (and module READMEs under `terraform/` and `pulumi/`).
 - **NixOS host collectors (`services.oof-collector`)**: import `oof.nixosModules.default` from [flake.nix](./flake.nix) and supply an out-of-store `environmentFile` (`OOF_BASIN_ENDPOINT` / `OOF_BASIN_HOST`, `OOF_INGEST_TOKEN`).
+
+## License
+
+Licensed under the [Apache License, Version 2.0](./LICENSE).
