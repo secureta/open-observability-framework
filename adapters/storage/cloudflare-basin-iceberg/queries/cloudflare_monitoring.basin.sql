@@ -78,7 +78,7 @@ GROUP BY request_host
 ORDER BY status_5xx DESC, total_requests DESC
 LIMIT 100;
 
--- 3. Top WAF / Firewall blocked or challenged clients and rules
+-- 3. Top WAF / Firewall enforced actions (block, drop, connectionclose, challenges; excludes log-only matches)
 SELECT
   json_get_str(unmapped, 'request_host') AS request_host,
   json_get_str(unmapped, 'waf_action') AS waf_action,
@@ -92,7 +92,19 @@ FROM siem.ocsf_event_log_activity
 WHERE class_uid = 1008
   AND log_provider = 'cloudflare-logpush'
   AND json_get_str(unmapped, 'cloudflare_dataset') = 'firewall_events'
-  AND severity_id >= 3
+  AND json_get_str(unmapped, 'waf_action') IN (
+    'block',
+    'drop',
+    'connectionclose',
+    'connection_close',
+    'force_connection_close',
+    'challenge',
+    'managedchallenge',
+    'managed_challenge',
+    'jschallenge',
+    'interactivechallenge',
+    'l7ddos'
+  )
 GROUP BY request_host, waf_action, waf_source, waf_rule_id, client_ip, client_country
 ORDER BY event_count DESC
 LIMIT 100;

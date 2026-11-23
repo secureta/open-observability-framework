@@ -3,6 +3,7 @@ import { pathToFileURL } from "node:url";
 
 const DEFAULT_GRAPHQL_ENDPOINT = "https://api.cloudflare.com/client/v4/graphql";
 const DEFAULT_LISTEN = "127.0.0.1:9199";
+const MAX_ZONES_PER_QUERY = 10;
 const ZONE_ID_RE = /^[a-fA-F0-9]{32}$/;
 const ZONE_ALIAS_RE = /^[a-zA-Z0-9._-]+$/;
 
@@ -75,24 +76,40 @@ export function parseZoneSpecs(raw) {
   return entries;
 }
 
-export function parseListenAddress(listenStr = DEFAULT_LISTEN) {
+export function isLoopbackHost(host) {
+  const h = String(host || "").trim().toLowerCase();
+  if (h === "::1" || h === "0:0:0:0:0:0:0:1") return true;
+  const m = h.match(/^127\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$/);
+  if (!m) return false;
+  return [m[1], m[2], m[3]].every((o) => {
+    const n = Number(o);
+    return (o === "0" || !o.startsWith("0")) && n >= 0 && n <= 255;
+  });
+}
+
+export function parseListenAddress(listenStr = DEFAULT_LISTEN, { requireLoopback = true } = {}) {
   const trimmed = String(listenStr).trim();
   const ipv6Match = trimmed.match(/^\[([0-9a-fA-F:]+)\]:([0-9]+)$/);
+  let host;
+  let port;
   if (ipv6Match) {
-    const port = Number(ipv6Match[2]);
-    if (!Number.isInteger(port) || port < 0 || port > 65535) {
-      throw new Error(`Invalid port in listen address: ${listenStr}`);
+    host = ipv6Match[1];
+    port = Number(ipv6Match[2]);
+  } else {
+    const lastColon = trimmed.lastIndexOf(":");
+    if (lastColon <= 0) {
+      throw new Error(`Listen address must be host:port, got: ${listenStr}`);
     }
-    return { host: ipv6Match[1], port };
+    host = trimmed.slice(0, lastColon);
+    port = Number(trimmed.slice(lastColon + 1));
   }
-  const lastColon = trimmed.lastIndexOf(":");
-  if (lastColon <= 0) {
-    throw new Error(`Listen address must be host:port, got: ${listenStr}`);
-  }
-  const host = trimmed.slice(0, lastColon);
-  const port = Number(trimmed.slice(lastColon + 1));
   if (!Number.isInteger(port) || port < 0 || port > 65535) {
     throw new Error(`Invalid port in listen address: ${listenStr}`);
+  }
+  if (requireLoopback && !isLoopbackHost(host)) {
+    throw new Error(
+      `Listen address '${listenStr}' must bind to a loopback interface (127.0.0.0/8 or [::1]) because /metrics is unauthenticated.`
+    );
   }
   return { host, port };
 }
@@ -109,6 +126,18 @@ export function buildGraphqlPayload(zoneEntries, { nowMs = Date.now(), windowMin
       until: new Date(untilMs).toISOString(),
     },
   };
+}
+
+export function buildGraphqlPayloads(zoneEntries, { nowMs = Date.now(), windowMinutes = 5 } = {}) {
+  const chunks = [];
+  for (let i = 0; i < zoneEntries.length; i += MAX_ZONES_PER_QUERY) {
+    const slice = zoneEntries.slice(i, i + MAX_ZONES_PER_QUERY);
+    chunks.push({
+      zoneEntries: slice,
+      payload: buildGraphqlPayload(slice, { nowMs, windowMinutes }),
+    });
+  }
+  return chunks;
 }
 
 function toSafeNumber(val) {
@@ -294,26 +323,30 @@ export function createExporterServer(options) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const payload = buildGraphqlPayload(zoneEntries, { nowMs, windowMinutes });
-      const res = await fetchImpl(graphqlEndpoint, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          authorization: `Bearer ${apiToken}`,
-        },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
+      const batches = buildGraphqlPayloads(zoneEntries, { nowMs, windowMinutes });
+      const mergedMetrics = [];
+      for (const batch of batches) {
+        const res = await fetchImpl(graphqlEndpoint, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${apiToken}`,
+          },
+          body: JSON.stringify(batch.payload),
+          signal: controller.signal,
+        });
 
-      const elapsedSec = Number(process.hrtime.bigint() - startNs) / 1e9;
-      if (!res.ok) {
-        const body = renderPrometheusMetrics([], { scrapeSuccess: 0, durationSeconds: elapsedSec });
-        return body;
+        if (!res.ok) {
+          const elapsedSec = Number(process.hrtime.bigint() - startNs) / 1e9;
+          return renderPrometheusMetrics([], { scrapeSuccess: 0, durationSeconds: elapsedSec });
+        }
+
+        const json = await res.json();
+        mergedMetrics.push(...aggregateZoneAnalytics(json, batch.zoneEntries));
       }
 
-      const json = await res.json();
-      const metrics = aggregateZoneAnalytics(json, zoneEntries);
-      const body = renderPrometheusMetrics(metrics, { scrapeSuccess: 1, durationSeconds: elapsedSec });
+      const elapsedSec = Number(process.hrtime.bigint() - startNs) / 1e9;
+      const body = renderPrometheusMetrics(mergedMetrics, { scrapeSuccess: 1, durationSeconds: elapsedSec });
       cachedBody = body;
       cachedAtMs = Date.now();
       return body;

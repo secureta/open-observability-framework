@@ -99,7 +99,7 @@
           ocsfLuaStore = ./adapters/collect/fluent-bit-journald/ocsf.lua;
           vectorYamlSrc = ./adapters/collect/vector-journald/vector.yaml;
           vectorGhaYamlSrc = ./adapters/collect/vector-github-actions/vector.yaml;
-          vectorCfAuditYamlSrc = ./adapters/collect/vector-cloudflare-audit-logs/vector.yaml;
+          cfAuditPollerSrc = ./adapters/collect/cloudflare-audit-logs/poller.mjs;
           vectorCfLogpushYamlSrc = ./adapters/collect/vector-cloudflare-logpush/vector.yaml;
           cfGraphqlExporterSrc = ./adapters/collect/cloudflare-graphql-exporter/exporter.mjs;
           fluentBitConfRaw = builtins.readFile ./adapters/collect/fluent-bit-journald/fluent-bit.conf;
@@ -236,11 +236,6 @@
               cp ${vectorGhaYamlSrc} "$out"
             '';
 
-          oofVectorCfAuditConfig =
-            pkgs.runCommand "oof-vector-cloudflare-audit-logs.yaml" { } ''
-              cp ${vectorCfAuditYamlSrc} "$out"
-            '';
-
           oofVectorCfLogpushConfig =
             pkgs.runCommand "oof-vector-cloudflare-logpush.yaml" { } ''
               cp ${vectorCfLogpushYamlSrc} "$out"
@@ -286,19 +281,20 @@
             };
           };
 
-          oofVectorCfAudit = pkgs.symlinkJoin {
-            name = "oof-vector-cloudflare-audit-logs-${pkgs.vector.version}";
-            paths = [ pkgs.vector ];
-            nativeBuildInputs = [ pkgs.makeWrapper ];
-            postBuild = ''
-              wrapProgram "$out/bin/vector" \
-                --set VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION "true" \
-                --set-default VECTOR_CONFIG "${oofVectorCfAuditConfig}"
-            '';
-            meta = pkgs.vector.meta // {
-              mainProgram = "vector";
-            };
-          };
+          oofCfAuditPoller =
+            pkgs.runCommand "oof-cloudflare-audit-logs-0.1.0"
+              {
+                nativeBuildInputs = [ pkgs.makeWrapper ];
+                meta = {
+                  mainProgram = "oof-cloudflare-audit-logs";
+                };
+              }
+              ''
+                mkdir -p "$out/bin" "$out/share/oof-cloudflare-audit-logs"
+                cp ${cfAuditPollerSrc} "$out/share/oof-cloudflare-audit-logs/poller.mjs"
+                makeWrapper ${lib.getExe pkgs.nodejs} "$out/bin/oof-cloudflare-audit-logs" \
+                  --add-flags "$out/share/oof-cloudflare-audit-logs/poller.mjs"
+              '';
 
           oofVectorCfLogpush = pkgs.symlinkJoin {
             name = "oof-vector-cloudflare-logpush-${pkgs.vector.version}";
@@ -365,14 +361,13 @@
             mkPrometheusConfig
             oofVectorConfig
             oofVectorGhaConfig
-            oofVectorCfAuditConfig
             oofVectorCfLogpushConfig
             oofFluentBitConfig
             oofOtelcolConfig
             oofPrometheusConfig
             oofVector
             oofVectorGha
-            oofVectorCfAudit
+            oofCfAuditPoller
             oofVectorCfLogpush
             oofCfGraphqlExporter
             oofFluentBit
@@ -545,6 +540,10 @@
 
       isWildcardIpv4 = c: c.kind == "ipv4" && c.octets == [ 0 0 0 0 ];
       isWildcardIpv6 = c: c.kind == "ipv6" && c.words == [ 0 0 0 0 0 0 0 0 ];
+      isLoopbackCanonical =
+        c:
+        (c.kind == "ipv4" && builtins.elemAt c.octets 0 == 127)
+        || (c.kind == "ipv6" && c.words == [ 0 0 0 0 0 0 0 1 ]);
 
       hostsCollide =
         aCanon: bCanon:
@@ -664,14 +663,13 @@
             {
               oof-vector-config = assets.oofVectorConfig;
               oof-vector-github-actions-config = assets.oofVectorGhaConfig;
-              oof-vector-cloudflare-audit-logs-config = assets.oofVectorCfAuditConfig;
               oof-vector-cloudflare-logpush-config = assets.oofVectorCfLogpushConfig;
               oof-fluent-bit-config = assets.oofFluentBitConfig;
               oof-otelcol-config = assets.oofOtelcolConfig;
               oof-prometheus-config = assets.oofPrometheusConfig;
               oof-vector = assets.oofVector;
               oof-vector-github-actions = assets.oofVectorGha;
-              oof-vector-cloudflare-audit-logs = assets.oofVectorCfAudit;
+              oof-cloudflare-audit-logs = assets.oofCfAuditPoller;
               oof-vector-cloudflare-logpush = assets.oofVectorCfLogpush;
               oof-cloudflare-graphql-exporter = assets.oofCfGraphqlExporter;
               oof-fluent-bit = assets.oofFluentBit;
@@ -951,7 +949,9 @@
             };
 
             cloudflareAuditLogs = {
-              enable = lib.mkEnableOption "co-located Vector Cloudflare Account Audit Logs collector normalizing audit events into OCSF v1.3.0";
+              enable = lib.mkEnableOption "co-located checkpointed Cloudflare Account Audit Logs poller normalizing audit events into OCSF v1.3.0";
+
+              nodePackage = lib.mkPackageOption pkgs "nodejs" { };
 
               apiBaseUrl = lib.mkOption {
                 type = lib.types.str;
@@ -962,7 +962,19 @@
               perPage = lib.mkOption {
                 type = lib.types.ints.between 1 1000;
                 default = 100;
-                description = "Maximum number of audit log entries requested per poll.";
+                description = "Maximum number of audit log entries requested per page.";
+              };
+
+              pollIntervalSecs = lib.mkOption {
+                type = lib.types.ints.between 5 3600;
+                default = 60;
+                description = "Polling interval in seconds between bounded [since, before] windows.";
+              };
+
+              lookbackSecs = lib.mkOption {
+                type = lib.types.ints.between 60 86400;
+                default = 300;
+                description = "Initial lookback window in seconds when no persisted checkpoint exists.";
               };
 
               environmentFile = lib.mkOption {
@@ -1312,16 +1324,17 @@
               };
 
               systemd.services.oof-cloudflare-audit-logs = lib.mkIf cfg.cloudflareAuditLogs.enable {
-                description = "Open Observability Framework Cloudflare Audit Logs Collector (Vector)";
+                description = "Open Observability Framework Cloudflare Audit Logs Poller (Checkpointed OCSF v1.3.0)";
                 wantedBy = [ "multi-user.target" ];
                 after = [ "network-online.target" ];
                 wants = [ "network-online.target" ];
 
                 environment = {
-                  VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION = "true";
-                  OOF_VECTOR_DATA_DIR = "/var/lib/oof-cloudflare-audit-logs";
                   OOF_CLOUDFLARE_API_BASE_URL = cfg.cloudflareAuditLogs.apiBaseUrl;
                   OOF_CLOUDFLARE_AUDIT_PER_PAGE = toString cfg.cloudflareAuditLogs.perPage;
+                  OOF_CLOUDFLARE_AUDIT_POLL_INTERVAL_SECS = toString cfg.cloudflareAuditLogs.pollIntervalSecs;
+                  OOF_CLOUDFLARE_AUDIT_LOOKBACK_SECS = toString cfg.cloudflareAuditLogs.lookbackSecs;
+                  OOF_CF_AUDIT_CHECKPOINT_FILE = "/var/lib/oof-cloudflare-audit-logs/checkpoint.json";
                 };
 
                 serviceConfig = {
@@ -1343,10 +1356,8 @@
                   ProtectHome = true;
                   PrivateTmp = true;
                   ExecStart = utils.escapeSystemdExecArgs [
-                    (lib.getExe cfg.vectorPackage)
-                    "--dangerously-allow-env-var-interpolation"
-                    "--config"
-                    assets.oofVectorCfAuditConfig
+                    (lib.getExe cfg.cloudflareAuditLogs.nodePackage)
+                    "${./adapters/collect/cloudflare-audit-logs/poller.mjs}"
                   ];
                 };
               };
@@ -1394,8 +1405,8 @@
             (lib.mkIf cfg.cloudflareGraphqlExporter.enable {
               assertions = [
                 {
-                  assertion = cfExporterParsed.valid;
-                  message = "services.oof-collector.cloudflareGraphqlExporter.listen ('${cfg.cloudflareGraphqlExporter.listen}') must be a valid IPv4/IPv6 socket address (ip:port, e.g. 127.0.0.1:9199).";
+                  assertion = cfExporterParsed.valid && isLoopbackCanonical cfExporterParsed.canonical;
+                  message = "services.oof-collector.cloudflareGraphqlExporter.listen ('${cfg.cloudflareGraphqlExporter.listen}') must be a loopback IPv4/IPv6 socket address (127.0.0.0/8 or [::1], e.g. 127.0.0.1:9199) because /metrics is unauthenticated.";
                 }
                 {
                   assertion = cfg.cloudflareGraphqlExporter.environmentFile != null;
@@ -1683,6 +1694,16 @@
                 };
               };
 
+              badCfExporterNonLoopbackCfg = evalNixos {
+                services.oof-collector = {
+                  cloudflareGraphqlExporter = {
+                    enable = true;
+                    listen = "0.0.0.0:9199";
+                    environmentFile = "/run/secrets/oof-cf-graphql.env";
+                  };
+                };
+              };
+
               badGhaPortCollisionCfg = evalNixos {
                 services.oof-collector = {
                   enable = true;
@@ -1928,6 +1949,7 @@
                   cfLogpushListen = cfTelemetryCfg.config.systemd.services.oof-cloudflare-logpush.environment.OOF_CF_LOGPUSH_LISTEN;
                   cfExporterListen = cfTelemetryCfg.config.systemd.services.oof-cloudflare-graphql-exporter.environment.OOF_CF_EXPORTER_LISTEN;
                   badCfPortCollisionRejected = !(checkAssertionsPass badCfPortCollisionCfg);
+                  badCfExporterNonLoopbackRejected = !(checkAssertionsPass badCfExporterNonLoopbackCfg);
 
                   promDefaultDisabled = !(promDefaultDisabledCfg.config.services.oof-collector.prometheus.enable);
                   promDefaultHasUnit = builtins.hasAttr "oof-prometheus" promDefaultDisabledCfg.config.systemd.services;
@@ -2021,10 +2043,11 @@
                       assert.equal(s.badGhaCollisionRejected, true);
 
                       assert.equal(s.cfTelemetryOk, true);
-                      assert.match(s.cfAuditExec, /--dangerously-allow-env-var-interpolation/);
+                      assert.match(s.cfAuditExec, /poller\.mjs/);
                       assert.equal(s.cfLogpushListen, "127.0.0.1:8089");
                       assert.equal(s.cfExporterListen, "127.0.0.1:9199");
                       assert.equal(s.badCfPortCollisionRejected, true);
+                      assert.equal(s.badCfExporterNonLoopbackRejected, true);
 
                       assert.equal(s.promDefaultDisabled, true);
                       assert.equal(s.promDefaultHasUnit, false);
@@ -2135,13 +2158,6 @@
                   ''
                     export HOME="$TMPDIR/home"
                     mkdir -p "$HOME"
-
-                    OOF_VECTOR_DATA_DIR="$TMPDIR/vec-cf-audit-data" \
-                      OOF_BASIN_ENDPOINT="https://example-stream.ingest.cloudflare.com" \
-                      OOF_INGEST_TOKEN="dummy-basin-token" \
-                      OOF_CLOUDFLARE_ACCOUNT_ID="0123456789abcdef0123456789abcdef" \
-                      OOF_CLOUDFLARE_API_TOKEN="dummy-cf-token" \
-                      ${assets.oofVectorCfAudit}/bin/vector validate --no-environment
 
                     OOF_VECTOR_DATA_DIR="$TMPDIR/vec-cf-logpush-data" \
                       OOF_BASIN_ENDPOINT="https://example-stream.ingest.cloudflare.com" \
