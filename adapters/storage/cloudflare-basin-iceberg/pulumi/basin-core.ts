@@ -89,12 +89,16 @@ export function resolveDefaultRepoPaths(fromDir: string): {
   pipelineSqlFile: string;
   focusSchemaFile: string;
   focusPipelineSqlFile: string;
+  aiSchemaFile: string;
+  aiPipelineSqlFile: string;
 } {
   return {
     schemaFile: path.resolve(fromDir, "../../../../contracts/ocsf/event-log-activity.basin.json"),
     pipelineSqlFile: path.resolve(fromDir, "../pipeline.sql"),
     focusSchemaFile: path.resolve(fromDir, "../../../../contracts/focus/cost-and-usage.basin.json"),
     focusPipelineSqlFile: path.resolve(fromDir, "../focus_pipeline.sql"),
+    aiSchemaFile: path.resolve(fromDir, "../../../../contracts/otel-genai/genai-usage.basin.json"),
+    aiPipelineSqlFile: path.resolve(fromDir, "../pipeline_ai_usage.sql"),
   };
 }
 

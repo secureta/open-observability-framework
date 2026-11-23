@@ -11,6 +11,12 @@ locals {
   focus_schema       = var.enable_finops ? jsondecode(file(local.focus_schema_path)) : null
   rendered_focus_sql = var.enable_finops ? replace(replace(file(local.focus_pipeline_sql_path), "__SINK_NAME__", var.finops_sink_name), "__STREAM_NAME__", var.finops_stream_name) : ""
 
+  ai_schema_path       = var.ai_schema_file != "" ? var.ai_schema_file : "${path.module}/../../../../contracts/otel-genai/genai-usage.basin.json"
+  ai_pipeline_sql_path = var.ai_pipeline_sql_file != "" ? var.ai_pipeline_sql_file : "${path.module}/../pipeline_ai_usage.sql"
+
+  ai_usage_schema = var.enable_ai_usage ? jsondecode(file(local.ai_schema_path)) : null
+  ai_rendered_sql = var.enable_ai_usage ? replace(replace(file(local.ai_pipeline_sql_path), "__SINK_NAME__", var.ai_sink_name), "__STREAM_NAME__", var.ai_stream_name) : ""
+
   bucket_name = var.create_bucket ? cloudflare_r2_bucket.lake[0].name : var.bucket_name
 
   discovered_ingest_permission_group_ids = var.create_ingest_token && var.ingest_token_permission_group_id == null ? [
@@ -156,6 +162,7 @@ resource "cloudflare_account_token" "ingest" {
   }
 }
 
+# Optional FOCUS v1.0 FinOps cost & usage stream / sink / pipeline (enable_finops = true)
 resource "restful_resource" "focus_stream" {
   count = var.enable_finops ? 1 : 0
 
@@ -244,6 +251,94 @@ resource "cloudflare_pipeline" "focus" {
     precondition {
       condition     = var.finops_stream_name != var.stream_name && var.finops_sink_name != var.sink_name
       error_message = "FOCUS stream/sink names must be distinct from the OCSF stream/sink names."
+    }
+  }
+}
+
+# Optional OTel GenAI coding-agent usage stream / sink / pipeline (enable_ai_usage = true)
+resource "restful_resource" "ai_usage_stream" {
+  count = var.enable_ai_usage ? 1 : 0
+
+  path            = "/accounts/${var.cloudflare_account_id}/pipelines/v1/streams"
+  read_path       = "$(path)/$(body.id)"
+  update_path     = "$(path)/$(body.id)"
+  delete_path     = "$(path)/$(body.id)"
+  update_method   = "PATCH"
+  create_selector = "result"
+  read_selector   = "result"
+  force_new_attrs = ["name", "format", "schema"]
+  output_attrs    = ["id", "name", "endpoint", "version"]
+
+  body = {
+    name = var.ai_stream_name
+    format = {
+      type = "json"
+    }
+    http = {
+      enabled        = true
+      authentication = true
+      cors = {
+        origins = var.stream_cors_origins
+      }
+    }
+    worker_binding = {
+      enabled = false
+    }
+    schema = {
+      fields = local.ai_usage_schema.fields
+    }
+  }
+}
+
+resource "cloudflare_pipeline_sink" "ai_usage" {
+  count = var.enable_ai_usage ? 1 : 0
+
+  account_id = var.cloudflare_account_id
+  name       = var.ai_sink_name
+  type       = "r2_data_catalog"
+
+  format = {
+    type = "parquet"
+  }
+
+  config = {
+    account_id = var.cloudflare_account_id
+    bucket     = local.bucket_name
+    namespace  = var.ai_namespace
+    table_name = var.ai_table_name
+    token      = var.catalog_token
+    rolling_policy = {
+      interval_seconds = var.roll_interval_seconds
+    }
+  }
+
+  depends_on = [
+    cloudflare_r2_bucket.lake,
+    cloudflare_r2_data_catalog.lake,
+  ]
+}
+
+resource "cloudflare_pipeline" "ai_usage" {
+  count = var.enable_ai_usage ? 1 : 0
+
+  account_id = var.cloudflare_account_id
+  name       = var.ai_pipeline_name
+  sql        = local.ai_rendered_sql
+
+  depends_on = [
+    restful_resource.ai_usage_stream,
+    cloudflare_pipeline_sink.ai_usage,
+  ]
+
+  lifecycle {
+    replace_triggered_by = [
+      restful_resource.ai_usage_stream[0].id,
+      cloudflare_pipeline_sink.ai_usage[0].id,
+    ]
+
+    precondition {
+      condition     = var.ai_stream_name != var.ai_sink_name
+      error_message = "ai_stream_name and ai_sink_name must be distinct SQL identifiers."
     }
   }
 }
