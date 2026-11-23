@@ -41,9 +41,18 @@ const createIngestToken = config.getBoolean("createIngestToken") ?? false;
 const ingestTokenName = config.get("ingestTokenName") ?? "oof-basin-ingest";
 const ingestTokenPermissionGroupId = config.get("ingestTokenPermissionGroupId");
 
+const enableAiUsage = config.getBoolean("enableAiUsage") ?? false;
+const aiNamespace = config.get("aiNamespace") ?? "ai";
+const aiTableName = config.get("aiTableName") ?? "genai_usage";
+const aiStreamNameConfig = config.get("aiStreamName") ?? "ai_genai_usage_stream";
+const aiSinkName = config.get("aiSinkName") ?? "ai_genai_usage_sink";
+const aiPipelineName = config.get("aiPipelineName") ?? "ai_genai_usage_to_iceberg";
+
 const defaults = resolveDefaultRepoPaths(__dirname);
 const schemaFile = config.get("schemaFile") ?? defaults.schemaFile;
 const pipelineSqlFile = config.get("pipelineSqlFile") ?? defaults.pipelineSqlFile;
+const aiSchemaFile = config.get("aiSchemaFile") ?? defaults.aiSchemaFile;
+const aiPipelineSqlFile = config.get("aiPipelineSqlFile") ?? defaults.aiPipelineSqlFile;
 
 // Validate non-secret inputs synchronously and secret catalogToken on resolution.
 validateBasinSettings({
@@ -232,3 +241,98 @@ export const streamHost = stream.endpoint.apply(extractHostFromEndpoint);
 export const sinkId = sink.id;
 export const pipelineId = pipeline.id;
 export const ingestToken = ingestTokenOutput;
+
+let aiStream: BasinStructuredStream | undefined;
+let aiSink: cloudflare.PipelineSink | undefined;
+let aiPipeline: cloudflare.Pipeline | undefined;
+
+if (enableAiUsage) {
+  validateBasinSettings({
+    accountId,
+    catalogToken: "placeholder-validated-separately",
+    apiBaseUrl,
+    bucketName: bucketNameConfig,
+    namespace: aiNamespace,
+    tableName: aiTableName,
+    streamName: aiStreamNameConfig,
+    sinkName: aiSinkName,
+    pipelineName: aiPipelineName,
+    rollIntervalSeconds,
+    ingestTokenName,
+  });
+
+  const aiSchemaFields = loadBasinSchemaFields(aiSchemaFile);
+  const aiRenderedSql = renderPipelineSql(aiPipelineSqlFile, aiSinkName, aiStreamNameConfig);
+
+  aiStream = new BasinStructuredStream("oof-ai-usage-stream", {
+    accountId,
+    apiBaseUrl,
+    name: aiStreamNameConfig,
+    format: {
+      type: "json",
+    },
+    http: {
+      enabled: true,
+      authentication: true,
+      cors: {
+        origins: streamCorsOrigins,
+      },
+    },
+    workerBinding: {
+      enabled: false,
+    },
+    schema: {
+      fields: aiSchemaFields,
+    },
+  });
+
+  aiSink = new cloudflare.PipelineSink(
+    "oof-ai-usage-sink",
+    {
+      accountId,
+      name: aiSinkName,
+      type: "r2_data_catalog",
+      format: {
+        type: "parquet",
+      },
+      config: {
+        accountId,
+        bucket: effectiveBucketName,
+        namespace: aiNamespace,
+        tableName: aiTableName,
+        token: validatedCatalogToken,
+        rollingPolicy: {
+          intervalSeconds: rollIntervalSeconds,
+        },
+      },
+    },
+    {
+      provider: cfProvider,
+      dependsOn: sinkDependencies,
+    }
+  );
+
+  aiPipeline = new cloudflare.Pipeline(
+    "oof-ai-usage-pipeline",
+    {
+      accountId,
+      name: aiPipelineName,
+      sql: pulumi.interpolate`-- stream_id=${aiStream.id} sink_id=${aiSink.id}\n${aiRenderedSql}`,
+    },
+    {
+      provider: cfProvider,
+      dependsOn: [aiStream, aiSink],
+      replaceOnChanges: ["sql"],
+      deleteBeforeReplace: true,
+    }
+  );
+}
+
+export const aiStreamId = aiStream ? aiStream.id : pulumi.output(undefined);
+export const aiStreamName = aiStream ? aiStream.name : pulumi.output(undefined);
+export const aiStreamEndpoint = aiStream ? aiStream.endpoint : pulumi.output(undefined);
+export const aiStreamHost = aiStream
+  ? aiStream.endpoint.apply(extractHostFromEndpoint)
+  : pulumi.output(undefined);
+export const aiSinkId = aiSink ? aiSink.id : pulumi.output(undefined);
+export const aiPipelineId = aiPipeline ? aiPipeline.id : pulumi.output(undefined);
