@@ -3,7 +3,10 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { spawnSync } from "node:child_process";
+import http from "node:http";
+import net from "node:net";
+import zlib from "node:zlib";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -237,6 +240,170 @@ tests:
       `vector test (capture_content=redacted) failed:\n${tstRedacted.stdout}\n${tstRedacted.stderr}`
     );
   } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+async function getFreePort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.unref();
+    srv.on("error", reject);
+    srv.listen(0, "127.0.0.1", () => {
+      const addr = srv.address();
+      srv.close(() => resolve(addr.port));
+    });
+  });
+}
+
+async function waitForPort(port, timeoutMs = 8000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const ok = await new Promise((resolve) => {
+      const sock = net.connect({ host: "127.0.0.1", port }, () => {
+        sock.destroy();
+        resolve(true);
+      });
+      sock.on("error", () => resolve(false));
+    });
+    if (ok) return;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  throw new Error(`Timed out waiting for 127.0.0.1:${port}`);
+}
+
+test("live wire-level OTLP HTTP auth returns 401 on invalid token and delivers valid batch to Basin", async (t) => {
+  const vectorBin = findBinary("vector");
+  if (!vectorBin) {
+    t.skip("vector binary not in PATH; run inside `nix develop` to execute live wire-level auth test");
+    return;
+  }
+
+  const otlpPort = await getFreePort();
+  const receivedBatches = [];
+  const basinServer = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const buf = Buffer.concat(chunks);
+      const body = req.headers["content-encoding"] === "gzip" ? zlib.gunzipSync(buf).toString("utf8") : buf.toString("utf8");
+      receivedBatches.push({
+        auth: req.headers.authorization,
+        events: JSON.parse(body),
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"ok":true}');
+    });
+  });
+  await new Promise((resolve) => basinServer.listen(0, "127.0.0.1", resolve));
+  const basinPort = basinServer.address().port;
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "oof-vector-ai-wire-"));
+  const localToken = "wire-local-secret-token-0123456789";
+  const basinToken = "wire-basin-secret-token-9876543210";
+
+  // Reduce batch timeout to 1s for fast deterministic wire test
+  const wireCfg = fs
+    .readFileSync(VECTOR_AI_CONFIG_PATH, "utf8")
+    .split(/\ntests:\n/)[0]
+    .replace("timeout_secs: 5", "timeout_secs: 1");
+  const wireCfgPath = path.join(tmpDir, "vector-wire.yaml");
+  fs.writeFileSync(wireCfgPath, wireCfg, "utf8");
+
+  const proc = spawn(vectorBin, ["--config-yaml", wireCfgPath], {
+    env: {
+      ...process.env,
+      VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION: "true",
+      OOF_VECTOR_AI_DATA_DIR: tmpDir,
+      OOF_AI_OTLP_HTTP_LISTEN: `127.0.0.1:${otlpPort}`,
+      OOF_AI_BASIN_ENDPOINT: `http://127.0.0.1:${basinPort}/ingest`,
+      OOF_AI_INGEST_TOKEN: basinToken,
+      OOF_AI_OTLP_AUTH_TOKEN: localToken,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  try {
+    await waitForPort(otlpPort);
+
+    const payload = JSON.stringify({
+      resourceLogs: [
+        {
+          resource: {
+            attributes: [{ key: "service.name", value: { stringValue: "claude-code" } }],
+          },
+          scopeLogs: [
+            {
+              logRecords: [
+                {
+                  timeUnixNano: "1795402902000000000",
+                  eventName: "api_request",
+                  attributes: [
+                    { key: "model", value: { stringValue: "claude-sonnet-4-6" } },
+                    { key: "input_tokens", value: { intValue: "100" } },
+                    { key: "output_tokens", value: { intValue: "50" } },
+                    { key: "session.id", value: { stringValue: "sess-wire-ok" } },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    const postOtlp = (headers = {}) =>
+      new Promise((resolve, reject) => {
+        const req = http.request(
+          {
+            hostname: "127.0.0.1",
+            port: otlpPort,
+            path: "/v1/logs",
+            method: "POST",
+            headers: { "content-type": "application/json", ...headers },
+          },
+          (res) => {
+            res.resume();
+            res.on("end", () => resolve(res.statusCode));
+          }
+        );
+        req.on("error", reject);
+        req.end(payload);
+      });
+
+    // 1. Missing auth -> HTTP 401
+    assert.equal(await postOtlp(), 401, "unauthenticated OTLP POST must return HTTP 401");
+    // 2. Wrong bearer token -> HTTP 401
+    assert.equal(
+      await postOtlp({ authorization: "Bearer wrong-token" }),
+      401,
+      "mismatched bearer token must return HTTP 401"
+    );
+    // 3. Valid bearer token -> HTTP 200
+    assert.equal(
+      await postOtlp({ authorization: `Bearer ${localToken}` }),
+      200,
+      "valid bearer token must return HTTP 200"
+    );
+
+    const deadline = Date.now() + 8000;
+    while (receivedBatches.length === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 150));
+    }
+
+    assert.equal(receivedBatches.length, 1, "expected exactly 1 delivered batch");
+    assert.equal(receivedBatches[0].auth, `Bearer ${basinToken}`);
+    assert.equal(receivedBatches[0].events.length, 1, "rejected 401 requests must not reach Basin");
+    const ev = receivedBatches[0].events[0];
+    assert.equal(ev.service.name, "claude-code");
+    assert.equal(ev.event_name, "claude_code.api_request");
+    assert.equal(ev.gen_ai.usage.total_tokens, 150);
+    assert.equal(ev.session_id, "sess-wire-ok");
+    assert.ok(!JSON.stringify(ev).includes(localToken), "local OTLP auth token must never leak to Basin");
+  } finally {
+    proc.kill("SIGTERM");
+    await new Promise((resolve) => proc.once("exit", resolve));
+    await new Promise((resolve) => basinServer.close(resolve));
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });

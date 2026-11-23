@@ -11,23 +11,23 @@ First, generate a local shared Bearer token for authenticated OTLP HTTP ingestio
 export OOF_AI_OTLP_AUTH_TOKEN="$(openssl rand -hex 32)"
 ```
 
-### 1. Claude Code (OTLP HTTP)
-Export these environment variables in your shell / dev environment:
+### 1. Claude Code (OTLP/HTTP JSON)
+Use the **logs-only** OTLP environment variables so the local collector token is never sent to separate OTLP metrics or traces providers:
 ```bash
 export CLAUDE_CODE_ENABLE_TELEMETRY=1
 export OTEL_LOGS_EXPORTER=otlp
-export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
-export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4328
-export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer ${OOF_AI_OTLP_AUTH_TOKEN}"
+export OTEL_EXPORTER_OTLP_LOGS_PROTOCOL=http/json
+export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://127.0.0.1:4328/v1/logs
+export OTEL_EXPORTER_OTLP_LOGS_HEADERS="Authorization=Bearer ${OOF_AI_OTLP_AUTH_TOKEN}"
 export OTEL_LOG_USER_PROMPTS=0
 ```
 
-### 2. Codex CLI (OTLP HTTP)
+### 2. Codex CLI (OTLP/HTTP JSON)
 Add the `[otel]` block to `~/.codex/config.toml` (replace `<OOF_AI_OTLP_AUTH_TOKEN>` with your token):
 ```toml
 [otel]
 log_user_prompt = false
-exporter = { otlp-http = { endpoint = "http://127.0.0.1:4328/v1/logs", protocol = "binary", headers = { Authorization = "Bearer <OOF_AI_OTLP_AUTH_TOKEN>" } } }
+exporter = { otlp-http = { endpoint = "http://127.0.0.1:4328/v1/logs", protocol = "json", headers = { Authorization = "Bearer <OOF_AI_OTLP_AUTH_TOKEN>" } } }
 ```
 
 ### 3. Antigravity (`agy`) / herdr Sessions (Local JSONL)
@@ -63,8 +63,9 @@ When enabling `redacted` or `full`, also opt in on OTLP agents if desired:
 export OOF_AI_CAPTURE_CONTENT=redacted
 ```
 
-## Security Note (Shared Hosts)
-The default loopback OTLP listener (`127.0.0.1:4327`/`4328`) is unauthenticated and intended for single-user developer workstations. On shared/multi-tenant hosts, run Vector inside an isolated per-user network namespace or front it with an authenticated mTLS/token proxy so other local accounts cannot inject forged usage telemetry.
+## Security Note
+- The local OTLP/HTTP JSON listener (`127.0.0.1:4328/v1/logs`) enforces `Authorization: Bearer <OOF_AI_OTLP_AUTH_TOKEN>` at the HTTP listener layer, returning `HTTP 401 Unauthorized` for missing or invalid tokens before any batch is accepted.
+- No unauthenticated gRPC listener is exposed, and `OTEL_EXPORTER_OTLP_LOGS_HEADERS` scopes the local Bearer token strictly to logs so it is never sent to external metrics/traces providers.
 
 ## Running & Validating Locally
 
