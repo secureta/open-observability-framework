@@ -5,6 +5,8 @@ Each slot can swap services independently because adapters speak standard open s
 | Slot | Adapter ID | Path / Reference | Best For |
 | :--- | :--- | :--- | :--- |
 | `schema` | `ocsf` (`v1.3.0`, `1008`) | `contracts/ocsf/event-log-activity.basin.json` | Vendor-neutral SIEM + APM log standardization (`ecs`/`cim` extensible later) |
+| `schema` (FinOps) | `focus` (`v1.0`) | `contracts/focus/cost-and-usage.basin.json` | Vendor-neutral FinOps Open Cost and Usage Specification (FOCUS v1.0) for Cloudflare & GitHub cost monitoring |
+| `collect` | `finops-billing` | `adapters/collect/finops-billing/collect-focus.mjs` | Zero-dependency Node.js 20+ collector pulling Cloudflare GraphQL Analytics (R2/Pipelines) & GitHub Billing Usage API -> FOCUS v1.0 -> Basin HTTP |
 | `collect` | `vector-journald` | `adapters/collect/vector-journald/vector.yaml` | Host `systemd-journald` + OTLP (`4317`/`4318`) -> VRL OCSF v1.3.0 -> gzipped JSON array |
 | `collect` | `fluent-bit-journald` | `adapters/collect/fluent-bit-journald/fluent-bit.conf` | Ultra-lightweight `systemd` + `opentelemetry` -> Lua OCSF v1.3.0 -> gzipped JSON array |
 | `collect` | `otel-collector-journald` | `adapters/collect/otel-collector-journald/otelcol.yaml` | OTLP agent/gateway forwarding protobuf logs (`encoding: proto`) to Vector or Fluent Bit |

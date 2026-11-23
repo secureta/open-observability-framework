@@ -41,6 +41,13 @@ const createIngestToken = config.getBoolean("createIngestToken") ?? false;
 const ingestTokenName = config.get("ingestTokenName") ?? "oof-basin-ingest";
 const ingestTokenPermissionGroupId = config.get("ingestTokenPermissionGroupId");
 
+const enableFinops = config.getBoolean("enableFinops") ?? false;
+const finopsNamespace = config.get("finopsNamespace") ?? "finops";
+const finopsTableName = config.get("finopsTableName") ?? "focus_cost_and_usage";
+const finopsStreamNameConfig = config.get("finopsStreamName") ?? "focus_cost_and_usage_stream";
+const finopsSinkName = config.get("finopsSinkName") ?? "focus_cost_and_usage_sink";
+const finopsPipelineName = config.get("finopsPipelineName") ?? "focus_cost_and_usage_to_iceberg";
+
 interface LogpushJobConfig {
   scope?: "zone" | "account";
   zoneId?: string;
@@ -87,6 +94,8 @@ const aiPipelineName = config.get("aiPipelineName") ?? "ai_genai_usage_to_iceber
 const defaults = resolveDefaultRepoPaths(__dirname);
 const schemaFile = config.get("schemaFile") ?? defaults.schemaFile;
 const pipelineSqlFile = config.get("pipelineSqlFile") ?? defaults.pipelineSqlFile;
+const finopsSchemaFile = config.get("finopsSchemaFile") ?? defaults.focusSchemaFile;
+const finopsPipelineSqlFile = config.get("finopsPipelineSqlFile") ?? defaults.focusPipelineSqlFile;
 const aiSchemaFile = config.get("aiSchemaFile") ?? defaults.aiSchemaFile;
 const aiPipelineSqlFile = config.get("aiPipelineSqlFile") ?? defaults.aiPipelineSqlFile;
 
@@ -268,6 +277,99 @@ if (createIngestToken) {
   ingestTokenOutput = pulumi.secret(tokenResource.value);
 }
 
+let focusStream: BasinStructuredStream | undefined;
+let focusSink: cloudflare.PipelineSink | undefined;
+let focusPipeline: cloudflare.Pipeline | undefined;
+
+if (enableFinops) {
+  validateBasinSettings({
+    accountId,
+    catalogToken: "placeholder-validated-separately",
+    apiBaseUrl,
+    bucketName: bucketNameConfig,
+    namespace: finopsNamespace,
+    tableName: finopsTableName,
+    streamName: finopsStreamNameConfig,
+    sinkName: finopsSinkName,
+    pipelineName: finopsPipelineName,
+    rollIntervalSeconds,
+    ingestTokenName,
+  });
+  if (finopsStreamNameConfig === streamNameConfig || finopsSinkName === sinkName) {
+    throw new Error("FOCUS stream/sink names must be distinct from the OCSF stream/sink names.");
+  }
+
+  const focusSchemaFields = loadBasinSchemaFields(finopsSchemaFile);
+  const renderedFocusSql = renderPipelineSql(
+    finopsPipelineSqlFile,
+    finopsSinkName,
+    finopsStreamNameConfig
+  );
+
+  focusStream = new BasinStructuredStream("oof-focus-stream", {
+    accountId,
+    apiBaseUrl,
+    name: finopsStreamNameConfig,
+    format: {
+      type: "json",
+    },
+    http: {
+      enabled: true,
+      authentication: true,
+      cors: {
+        origins: streamCorsOrigins,
+      },
+    },
+    workerBinding: {
+      enabled: false,
+    },
+    schema: {
+      fields: focusSchemaFields,
+    },
+  });
+
+  focusSink = new cloudflare.PipelineSink(
+    "oof-focus-sink",
+    {
+      accountId,
+      name: finopsSinkName,
+      type: "r2_data_catalog",
+      format: {
+        type: "parquet",
+      },
+      config: {
+        accountId,
+        bucket: effectiveBucketName,
+        namespace: finopsNamespace,
+        tableName: finopsTableName,
+        token: validatedCatalogToken,
+        rollingPolicy: {
+          intervalSeconds: rollIntervalSeconds,
+        },
+      },
+    },
+    {
+      provider: cfProvider,
+      dependsOn: sinkDependencies,
+    }
+  );
+
+  focusPipeline = new cloudflare.Pipeline(
+    "oof-focus-pipeline",
+    {
+      accountId,
+      name: finopsPipelineName,
+      sql: pulumi.interpolate`-- stream_id=${focusStream.id} sink_id=${focusSink.id}\n${renderedFocusSql}`,
+    },
+    {
+      provider: cfProvider,
+      dependsOn: [focusStream, focusSink],
+      replaceOnChanges: ["sql"],
+      deleteBeforeReplace: true,
+    }
+  );
+}
+
 const logpushJobResources: Record<string, pulumi.Output<string>> = {};
 for (const [jobKey, job] of Object.entries(logpushJobsConfig)) {
   const scope = job.scope ?? "zone";
@@ -298,6 +400,14 @@ export const streamHost = stream.endpoint.apply(extractHostFromEndpoint);
 export const sinkId = sink.id;
 export const pipelineId = pipeline.id;
 export const ingestToken = ingestTokenOutput;
+export const focusStreamId = focusStream ? focusStream.id : pulumi.output(undefined);
+export const focusStreamName = focusStream ? focusStream.name : pulumi.output(undefined);
+export const focusStreamEndpoint = focusStream ? focusStream.endpoint : pulumi.output(undefined);
+export const focusStreamHost = focusStream
+  ? focusStream.endpoint.apply(extractHostFromEndpoint)
+  : pulumi.output(undefined);
+export const focusSinkId = focusSink ? focusSink.id : pulumi.output(undefined);
+export const focusPipelineId = focusPipeline ? focusPipeline.id : pulumi.output(undefined);
 export const logpushJobIds = logpushJobResources;
 
 let aiStream: BasinStructuredStream | undefined;

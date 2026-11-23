@@ -44,6 +44,36 @@ output "ingest_token" {
   sensitive   = true
 }
 
+output "focus_stream_id" {
+  description = "Provisioned FOCUS v1.0 Basin HTTP stream ID (null when enable_finops = false)."
+  value       = var.enable_finops ? restful_resource.focus_stream[0].output.id : null
+}
+
+output "focus_stream_name" {
+  description = "Provisioned FOCUS v1.0 Basin HTTP stream SQL identifier (null when enable_finops = false)."
+  value       = var.enable_finops ? restful_resource.focus_stream[0].output.name : null
+}
+
+output "focus_stream_endpoint" {
+  description = "Authenticated FOCUS v1.0 Basin HTTPS ingest URL (use for OOF_FOCUS_BASIN_ENDPOINT; null when enable_finops = false)."
+  value       = var.enable_finops ? restful_resource.focus_stream[0].output.endpoint : null
+}
+
+output "focus_stream_host" {
+  description = "Hostname portion of focus_stream_endpoint (null when enable_finops = false)."
+  value       = var.enable_finops ? regex("^https?://([^/]+)", restful_resource.focus_stream[0].output.endpoint)[0] : null
+}
+
+output "focus_sink_id" {
+  description = "Provisioned FOCUS v1.0 Basin R2 Data Catalog sink ID (null when enable_finops = false)."
+  value       = var.enable_finops ? cloudflare_pipeline_sink.focus[0].id : null
+}
+
+output "focus_pipeline_id" {
+  description = "Provisioned FOCUS v1.0 Basin SQL pipeline ID (null when enable_finops = false)."
+  value       = var.enable_finops ? cloudflare_pipeline.focus[0].id : null
+}
+
 output "logpush_job_ids" {
   description = "Map of provisioned Cloudflare Logpush job names to their numeric IDs (omits destination_conf secrets)."
   value = {
