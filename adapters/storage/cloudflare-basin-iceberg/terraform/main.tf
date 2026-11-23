@@ -149,3 +149,17 @@ resource "cloudflare_account_token" "ingest" {
     }
   }
 }
+
+resource "cloudflare_logpush_job" "telemetry" {
+  for_each = toset(nonsensitive(keys(var.logpush_jobs)))
+
+  account_id       = var.logpush_jobs[each.key].scope == "account" ? var.cloudflare_account_id : null
+  zone_id          = var.logpush_jobs[each.key].scope == "zone" ? var.logpush_jobs[each.key].zone_id : null
+  name             = coalesce(var.logpush_jobs[each.key].name, each.key)
+  dataset          = var.logpush_jobs[each.key].dataset
+  destination_conf = var.logpush_jobs[each.key].destination_conf
+  enabled          = var.logpush_jobs[each.key].enabled
+  frequency        = var.logpush_jobs[each.key].frequency
+  filter           = var.logpush_jobs[each.key].filter
+  output_options   = var.logpush_jobs[each.key].output_options
+}

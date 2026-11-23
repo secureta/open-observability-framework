@@ -41,6 +41,42 @@ const createIngestToken = config.getBoolean("createIngestToken") ?? false;
 const ingestTokenName = config.get("ingestTokenName") ?? "oof-basin-ingest";
 const ingestTokenPermissionGroupId = config.get("ingestTokenPermissionGroupId");
 
+interface LogpushJobConfig {
+  scope?: "zone" | "account";
+  zoneId?: string;
+  dataset: string;
+  destinationConf: string;
+  enabled?: boolean;
+  frequency?: "high" | "low";
+  name?: string;
+  filter?: string;
+  outputOptions?: {
+    fieldNames?: string[];
+    timestampFormat?: string;
+    outputType?: string;
+  };
+}
+
+const logpushJobsConfig = config.getObject<Record<string, LogpushJobConfig>>("logpushJobs") ?? {};
+for (const [jobKey, job] of Object.entries(logpushJobsConfig)) {
+  const scope = job.scope ?? "zone";
+  if (scope !== "zone" && scope !== "account") {
+    throw new Error(`logpushJobs.${jobKey}.scope must be 'zone' or 'account'.`);
+  }
+  if (scope === "zone" && (!job.zoneId || !/^[a-fA-F0-9]{32}$/.test(job.zoneId))) {
+    throw new Error(`logpushJobs.${jobKey}.zoneId must be a 32-hex Cloudflare Zone ID when scope is 'zone'.`);
+  }
+  if (scope === "account" && job.zoneId !== undefined) {
+    throw new Error(`logpushJobs.${jobKey}.zoneId must not be set when scope is 'account'.`);
+  }
+  if (!job.dataset || job.dataset.trim() === "") {
+    throw new Error(`logpushJobs.${jobKey}.dataset must be non-empty.`);
+  }
+  if (!job.destinationConf || job.destinationConf.trim() === "") {
+    throw new Error(`logpushJobs.${jobKey}.destinationConf must be non-empty.`);
+  }
+}
+
 const defaults = resolveDefaultRepoPaths(__dirname);
 const schemaFile = config.get("schemaFile") ?? defaults.schemaFile;
 const pipelineSqlFile = config.get("pipelineSqlFile") ?? defaults.pipelineSqlFile;
@@ -223,6 +259,27 @@ if (createIngestToken) {
   ingestTokenOutput = pulumi.secret(tokenResource.value);
 }
 
+const logpushJobResources: Record<string, pulumi.Output<string>> = {};
+for (const [jobKey, job] of Object.entries(logpushJobsConfig)) {
+  const scope = job.scope ?? "zone";
+  const lpJob = new cloudflare.LogpushJob(
+    `oof-logpush-${jobKey}`,
+    {
+      accountId: scope === "account" ? accountId : undefined,
+      zoneId: scope === "zone" ? job.zoneId : undefined,
+      name: job.name ?? jobKey,
+      dataset: job.dataset,
+      destinationConf: pulumi.secret(job.destinationConf),
+      enabled: job.enabled ?? true,
+      frequency: job.frequency ?? "high",
+      filter: job.filter,
+      outputOptions: job.outputOptions,
+    },
+    { provider: cfProvider }
+  );
+  logpushJobResources[jobKey] = lpJob.id;
+}
+
 export const bucketName = effectiveBucketName;
 export const catalogId = catalog ? catalog.id : pulumi.output(undefined);
 export const streamId = stream.id;
@@ -232,3 +289,4 @@ export const streamHost = stream.endpoint.apply(extractHostFromEndpoint);
 export const sinkId = sink.id;
 export const pipelineId = pipeline.id;
 export const ingestToken = ingestTokenOutput;
+export const logpushJobIds = logpushJobResources;

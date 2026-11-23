@@ -1,0 +1,462 @@
+# Open Observability Framework — Vector Cloudflare Logpush Collector (OCSF v1.3.0 -> Direct Basin HTTP)
+#
+# Receives Cloudflare Logpush HTTP Push batches (gzip-compressed NDJSON) for
+# `http_requests`, `firewall_events`, `dns_logs`, `access_requests`, and `gateway_dns`,
+# authenticates requests via `X-OOF-Logpush-Token` or `Authorization: Bearer <token>`,
+# normalizes each record into official OCSF v1.3.0 `Event Log Activity`
+# (`category_uid: 1`, `class_uid: 1008`, `activity_id: 99`, `type_uid: 100899`),
+# and ships gzipped JSON arrays directly to Cloudflare Basin HTTP (`direct-basin-http`).
+#
+# Required environment variables:
+#   OOF_BASIN_ENDPOINT             (e.g. https://<STREAM_ID>.ingest.cloudflare.com)
+#   OOF_INGEST_TOKEN               (Cloudflare Account API Token with `Basin Pipelines Send`)
+#   OOF_CLOUDFLARE_LOGPUSH_TOKEN   (Shared secret sent by Cloudflare Logpush custom HTTP header)
+#
+# Optional environment variables:
+#   OOF_VECTOR_DATA_DIR            (default: /var/lib/vector)
+#   OOF_CF_LOGPUSH_LISTEN          (default: 127.0.0.1:8089)
+#
+# Vector >= 0.60 note:
+#   Interpolating environment variables (e.g. `$OOF_BASIN_ENDPOINT` with braces) requires `--dangerously-allow-env-var-interpolation`
+#   (or `VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true`):
+#     VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true vector validate --no-environment adapters/collect/vector-cloudflare-logpush/vector.yaml
+#     VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true OOF_CLOUDFLARE_LOGPUSH_TOKEN=test-token vector test adapters/collect/vector-cloudflare-logpush/vector.yaml
+
+data_dir: "${OOF_VECTOR_DATA_DIR:-/var/lib/vector}"
+
+sources:
+  cloudflare_logpush_http:
+    type: http_server
+    address: "${OOF_CF_LOGPUSH_LISTEN:-127.0.0.1:8089}"
+    path: "/logpush/cloudflare"
+    strict_path: true
+    framing:
+      method: newline_delimited
+    decoding:
+      codec: json
+    headers:
+      - x-oof-logpush-token
+      - authorization
+      - x-cloudflare-dataset
+
+transforms:
+  verify_logpush_token:
+    type: filter
+    inputs:
+      - cloudflare_logpush_http
+    condition:
+      type: vrl
+      source: |
+        expected, env_err = get_env_var("OOF_CLOUDFLARE_LOGPUSH_TOKEN")
+        if env_err != null || !is_string(expected) || expected == "" {
+          false
+        } else {
+          provided = null
+          if exists(."x-oof-logpush-token") && is_string(."x-oof-logpush-token") && string!(."x-oof-logpush-token") != "" {
+            provided = string!(."x-oof-logpush-token")
+          } else if exists(.authorization) && is_string(.authorization) {
+            auth_val = string!(.authorization)
+            if starts_with(downcase(auth_val), "bearer ") {
+              provided = slice!(auth_val, 7)
+            }
+          }
+          if provided == null || provided == "" {
+            false
+          } else {
+            sha2(string!(provided), variant: "SHA-256") == sha2(expected, variant: "SHA-256")
+          }
+        }
+
+  ocsf_cloudflare_logpush:
+    type: remap
+    inputs:
+      - verify_logpush_token
+    source: |
+      now_ts = now()
+      logged_ms = to_unix_timestamp(now_ts, unit: "milliseconds")
+
+      # Drop Logpush destination ownership verification probe payloads after auth check
+      if exists(.content) && is_string(.content) && string!(.content) == "test" && !exists(.RayID) && !exists(.EdgeStartTimestamp) {
+        abort
+      }
+
+      # Determine dataset from header or payload shape
+      dataset = if exists(."x-cloudflare-dataset") && is_string(."x-cloudflare-dataset") && string!(."x-cloudflare-dataset") != "" {
+        downcase(string!(."x-cloudflare-dataset"))
+      } else if exists(.RuleID) || (exists(.Action) && exists(.Source)) {
+        "firewall_events"
+      } else if exists(.EdgeResponseStatus) || exists(.ClientRequestURI) || exists(.EdgeStartTimestamp) {
+        "http_requests"
+      } else if exists(.QueryName) && exists(.ResponseCode) {
+        "dns_logs"
+      } else if exists(.AppUID) || exists(.Allowed) {
+        "access_requests"
+      } else if exists(.Decision) && exists(.PolicyID) {
+        "gateway_dns"
+      } else {
+        "logpush"
+      }
+
+      # Extract common Cloudflare Logpush fields
+      ray_id = if exists(.RayID) && is_string(.RayID) && string!(.RayID) != "" { string!(.RayID) } else { null }
+      client_ip = if exists(.ClientIP) && is_string(.ClientIP) && string!(.ClientIP) != "" { string!(.ClientIP) } else { null }
+      client_country = if exists(.ClientCountry) && is_string(.ClientCountry) && string!(.ClientCountry) != "" { string!(.ClientCountry) } else { null }
+      client_asn = if exists(.ClientASN) && is_integer(.ClientASN) { int!(.ClientASN) } else { null }
+      req_host = if exists(.ClientRequestHost) && is_string(.ClientRequestHost) && string!(.ClientRequestHost) != "" { string!(.ClientRequestHost) } else { null }
+      req_method = if exists(.ClientRequestMethod) && is_string(.ClientRequestMethod) && string!(.ClientRequestMethod) != "" { string!(.ClientRequestMethod) } else { null }
+      req_uri = if exists(.ClientRequestURI) && is_string(.ClientRequestURI) && string!(.ClientRequestURI) != "" { string!(.ClientRequestURI) } else { null }
+      edge_status = if exists(.EdgeResponseStatus) && is_integer(.EdgeResponseStatus) { int!(.EdgeResponseStatus) } else { null }
+      origin_status = if exists(.OriginResponseStatus) && is_integer(.OriginResponseStatus) { int!(.OriginResponseStatus) } else { null }
+      cache_status = if exists(.CacheCacheStatus) && is_string(.CacheCacheStatus) && string!(.CacheCacheStatus) != "" { string!(.CacheCacheStatus) } else { null }
+      colo_code = if exists(.EdgeColoCode) && is_string(.EdgeColoCode) && string!(.EdgeColoCode) != "" {
+        string!(.EdgeColoCode)
+      } else if exists(.ColoCode) && is_string(.ColoCode) && string!(.ColoCode) != "" {
+        string!(.ColoCode)
+      } else {
+        null
+      }
+      zone_name = if exists(.ZoneName) && is_string(.ZoneName) && string!(.ZoneName) != "" { string!(.ZoneName) } else { null }
+
+      # Firewall / WAF fields
+      waf_action = if exists(.Action) && is_string(.Action) && string!(.Action) != "" { downcase(string!(.Action)) } else { null }
+      waf_rule_id = if exists(.RuleID) && is_string(.RuleID) && string!(.RuleID) != "" { string!(.RuleID) } else { null }
+      waf_source = if exists(.Source) && is_string(.Source) && string!(.Source) != "" { string!(.Source) } else { null }
+
+      # DNS / Access / Gateway fields
+      query_name = if exists(.QueryName) && is_string(.QueryName) && string!(.QueryName) != "" { string!(.QueryName) } else { null }
+      response_code = if exists(.ResponseCode) && is_integer(.ResponseCode) { int!(.ResponseCode) } else { null }
+      access_allowed = if exists(.Allowed) && is_boolean(.Allowed) { bool!(.Allowed) } else { null }
+      access_app_uid = if exists(.AppUID) && is_string(.AppUID) && string!(.AppUID) != "" { string!(.AppUID) } else { null }
+      user_email = if exists(.UserEmail) && is_string(.UserEmail) && string!(.UserEmail) != "" {
+        string!(.UserEmail)
+      } else if exists(.Email) && is_string(.Email) && string!(.Email) != "" {
+        string!(.Email)
+      } else {
+        null
+      }
+
+      # Resolve timestamp (supports RFC 3339 strings and Unix ns/ms/s integers)
+      raw_ts = if exists(.EdgeStartTimestamp) && .EdgeStartTimestamp != null {
+        .EdgeStartTimestamp
+      } else if exists(.Datetime) && .Datetime != null {
+        .Datetime
+      } else if exists(.Timestamp) && .Timestamp != null {
+        .Timestamp
+      } else if exists(.CreatedAt) && .CreatedAt != null {
+        .CreatedAt
+      } else {
+        null
+      }
+
+      event_ts = now_ts
+      orig_time_str = null
+      if raw_ts != null {
+        if is_string(raw_ts) {
+          s_ts = string!(raw_ts)
+          orig_time_str = s_ts
+          parsed_ev, t_err = parse_timestamp(s_ts, "%+")
+          if t_err == null {
+            tms = to_unix_timestamp(parsed_ev, unit: "milliseconds")
+            if tms >= 1 && tms <= 253402300799999 {
+              event_ts = parsed_ev
+            }
+          }
+        } else if is_integer(raw_ts) {
+          n_ts = int!(raw_ts)
+          parsed_int, i_err = if n_ts > 1000000000000000 {
+            from_unix_timestamp(n_ts, unit: "nanoseconds")
+          } else if n_ts > 1000000000000 {
+            from_unix_timestamp(n_ts, unit: "milliseconds")
+          } else {
+            from_unix_timestamp(n_ts, unit: "seconds")
+          }
+          if i_err == null {
+            tms = to_unix_timestamp(parsed_int, unit: "milliseconds")
+            if tms >= 1 && tms <= 253402300799999 {
+              event_ts = parsed_int
+            }
+          }
+        }
+      }
+      time_ms = to_unix_timestamp(event_ts, unit: "milliseconds")
+      time_dt = format_timestamp!(event_ts, "%Y-%m-%dT%H:%M:%S%.3fZ")
+
+      # Map dataset outcome to OCSF v1.3.0 severity_id / severity
+      severity_id = 1
+      severity = "Informational"
+      log_level = "info"
+
+      if dataset == "firewall_events" {
+        if waf_action == "block" || waf_action == "drop" || waf_action == "connection_close" || waf_action == "force_connection_close" {
+          severity_id = 4
+          severity = "High"
+          log_level = "error"
+        } else if waf_action == "challenge" || waf_action == "managed_challenge" || waf_action == "jschallenge" || waf_action == "log" {
+          severity_id = 3
+          severity = "Medium"
+          log_level = "warn"
+        }
+      } else if dataset == "http_requests" && edge_status != null {
+        if int!(edge_status) >= 500 {
+          severity_id = 4
+          severity = "High"
+          log_level = "error"
+        } else if int!(edge_status) >= 400 {
+          severity_id = 3
+          severity = "Medium"
+          log_level = "warn"
+        }
+      } else if dataset == "access_requests" && access_allowed == false {
+        severity_id = 4
+        severity = "High"
+        log_level = "error"
+      } else if dataset == "dns_logs" && response_code != null && int!(response_code) != 0 {
+        severity_id = 3
+        severity = "Medium"
+        log_level = "warn"
+      }
+
+      log_provider = "cloudflare-logpush"
+      host_label = if req_host != null {
+        string!(req_host)
+      } else if zone_name != null {
+        string!(zone_name)
+      } else if query_name != null {
+        string!(query_name)
+      } else {
+        "cloudflare-edge"
+      }
+      log_name = dataset + ":" + host_label
+
+      msg = if dataset == "firewall_events" {
+        act_s = if waf_action != null { string!(waf_action) } else { "event" }
+        src_s = if waf_source != null { string!(waf_source) } else { "waf" }
+        "cloudflare firewall " + act_s + " (" + src_s + ") on " + host_label
+      } else if dataset == "http_requests" {
+        m_s = if req_method != null { string!(req_method) } else { "HTTP" }
+        u_s = if req_uri != null { string!(req_uri) } else { "/" }
+        st_s = if edge_status != null { to_string(edge_status) } else { "-" }
+        "cloudflare http " + m_s + " " + host_label + u_s + " -> " + st_s
+      } else if dataset == "dns_logs" {
+        q_s = if query_name != null { string!(query_name) } else { "-" }
+        rc_s = if response_code != null { to_string(response_code) } else { "-" }
+        "cloudflare dns query " + q_s + " rcode=" + rc_s
+      } else if dataset == "access_requests" {
+        st_s = if access_allowed == false { "denied" } else { "allowed" }
+        "cloudflare access " + st_s + " on " + host_label
+      } else {
+        "cloudflare logpush " + dataset + " on " + host_label
+      }
+
+      dev = {
+        "type_id": 99,
+        "type": "Other",
+        "hostname": host_label
+      }
+      if colo_code != null { dev.uid = colo_code }
+
+      usr = {}
+      if user_email != null { usr.name = user_email }
+      act = {}
+      if length(usr) > 0 { act.user = usr }
+
+      meta = {
+        "version": "1.3.0",
+        "product": {
+          "name": "Vector",
+          "vendor_name": "Datadog"
+        },
+        "logged_time": logged_ms,
+        "log_provider": log_provider,
+        "log_name": log_name,
+        "log_level": log_level
+      }
+      if ray_id != null {
+        meta.original_event_uid = ray_id
+        meta.correlation_uid = ray_id
+      }
+      if orig_time_str != null { meta.original_time = orig_time_str }
+
+      unmapped = {
+        "cloudflare_dataset": dataset
+      }
+      if ray_id != null { unmapped.ray_id = ray_id }
+      if client_ip != null { unmapped.client_ip = client_ip }
+      if client_country != null { unmapped.client_country = client_country }
+      if client_asn != null { unmapped.client_asn = client_asn }
+      if req_host != null { unmapped.request_host = req_host }
+      if req_method != null { unmapped.request_method = req_method }
+      if req_uri != null { unmapped.request_uri = req_uri }
+      if edge_status != null { unmapped.edge_status = edge_status }
+      if origin_status != null { unmapped.origin_status = origin_status }
+      if cache_status != null { unmapped.cache_status = cache_status }
+      if colo_code != null { unmapped.colo_code = colo_code }
+      if zone_name != null { unmapped.zone_name = zone_name }
+      if waf_action != null { unmapped.waf_action = waf_action }
+      if waf_rule_id != null { unmapped.waf_rule_id = waf_rule_id }
+      if waf_source != null { unmapped.waf_source = waf_source }
+      if query_name != null { unmapped.query_name = query_name }
+      if response_code != null { unmapped.response_code = response_code }
+      if access_allowed != null { unmapped.access_allowed = access_allowed }
+      if access_app_uid != null { unmapped.access_app_uid = access_app_uid }
+
+      out = {
+        "category_uid": 1,
+        "category_name": "System Activity",
+        "class_uid": 1008,
+        "class_name": "Event Log Activity",
+        "type_uid": 100899,
+        "type_name": "Event Log Activity: Other",
+        "activity_id": 99,
+        "activity_name": "Other",
+        "severity_id": severity_id,
+        "severity": severity,
+        "time": time_ms,
+        "time_dt": time_dt,
+        "message": msg,
+        "log_name": log_name,
+        "log_provider": log_provider,
+        "metadata": meta,
+        "device": dev,
+        "unmapped": unmapped
+      }
+      if length(act) > 0 { out.actor = act }
+
+      . = out
+
+sinks:
+  basin_http:
+    type: http
+    inputs:
+      - ocsf_cloudflare_logpush
+    uri: "${OOF_BASIN_ENDPOINT}"
+    method: post
+    compression: gzip
+    tls:
+      verify_certificate: true
+      verify_hostname: true
+    encoding:
+      codec: json
+    auth:
+      strategy: bearer
+      token: "${OOF_INGEST_TOKEN}"
+    batch:
+      max_events: 500
+      max_bytes: 5000000
+      timeout_secs: 5
+    buffer:
+      type: disk
+      max_size: 268435488
+      when_full: block
+    request:
+      retry_attempts: 5
+      retry_initial_backoff_secs: 1
+      retry_max_duration_secs: 30
+
+tests:
+  - name: ocsf_cloudflare_logpush_http_5xx
+    inputs:
+      - insert_at: ocsf_cloudflare_logpush
+        type: log
+        log_fields:
+          RayID: "8a1b2c3d4e5f6789"
+          ClientIP: "198.51.100.42"
+          ClientCountry: "jp"
+          ClientASN: 64512
+          ClientRequestHost: "api.example.com"
+          ClientRequestMethod: "POST"
+          ClientRequestURI: "/v1/orders"
+          EdgeResponseStatus: 502
+          OriginResponseStatus: 502
+          CacheCacheStatus: "bypass"
+          EdgeColoCode: "NRT"
+          EdgeStartTimestamp: "2026-03-01T10:15:30.123Z"
+    outputs:
+      - extract_from: ocsf_cloudflare_logpush
+        conditions:
+          - type: vrl
+            source: |
+              .category_uid == 1 &&
+              .class_uid == 1008 &&
+              .activity_id == 99 &&
+              .type_uid == 100899 &&
+              .severity_id == 4 &&
+              .severity == "High" &&
+              .log_provider == "cloudflare-logpush" &&
+              .log_name == "http_requests:api.example.com" &&
+              .metadata.original_event_uid == "8a1b2c3d4e5f6789" &&
+              .metadata.correlation_uid == "8a1b2c3d4e5f6789" &&
+              .device.hostname == "api.example.com" &&
+              .device.uid == "NRT" &&
+              .unmapped.cloudflare_dataset == "http_requests" &&
+              .unmapped.edge_status == 502 &&
+              .unmapped.cache_status == "bypass"
+
+  - name: ocsf_cloudflare_logpush_firewall_block
+    inputs:
+      - insert_at: ocsf_cloudflare_logpush
+        type: log
+        log_fields:
+          RayID: "9b2c3d4e5f678901"
+          Action: "block"
+          RuleID: "cf-waf-sqli-001"
+          Source: "firewallManaged"
+          ClientIP: "203.0.113.99"
+          ClientRequestHost: "app.example.com"
+          ClientRequestURI: "/login?id=1%20OR%201=1"
+          Datetime: "2026-03-01T10:20:00Z"
+    outputs:
+      - extract_from: ocsf_cloudflare_logpush
+        conditions:
+          - type: vrl
+            source: |
+              .severity_id == 4 &&
+              .severity == "High" &&
+              .log_name == "firewall_events:app.example.com" &&
+              .unmapped.cloudflare_dataset == "firewall_events" &&
+              .unmapped.waf_action == "block" &&
+              .unmapped.waf_rule_id == "cf-waf-sqli-001" &&
+              .unmapped.waf_source == "firewallManaged"
+
+  - name: ocsf_cloudflare_logpush_access_denied
+    inputs:
+      - insert_at: ocsf_cloudflare_logpush
+        type: log
+        log_fields:
+          AppUID: "app-zero-trust-01"
+          Allowed: false
+          UserEmail: "intruder@example.org"
+          ClientRequestHost: "admin.example.com"
+          CreatedAt: "2026-03-01T10:25:00Z"
+    outputs:
+      - extract_from: ocsf_cloudflare_logpush
+        conditions:
+          - type: vrl
+            source: |
+              .severity_id == 4 &&
+              .severity == "High" &&
+              .actor.user.name == "intruder@example.org" &&
+              .unmapped.cloudflare_dataset == "access_requests" &&
+              .unmapped.access_allowed == false
+
+  - name: ocsf_cloudflare_logpush_unixnano_timestamp
+    inputs:
+      - insert_at: ocsf_cloudflare_logpush
+        type: log
+        log_fields:
+          RayID: "1122334455667788"
+          ClientRequestHost: "cdn.example.com"
+          ClientRequestMethod: "GET"
+          ClientRequestURI: "/static/app.js"
+          EdgeResponseStatus: 200
+          CacheCacheStatus: "hit"
+          EdgeStartTimestamp: 1772360130123000000
+    outputs:
+      - extract_from: ocsf_cloudflare_logpush
+        conditions:
+          - type: vrl
+            source: |
+              .severity_id == 1 &&
+              .severity == "Informational" &&
+              .time == 1772360130123 &&
+              .unmapped.cache_status == "hit"
