@@ -2,8 +2,8 @@
 -- Target Iceberg table: ai.genai_usage (metadata-only, capture_content = none)
 
 -- 1. Daily token usage and estimated cost by coding agent and model
--- Note: Codex emits both codex.api_request (HTTP request/latency) and codex.sse_event (stream usage).
--- Conditional aggregation prevents double-counting requests and mixing stream/HTTP latencies.
+-- Note: Codex emits codex.api_request (HTTP) or codex.websocket_request (WebSocket) alongside codex.sse_event / codex.websocket_event (stream usage).
+-- Conditional aggregation prevents double-counting requests and separates HTTP request latency from WebSocket send latency.
 SELECT
   DATE_TRUNC('day', time_dt) AS day,
   service.name AS agent,
@@ -15,6 +15,7 @@ SELECT
         'claude_code.api_request',
         'claude_code.api_error',
         'codex.api_request',
+        'codex.websocket_request',
         'pi.assistant_message',
         'antigravity.planner_response'
       )
@@ -46,7 +47,16 @@ SELECT
       END
     ),
     1
-  ) AS avg_duration_ms
+  ) AS avg_duration_ms,
+  ROUND(
+    AVG(
+      CASE
+        WHEN event_name = 'codex.websocket_request' THEN duration_ms
+        ELSE NULL
+      END
+    ),
+    1
+  ) AS avg_ws_send_duration_ms
 FROM ai.genai_usage
 WHERE operation_name IN ('chat', 'invoke_agent')
 GROUP BY 1, 2, 3, 4
