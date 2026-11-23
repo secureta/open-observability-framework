@@ -323,9 +323,20 @@ local function read_first_line(path)
   return line
 end
 
--- Collector host's own hostname (same source as gethostname(2) used by Vector `get_hostname()`).
-local COLLECTOR_HOSTNAME = read_first_line("/proc/sys/kernel/hostname")
-  or read_first_line("/etc/hostname")
+-- Collector host's own hostname (same source as gethostname(2) used by Vector `get_hostname()`),
+-- re-read at most once per second so a live host rename is picked up without a restart.
+local collector_hostname_cache = nil
+local collector_hostname_read_at = nil
+
+local function collector_hostname()
+  local now = os.time()
+  if collector_hostname_read_at ~= now then
+    collector_hostname_cache = read_first_line("/proc/sys/kernel/hostname")
+      or read_first_line("/etc/hostname")
+    collector_hostname_read_at = now
+  end
+  return collector_hostname_cache
+end
 
 local function transform_journald(ts, record)
   local rec = type(record) == "table" and record or {}
@@ -559,7 +570,8 @@ local function transform_otlp(ts, group, metadata, record)
     type_id = 0,
     type = "Unknown",
   }
-  if COLLECTOR_HOSTNAME ~= nil then dev.hostname = COLLECTOR_HOSTNAME end
+  local hostname = collector_hostname()
+  if hostname ~= nil then dev.hostname = hostname end
 
   local unmapped_attrs = {}
   for k, v in pairs(attrs) do
