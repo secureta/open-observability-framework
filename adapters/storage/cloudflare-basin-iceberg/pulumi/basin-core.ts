@@ -87,10 +87,14 @@ export const PIPELINE_NAME_RE = /^[A-Za-z0-9_]+$/;
 export function resolveDefaultRepoPaths(fromDir: string): {
   schemaFile: string;
   pipelineSqlFile: string;
+  aiSchemaFile: string;
+  aiPipelineSqlFile: string;
 } {
   return {
     schemaFile: path.resolve(fromDir, "../../../../contracts/ocsf/event-log-activity.basin.json"),
     pipelineSqlFile: path.resolve(fromDir, "../pipeline.sql"),
+    aiSchemaFile: path.resolve(fromDir, "../../../../contracts/otel-genai/genai-usage.basin.json"),
+    aiPipelineSqlFile: path.resolve(fromDir, "../pipeline_ai_usage.sql"),
   };
 }
 
