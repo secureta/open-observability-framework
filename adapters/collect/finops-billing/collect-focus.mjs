@@ -72,8 +72,12 @@ function toFiniteNumber(val, fallback = 0) {
   return fallback;
 }
 
-function roundCost(val) {
-  return Math.round(toFiniteNumber(val, 0) * 1e6) / 1e6;
+function normalizeNumericValue(val) {
+  const n = toFiniteNumber(val, 0);
+  if (n === 0) return 0;
+  // Preserve up to 12 significant digits to eliminate IEEE-754 binary noise
+  // without truncating small FOCUS monetary products (e.g. 1e-6 * 0.36 = 3.6e-7).
+  return Number(n.toPrecision(12));
 }
 
 function validateUrl(rawUrl, label, allowInsecureHttp = false) {
@@ -121,7 +125,7 @@ export function resolveUtcDayWindow(dateInput, nowDate = new Date()) {
 
 export function buildFocusRecord(input) {
   const record = {
-    BilledCost: roundCost(input.BilledCost),
+    BilledCost: normalizeNumericValue(input.BilledCost),
     BillingAccountId: cleanNonEmptyString(input.BillingAccountId) || "unknown",
     BillingCurrency: cleanNonEmptyString(input.BillingCurrency) || "USD",
     BillingPeriodEnd: cleanNonEmptyString(input.BillingPeriodEnd),
@@ -130,8 +134,8 @@ export function buildFocusRecord(input) {
     ChargeDescription: cleanNonEmptyString(input.ChargeDescription) || "Cloud usage charge",
     ChargePeriodEnd: cleanNonEmptyString(input.ChargePeriodEnd),
     ChargePeriodStart: cleanNonEmptyString(input.ChargePeriodStart),
-    ContractedCost: roundCost(input.ContractedCost ?? input.ListCost ?? input.BilledCost),
-    EffectiveCost: roundCost(input.EffectiveCost ?? input.BilledCost),
+    ContractedCost: normalizeNumericValue(input.ContractedCost ?? input.ListCost ?? input.BilledCost),
+    EffectiveCost: normalizeNumericValue(input.EffectiveCost ?? input.BilledCost),
     InvoiceIssuerName: cleanNonEmptyString(input.InvoiceIssuerName) || cleanNonEmptyString(input.ProviderName) || "Unknown",
     ProviderName: cleanNonEmptyString(input.ProviderName) || "Unknown",
     PublisherName: cleanNonEmptyString(input.PublisherName) || cleanNonEmptyString(input.ProviderName) || "Unknown",
@@ -177,7 +181,7 @@ export function buildFocusRecord(input) {
   for (const key of optionalNumbers) {
     if (input[key] !== undefined && input[key] !== null) {
       const n = toFiniteNumber(input[key], NaN);
-      if (Number.isFinite(n)) record[key] = roundCost(n);
+      if (Number.isFinite(n)) record[key] = normalizeNumericValue(n);
     }
   }
 
@@ -231,8 +235,9 @@ export function normalizeCloudflareAnalyticsToFocus(
 
   for (const [bucket, totalBytes] of storageByBucket.entries()) {
     const gb = totalBytes / 1e9;
-    const gbMonthDaily = gb / effectivePricing.daysPerBillingMonth;
-    const listEstimate = gbMonthDaily * effectivePricing.r2StoragePerGbMonth;
+    const pricingQuantity = normalizeNumericValue(gb / effectivePricing.daysPerBillingMonth);
+    const unitPrice = normalizeNumericValue(effectivePricing.r2StoragePerGbMonth);
+    const listEstimate = normalizeNumericValue(pricingQuantity * unitPrice);
     records.push(
       buildFocusRecord({
         BillingAccountId: accountId,
@@ -255,13 +260,13 @@ export function normalizeCloudflareAnalyticsToFocus(
         ResourceType: "R2 Bucket",
         SkuId: "r2_storage_standard",
         PricingCategory: "Standard",
-        ConsumedQuantity: gbMonthDaily,
+        ConsumedQuantity: pricingQuantity,
         ConsumedUnit: "GB-Month",
-        PricingQuantity: gbMonthDaily,
+        PricingQuantity: pricingQuantity,
         PricingUnit: "GB-Month",
-        ListUnitPrice: effectivePricing.r2StoragePerGbMonth,
+        ListUnitPrice: unitPrice,
         ListCost: listEstimate,
-        ContractedUnitPrice: effectivePricing.r2StoragePerGbMonth,
+        ContractedUnitPrice: unitPrice,
         ContractedCost: listEstimate,
         // Analytics data does not reflect account-wide monthly free allowances or invoices.
         BilledCost: 0,
@@ -313,8 +318,9 @@ export function normalizeCloudflareAnalyticsToFocus(
       descLabel = "free";
     }
 
-    const millionOps = requests / 1e6;
-    const listEstimate = millionOps * unitPricePerMillion;
+    const millionOps = normalizeNumericValue(requests / 1e6);
+    const publishedUnitPrice = normalizeNumericValue(unitPricePerMillion);
+    const listEstimate = normalizeNumericValue(millionOps * publishedUnitPrice);
 
     records.push(
       buildFocusRecord({
@@ -342,9 +348,9 @@ export function normalizeCloudflareAnalyticsToFocus(
         ConsumedUnit: "Requests",
         PricingQuantity: millionOps,
         PricingUnit: "1M Requests",
-        ListUnitPrice: unitPricePerMillion,
+        ListUnitPrice: publishedUnitPrice,
         ListCost: listEstimate,
-        ContractedUnitPrice: unitPricePerMillion,
+        ContractedUnitPrice: publishedUnitPrice,
         ContractedCost: listEstimate,
         BilledCost: 0,
         EffectiveCost: 0,
