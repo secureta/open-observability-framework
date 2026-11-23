@@ -23,6 +23,7 @@ Build observability platforms by composing standard open-source collectors and s
    - **Ingest (`ingest`)**: Use `direct-basin-http` with `auth: basin-api-token` (Cloudflare Account API Token with `Pipelines Send` / `Basin Pipelines Send`, native Basin HTTP endpoint with `http.enabled = true` and `http.authentication = true`).
    - **Storage (`storage`)**: Use `cloudflare-basin-iceberg` (Apache Iceberg tables on Cloudflare R2 provisioned declaratively via [terraform/main.tf](../../adapters/storage/cloudflare-basin-iceberg/terraform/main.tf) or [pulumi/index.ts](../../adapters/storage/cloudflare-basin-iceberg/pulumi/index.ts), inspected via Cloudflare's unified `cf` CLI).
    - **APM (`apm`)**: Set `apm.enabled: true` and enable trace/metric exporters in `otelcol.yaml` when correlating application spans/metrics alongside OCSF logs via `metadata.correlation_uid` (`trace_id`).
+   - **AI (`ai`, optional)**: Set `ai.enabled: true` with `schema_profile: otel-genai` and `capture_content: none` to record metadata-only coding-agent usage (Claude Code, Codex CLI, Antigravity/herdr, Pi) via `vector-ai-coding-agents` into `ai.genai_usage` ([cloudflare-basin-ai-coding-agents.yaml](../../manifest/examples/cloudflare-basin-ai-coding-agents.yaml)).
    - **Query (`query`)**: Combine `basin-sql` (serverless Cloudflare SQL) with external Iceberg engines like `duckdb`, `pyiceberg`, or Spark.
 
 3. **Validate contracts and wiring**

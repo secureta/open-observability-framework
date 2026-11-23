@@ -73,3 +73,33 @@ output "focus_pipeline_id" {
   description = "Provisioned FOCUS v1.0 Basin SQL pipeline ID (null when enable_finops = false)."
   value       = var.enable_finops ? cloudflare_pipeline.focus[0].id : null
 }
+
+output "ai_stream_id" {
+  description = "Provisioned Basin HTTP stream ID for AI usage telemetry (null when enable_ai_usage = false)."
+  value       = var.enable_ai_usage ? restful_resource.ai_usage_stream[0].output.id : null
+}
+
+output "ai_stream_name" {
+  description = "Provisioned Basin HTTP stream SQL identifier for AI usage telemetry (null when enable_ai_usage = false)."
+  value       = var.enable_ai_usage ? restful_resource.ai_usage_stream[0].output.name : null
+}
+
+output "ai_stream_endpoint" {
+  description = "Authenticated Basin HTTPS ingest URL for AI usage telemetry (use for Vector OOF_AI_BASIN_ENDPOINT)."
+  value       = var.enable_ai_usage ? restful_resource.ai_usage_stream[0].output.endpoint : null
+}
+
+output "ai_stream_host" {
+  description = "Hostname portion of ai_stream_endpoint (null when enable_ai_usage = false)."
+  value       = var.enable_ai_usage ? regex("^https?://([^/]+)", restful_resource.ai_usage_stream[0].output.endpoint)[0] : null
+}
+
+output "ai_sink_id" {
+  description = "Provisioned Basin R2 Data Catalog sink ID for AI usage telemetry (null when enable_ai_usage = false)."
+  value       = var.enable_ai_usage ? cloudflare_pipeline_sink.ai_usage[0].id : null
+}
+
+output "ai_pipeline_id" {
+  description = "Provisioned Basin SQL pipeline ID for AI usage telemetry (null when enable_ai_usage = false)."
+  value       = var.enable_ai_usage ? cloudflare_pipeline.ai_usage[0].id : null
+}

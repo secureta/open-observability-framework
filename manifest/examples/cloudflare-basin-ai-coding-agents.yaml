@@ -1,0 +1,68 @@
+version: "0.1"
+platform_name: cloudflare-basin-ai-coding-agents
+
+schema:
+  profile: ocsf
+  version: "1.3.0"
+  class_uid: 1008
+  contract_path: contracts/ocsf/event-log-activity.basin.json
+
+collect:
+  adapter: vector-journald
+  sources:
+    - systemd-journald
+    - otlp-logs
+  options:
+    config_path: adapters/collect/vector-journald/vector.yaml
+    ai_collector_adapter: vector-ai-coding-agents
+    ai_collector_config_path: adapters/collect/vector-ai-coding-agents/vector.yaml
+
+detect:
+  enabled: false
+
+ingest:
+  adapter: direct-basin-http
+  endpoint: https://<STREAM_ID>.ingest.cloudflare.com
+  auth: basin-api-token
+
+storage:
+  adapter: cloudflare-basin-iceberg
+  format: iceberg
+  catalog: basin-catalog
+  bucket: oof-telemetry
+  namespace: siem
+  tables:
+    logs_table: ocsf_event_log_activity
+    ai_usage_table: genai_usage
+  options:
+    pipeline_sql_path: adapters/storage/cloudflare-basin-iceberg/pipeline.sql
+    ai_namespace: ai
+    ai_pipeline_sql_path: adapters/storage/cloudflare-basin-iceberg/pipeline_ai_usage.sql
+    terraform_dir: adapters/storage/cloudflare-basin-iceberg/terraform
+    pulumi_dir: adapters/storage/cloudflare-basin-iceberg/pulumi
+
+apm:
+  enabled: false
+  traces_adapter: otlp-basin-iceberg
+  metrics_adapter: otlp-prometheus-remote-write
+
+ai:
+  enabled: true
+  schema_profile: otel-genai
+  capture_content: none
+  contract_path: contracts/otel-genai/genai-usage.basin.json
+  collector_adapter: vector-ai-coding-agents
+  sources:
+    - claude-code-otlp
+    - codex-cli-otlp
+    - antigravity-transcript
+    - herdr-session
+    - pi-session
+  options:
+    config_path: adapters/collect/vector-ai-coding-agents/vector.yaml
+    queries_path: adapters/storage/cloudflare-basin-iceberg/queries/ai_coding_agents.sql
+
+query:
+  adapters:
+    - basin-sql
+    - duckdb
