@@ -265,6 +265,52 @@ test("Cloudflare Audit Logs poller: multi-page burst pagination, checkpoint pres
     const ids2 = new Set(receivedEvents.map((e) => e.metadata.original_event_uid));
     assert.ok(ids2.has("audit-boundary"));
     assert.ok(ids2.has("audit-006"));
+
+    // 4. High-volume burst (>2,000 events) inside the 5s overlap window across multiple pages:
+    //    every overlap ID must be retained regardless of count so the next poll ships zero duplicates,
+    //    and expired IDs outside the next overlap window are pruned.
+    for (let i = 0; i < 2050; i += 1) {
+      allRecords.push({
+        id: `burst-${i}`,
+        when: "2026-03-01T12:03:57.000Z",
+        interface: "API",
+        action: { type: "rec_add", result: true },
+        actor: { id: "u1", email: "alice@example.com", type: "user" },
+        owner: { id: accountId },
+        resource: { id: `rb-${i}`, type: "DNS_record" },
+      });
+    }
+    const resBurst = await mod.pollOnce({
+      accountId,
+      apiToken: cfToken,
+      basinEndpoint: `http://127.0.0.1:${basinPort}/ingest`,
+      ingestToken: basinToken,
+      checkpointPath,
+      apiBaseUrl: `http://127.0.0.1:${cfPort}/client/v4`,
+      perPage: 1000,
+      nowMs: Date.parse("2026-03-01T12:04:00.000Z"),
+    });
+    assert.equal(resBurst.pagesFetched, 3);
+    assert.equal(resBurst.shipped, 2050);
+
+    const cpAfterBurst = mod.loadCheckpoint(checkpointPath);
+    assert.equal(cpAfterBurst.recentEntries.length, 2050, "All 2050 overlap-window IDs must be retained without 2000-item cap");
+
+    // Next poll at 12:05:00Z overlaps back to 12:03:55Z (which includes all 2050 burst records at 12:03:57Z)
+    const resAfterBurst = await mod.pollOnce({
+      accountId,
+      apiToken: cfToken,
+      basinEndpoint: `http://127.0.0.1:${basinPort}/ingest`,
+      ingestToken: basinToken,
+      checkpointPath,
+      apiBaseUrl: `http://127.0.0.1:${cfPort}/client/v4`,
+      perPage: 1000,
+      nowMs: Date.parse("2026-03-01T12:05:00.000Z"),
+    });
+    assert.equal(resAfterBurst.shipped, 0, "Zero duplicates must be re-uploaded from the 2050-event overlap burst");
+
+    const cpAfterExpire = mod.loadCheckpoint(checkpointPath);
+    assert.equal(cpAfterExpire.recentEntries.length, 0, "IDs older than the next overlap window must be expired");
   } finally {
     await new Promise((resolve) => cfServer.close(resolve));
     await new Promise((resolve) => basinServer.close(resolve));

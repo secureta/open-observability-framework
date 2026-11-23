@@ -10,7 +10,6 @@ const DEFAULT_LOOKBACK_SECS = 300;
 const DEFAULT_OVERLAP_MS = 5000;
 const DEFAULT_BATCH_SIZE = 500;
 const MAX_RFC3339_MS = 253402300799999;
-const MAX_RECENT_IDS = 2000;
 const ACCOUNT_ID_RE = /^[a-fA-F0-9]{32}$/;
 
 function cleanNonEmptyString(val) {
@@ -161,13 +160,27 @@ export function normalizeAuditLogToOcsf(entry, { nowMs = Date.now() } = {}) {
 
 export function loadCheckpoint(checkpointPath) {
   if (!checkpointPath || !fs.existsSync(checkpointPath)) {
-    return { lastBefore: null, initialSince: null, recentIds: [] };
+    return { lastBefore: null, initialSince: null, recentEntries: [] };
   }
   const raw = JSON.parse(fs.readFileSync(checkpointPath, "utf8"));
+  const recentEntries = [];
+  if (Array.isArray(raw.recentEntries)) {
+    for (const item of raw.recentEntries) {
+      if (item && typeof item.id === "string" && typeof item.timeMs === "number" && Number.isFinite(item.timeMs)) {
+        recentEntries.push({ id: item.id, timeMs: item.timeMs });
+      }
+    }
+  } else if (Array.isArray(raw.recentIds)) {
+    // Backward compatibility with legacy id-only checkpoints
+    const fallbackMs = typeof raw.lastBefore === "string" ? Date.parse(raw.lastBefore) || 0 : 0;
+    for (const id of raw.recentIds) {
+      if (typeof id === "string") recentEntries.push({ id, timeMs: fallbackMs });
+    }
+  }
   return {
     lastBefore: typeof raw.lastBefore === "string" ? raw.lastBefore : null,
     initialSince: typeof raw.initialSince === "string" ? raw.initialSince : null,
-    recentIds: Array.isArray(raw.recentIds) ? raw.recentIds.filter((x) => typeof x === "string") : [],
+    recentEntries,
   };
 }
 
@@ -175,14 +188,14 @@ export function saveCheckpoint(checkpointPath, state) {
   if (!checkpointPath) return;
   fs.mkdirSync(path.dirname(checkpointPath), { recursive: true });
   const tmpPath = `${checkpointPath}.tmp.${process.pid}.${Date.now()}`;
-  const trimmedIds = Array.isArray(state.recentIds) ? state.recentIds.slice(-MAX_RECENT_IDS) : [];
+  const entries = Array.isArray(state.recentEntries) ? state.recentEntries : [];
   fs.writeFileSync(
     tmpPath,
     JSON.stringify(
       {
         lastBefore: state.lastBefore ?? null,
         initialSince: state.initialSince ?? null,
-        recentIds: trimmedIds,
+        recentEntries: entries,
       },
       null,
       2
@@ -281,12 +294,14 @@ export async function pollOnce(options) {
     saveCheckpoint(checkpointPath, {
       lastBefore: null,
       initialSince: sinceIso,
-      recentIds: checkpoint.recentIds,
+      recentEntries: checkpoint.recentEntries,
     });
   }
 
-  const seenIds = new Set(checkpoint.recentIds);
-  const newIds = [...checkpoint.recentIds];
+  const seenMap = new Map();
+  for (const item of checkpoint.recentEntries) {
+    seenMap.set(item.id, item.timeMs);
+  }
 
   const base = apiBaseUrl.replace(/\/+$/, "");
   const collected = [];
@@ -321,15 +336,14 @@ export async function pollOnce(options) {
     const pageRows = res.json.result;
     for (const row of pageRows) {
       const id = cleanNonEmptyString(row?.id);
-      if (id && seenIds.has(id)) {
+      if (id && seenMap.has(id)) {
         continue;
       }
       const ocsf = normalizeAuditLogToOcsf(row, { nowMs });
       if (ocsf) {
         collected.push(ocsf);
         if (id) {
-          seenIds.add(id);
-          newIds.push(id);
+          seenMap.set(id, ocsf.time);
         }
       }
     }
@@ -355,11 +369,21 @@ export async function pollOnce(options) {
     fetchImpl,
   });
 
+  // Retain every shipped ID whose event timestamp falls inside the next overlap window
+  // (no fixed count cap), and expire IDs strictly older than the next overlap lower bound.
+  const nextOverlapFloorMs = Math.max(1, nowMs - safeOverlapMs);
+  const retainedEntries = [];
+  for (const [id, timeMs] of seenMap.entries()) {
+    if (timeMs >= nextOverlapFloorMs) {
+      retainedEntries.push({ id, timeMs });
+    }
+  }
+
   // Advance checkpoint ONLY after all pages have been fetched and shipped to Basin.
   saveCheckpoint(checkpointPath, {
     lastBefore: beforeIso,
     initialSince: null,
-    recentIds: newIds,
+    recentEntries: retainedEntries,
   });
 
   return { since: sinceIso, before: beforeIso, pagesFetched: page, shipped };
