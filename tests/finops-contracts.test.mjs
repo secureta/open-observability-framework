@@ -359,6 +359,36 @@ test("Cloudflare and GitHub FOCUS normalizers classify R2 free/unknown ops safel
   assert.equal(deduped.find((r) => r.Tags.dataset === "cloudflare_r2").ListCost, 0.03);
   assert.equal(deduped.filter((r) => r.Tags.dataset === "cloudflare_pipelines").length, 1);
 
+  // Regression: single R2 Class B request preserves full ContractedCost = ContractedUnitPrice * PricingQuantity precision
+  const singleReq = normalizeCloudflareAnalyticsToFocus(
+    {
+      data: {
+        viewer: {
+          accounts: [
+            {
+              r2StorageAdaptiveGroups: [],
+              r2OperationsAdaptiveGroups: [
+                { dimensions: { bucketName: "oof-telemetry", actionType: "GetObject" }, sum: { requests: 1 } },
+              ],
+            },
+          ],
+        },
+      },
+    },
+    {
+      accountId: "0123456789abcdef0123456789abcdef",
+      window,
+      pricing: DEFAULT_CLOUDFLARE_PRICING,
+      snapshotTsMs,
+    }
+  );
+  assert.equal(singleReq.length, 1);
+  assertFocusRecordMatchesSchema(singleReq[0], schema.fields);
+  assert.equal(singleReq[0].PricingQuantity, 0.000001);
+  assert.equal(singleReq[0].ContractedUnitPrice, 0.36);
+  assert.equal(singleReq[0].ContractedCost, 0.00000036);
+  assert.equal(singleReq[0].ListCost, 0.00000036);
+
   const ghRecords = normalizeGitHubBillingUsageToFocus(
     {
       usageItems: [
