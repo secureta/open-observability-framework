@@ -49,13 +49,16 @@ To opt into capturing prompts and assistant text replies inside `attributes.prom
 | `full` | Captures unredacted text (truncated at 8,192 characters). |
 
 When enabling `redacted` or `full`, also opt in on OTLP agents if desired:
-- **Claude Code**: `export OTEL_LOG_USER_PROMPTS=1`
-- **Codex CLI**: set `log_user_prompt = true` under `[otel]` in `~/.codex/config.toml`
+- **Claude Code**: `export OTEL_LOG_USER_PROMPTS=1` (and enable assistant response logging if supported by your Claude Code version)
+- **Codex CLI**: set `log_user_prompt = true` (and `log_agent_responses = true` for assistant replies) under `[otel]` in `~/.codex/config.toml`
 - **Antigravity / Pi**: no extra agent config required (Vector reads prompts/replies directly from local JSONL).
 
 ```bash
 export OOF_AI_CAPTURE_CONTENT=redacted
 ```
+
+## Security Note (Shared Hosts)
+The default loopback OTLP listener (`127.0.0.1:4327`/`4328`) is unauthenticated and intended for single-user developer workstations. On shared/multi-tenant hosts, run Vector inside an isolated per-user network namespace or front it with an authenticated mTLS/token proxy so other local accounts cannot inject forged usage telemetry.
 
 ## Running & Validating Locally
 

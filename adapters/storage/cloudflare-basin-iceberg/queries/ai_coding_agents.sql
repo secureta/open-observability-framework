@@ -2,12 +2,27 @@
 -- Target Iceberg table: ai.genai_usage (metadata-only, capture_content = none)
 
 -- 1. Daily token usage and estimated cost by coding agent and model
+-- Note: Codex emits both codex.api_request (HTTP request/latency) and codex.sse_event (stream usage).
+-- Conditional aggregation prevents double-counting requests and mixing stream/HTTP latencies.
 SELECT
   DATE_TRUNC('day', time_dt) AS day,
   service.name AS agent,
   gen_ai.provider_name AS provider,
   COALESCE(gen_ai.response_model, gen_ai.request_model) AS model,
-  COUNT(*) AS requests,
+  SUM(
+    CASE
+      WHEN event_name IN (
+        'claude_code.api_request',
+        'claude_code.api_error',
+        'codex.api_request',
+        'pi.assistant_message',
+        'antigravity.planner_response'
+      )
+      OR (service.name NOT IN ('claude-code', 'codex-cli', 'pi', 'antigravity') AND operation_name = 'chat')
+      THEN 1
+      ELSE 0
+    END
+  ) AS requests,
   SUM(COALESCE(gen_ai.usage.input_tokens, 0)) AS input_tokens,
   SUM(COALESCE(gen_ai.usage.output_tokens, 0)) AS output_tokens,
   SUM(COALESCE(gen_ai.usage.cache_read_tokens, 0)) AS cache_read_tokens,
@@ -15,7 +30,23 @@ SELECT
   SUM(COALESCE(gen_ai.usage.reasoning_tokens, 0)) AS reasoning_tokens,
   SUM(COALESCE(gen_ai.usage.total_tokens, 0)) AS total_tokens,
   ROUND(SUM(COALESCE(gen_ai.usage.cost_usd, 0.0)), 4) AS total_cost_usd,
-  ROUND(AVG(duration_ms), 1) AS avg_duration_ms
+  ROUND(
+    AVG(
+      CASE
+        WHEN event_name IN (
+          'claude_code.api_request',
+          'claude_code.api_error',
+          'codex.api_request',
+          'pi.assistant_message',
+          'antigravity.planner_response'
+        )
+        OR (service.name NOT IN ('claude-code', 'codex-cli', 'pi', 'antigravity') AND operation_name = 'chat')
+        THEN duration_ms
+        ELSE NULL
+      END
+    ),
+    1
+  ) AS avg_duration_ms
 FROM ai.genai_usage
 WHERE operation_name IN ('chat', 'invoke_agent')
 GROUP BY 1, 2, 3, 4
@@ -23,6 +54,8 @@ ORDER BY day DESC, total_tokens DESC
 LIMIT 200;
 
 -- 2. Tool execution volume, failure rate, and latency by agent & tool name
+-- Uses actual tool execution result rows (excludes tool_decision approval events).
+-- For Antigravity multi-tool steps, gen_ai.tool_name holds the primary tool and attributes.tool_names holds the full list.
 SELECT
   service.name AS agent,
   gen_ai.tool_name AS tool_name,
@@ -32,6 +65,7 @@ SELECT
   ROUND(AVG(duration_ms), 1) AS avg_duration_ms
 FROM ai.genai_usage
 WHERE operation_name = 'execute_tool'
+  AND event_name NOT IN ('codex.tool_decision', 'claude_code.tool_decision')
   AND gen_ai.tool_name IS NOT NULL
 GROUP BY 1, 2
 ORDER BY total_calls DESC

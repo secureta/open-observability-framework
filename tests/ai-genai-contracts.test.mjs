@@ -197,6 +197,31 @@ tests:
               assert!(contains(p, "[REDACTED_SECRET]"))
               assert!(!contains(p, "alice@example.com"))
               assert!(!contains(p, "ghp_1234567890abcdefghij1234"))
+
+  - name: redacted_mode_captures_codex_agent_response
+    inputs:
+      - insert_at: genai_otlp_logs
+        type: log
+        log_fields:
+          timestamp: "2026-11-23T03:11:00Z"
+          resources:
+            service.name: "codex-cli"
+          attributes:
+            event.name: "codex.agent_response"
+            conversation.id: "conv-redact-1"
+            response: "Done! Contact bob@example.com with Bearer topSecretToken999"
+    outputs:
+      - extract_from: genai_content_policy
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.operation_name, "chat")
+              assert_eq!(.attributes.capture_content, "redacted")
+              c = string!(.attributes.completion)
+              assert!(contains(c, "[REDACTED_EMAIL]"))
+              assert!(contains(c, "Bearer [REDACTED]"))
+              assert!(!contains(c, "bob@example.com"))
+              assert!(!contains(c, "topSecretToken999"))
 `;
     const redactedCfgPath = path.join(tmpDir, "vector-redacted-test.yaml");
     fs.writeFileSync(redactedCfgPath, redactedTestConfig, "utf8");
