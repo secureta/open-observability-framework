@@ -207,3 +207,76 @@ variable "logpush_jobs" {
     error_message = "Each logpush_jobs entry must specify scope ('zone' or 'account'), a 32-hex zone_id iff scope == 'zone', frequency ('high' or 'low'), non-empty dataset, and non-empty destination_conf."
   }
 }
+
+variable "enable_ai_usage" {
+  type        = bool
+  default     = false
+  description = "Provision an additional Basin Stream, Iceberg Sink, and Pipeline for OTel GenAI coding-agent usage metadata (ai.genai_usage)."
+}
+
+variable "ai_namespace" {
+  type        = string
+  default     = "ai"
+  description = "Apache Iceberg namespace for AI usage telemetry."
+
+  validation {
+    condition     = can(regex("^[A-Za-z_][A-Za-z0-9_]*$", var.ai_namespace))
+    error_message = "ai_namespace must match ^[A-Za-z_][A-Za-z0-9_]*$."
+  }
+}
+
+variable "ai_table_name" {
+  type        = string
+  default     = "genai_usage"
+  description = "Apache Iceberg table name for OTel GenAI usage telemetry."
+
+  validation {
+    condition     = can(regex("^[A-Za-z_][A-Za-z0-9_]*$", var.ai_table_name))
+    error_message = "ai_table_name must match ^[A-Za-z_][A-Za-z0-9_]*$."
+  }
+}
+
+variable "ai_stream_name" {
+  type        = string
+  default     = "ai_genai_usage_stream"
+  description = "Basin SQL stream identifier for AI usage telemetry (must differ from ai_sink_name)."
+
+  validation {
+    condition     = can(regex("^[A-Za-z_][A-Za-z0-9_]*$", var.ai_stream_name))
+    error_message = "ai_stream_name must match ^[A-Za-z_][A-Za-z0-9_]*$."
+  }
+}
+
+variable "ai_sink_name" {
+  type        = string
+  default     = "ai_genai_usage_sink"
+  description = "Basin SQL sink identifier for AI usage telemetry (must differ from ai_stream_name)."
+
+  validation {
+    condition     = can(regex("^[A-Za-z_][A-Za-z0-9_]*$", var.ai_sink_name))
+    error_message = "ai_sink_name must match ^[A-Za-z_][A-Za-z0-9_]*$."
+  }
+}
+
+variable "ai_pipeline_name" {
+  type        = string
+  default     = "ai_genai_usage_to_iceberg"
+  description = "Basin Pipeline name for AI usage telemetry."
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_]+$", var.ai_pipeline_name))
+    error_message = "ai_pipeline_name must match ^[A-Za-z0-9_]+$."
+  }
+}
+
+variable "ai_schema_file" {
+  type        = string
+  default     = ""
+  description = "Optional override path to OTel GenAI Basin schema JSON (defaults to contracts/otel-genai/genai-usage.basin.json)."
+}
+
+variable "ai_pipeline_sql_file" {
+  type        = string
+  default     = ""
+  description = "Optional override path to AI usage Basin pipeline SQL template (defaults to ../pipeline_ai_usage.sql)."
+}
