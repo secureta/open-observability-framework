@@ -8,7 +8,7 @@ locals {
   focus_schema_path       = var.finops_schema_file != "" ? var.finops_schema_file : "${path.module}/../../../../contracts/focus/cost-and-usage.basin.json"
   focus_pipeline_sql_path = var.finops_pipeline_sql_file != "" ? var.finops_pipeline_sql_file : "${path.module}/../focus_pipeline.sql"
 
-  focus_schema       = var.enable_finops ? jsondecode(file(local.focus_schema_path)) : { fields = [] }
+  focus_schema       = var.enable_finops ? jsondecode(file(local.focus_schema_path)) : null
   rendered_focus_sql = var.enable_finops ? replace(replace(file(local.focus_pipeline_sql_path), "__SINK_NAME__", var.finops_sink_name), "__STREAM_NAME__", var.finops_stream_name) : ""
 
   bucket_name = var.create_bucket ? cloudflare_r2_bucket.lake[0].name : var.bucket_name
