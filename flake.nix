@@ -155,6 +155,74 @@
             in
             pkgs.writeText "oof-fluent-bit.conf" rendered;
 
+          prometheusYamlSrc = ./adapters/collect/prometheus-pull/prometheus.yml;
+          yamlFormat = pkgs.formats.yaml { };
+
+          mkPrometheusConfig =
+            {
+              defaultScrapeInterval ? "30s",
+              defaultScrapeTimeout ? "5s",
+              targets ? { },
+            }:
+            let
+              targetNames = lib.sort (a: b: a < b) (builtins.attrNames targets);
+              scrapeConfigs = map (
+                name:
+                let
+                  t = targets.${name};
+                  parsed = parseHttpUrlHostPort t.endpoint;
+                  metricsPath =
+                    if parsed.urlPath == null || parsed.urlPath == "" || parsed.urlPath == "/" then
+                      "/metrics"
+                    else
+                      parsed.urlPath;
+                  effectiveInterval = if t.scrapeInterval != null then t.scrapeInterval else defaultScrapeInterval;
+                  effectiveTimeout = if t.scrapeTimeout != null then t.scrapeTimeout else defaultScrapeTimeout;
+                  keepLabels = [
+                    "__name__"
+                    "job"
+                  ] ++ t.allowedLabels;
+                in
+                {
+                  job_name = name;
+                  scrape_interval = effectiveInterval;
+                  scrape_timeout = effectiveTimeout;
+                  metrics_path = metricsPath;
+                  scheme = if parsed.scheme != null then parsed.scheme else "http";
+                  honor_labels = false;
+                  static_configs = [
+                    {
+                      targets = [ "${parsed.rawHost}:${toString parsed.port}" ];
+                    }
+                  ];
+                  relabel_configs = [
+                    {
+                      target_label = "instance";
+                      replacement = name;
+                    }
+                  ];
+                  metric_relabel_configs = [
+                    {
+                      source_labels = [ "__name__" ];
+                      regex = "^(${lib.concatStringsSep "|" t.metrics})$";
+                      action = "keep";
+                    }
+                    {
+                      regex = "^(${lib.concatStringsSep "|" keepLabels})$";
+                      action = "labelkeep";
+                    }
+                  ];
+                }
+              ) targetNames;
+            in
+            yamlFormat.generate "oof-prometheus.yml" {
+              global = {
+                scrape_interval = defaultScrapeInterval;
+                scrape_timeout = defaultScrapeTimeout;
+              };
+              scrape_configs = scrapeConfigs;
+            };
+
           oofVectorConfig =
             pkgs.runCommand "oof-vector.yaml" { } ''
               cp ${vectorYamlSrc} "$out"
@@ -170,6 +238,11 @@
           oofOtelcolConfig =
             pkgs.runCommand "oof-otelcol.yaml" { } ''
               cp ${otelcolYamlSrc} "$out"
+            '';
+
+          oofPrometheusConfig =
+            pkgs.runCommand "oof-prometheus.yml" { } ''
+              cp ${prometheusYamlSrc} "$out"
             '';
 
           oofVector = pkgs.symlinkJoin {
@@ -212,17 +285,37 @@
               mainProgram = "fluent-bit";
             };
           };
+
+          oofPrometheus = pkgs.symlinkJoin {
+            name = "oof-prometheus-${pkgs.prometheus.version}";
+            paths = [
+              pkgs.prometheus
+              pkgs.prometheus.cli
+            ];
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            postBuild = ''
+              wrapProgram "$out/bin/prometheus" \
+                --add-flags "--config.file=${oofPrometheusConfig}" \
+                --add-flags "--web.listen-address=127.0.0.1:9090"
+            '';
+            meta = pkgs.prometheus.meta // {
+              mainProgram = "prometheus";
+            };
+          };
         in
         {
           inherit
             mkFluentBitConfig
+            mkPrometheusConfig
             oofVectorConfig
             oofVectorGhaConfig
             oofFluentBitConfig
             oofOtelcolConfig
+            oofPrometheusConfig
             oofVector
             oofVectorGha
             oofFluentBit
+            oofPrometheus
             ;
         };
 
@@ -406,6 +499,8 @@
           scheme = if m == null then null else builtins.elemAt m 0;
           rawHost = if m == null then null else builtins.elemAt m 1;
           portStr = if m == null then null else builtins.elemAt m 3;
+          urlPath = if m == null then null else builtins.elemAt m 4;
+          pathValid = urlPath == null || builtins.match "^/[^[:space:]?#]*$" urlPath != null;
           port =
             if m == null then
               null
@@ -417,7 +512,7 @@
           isBracketed = rawHost != null && lib.hasPrefix "[" rawHost && lib.hasSuffix "]" rawHost;
           bareHost = if rawHost == null then "" else lib.removePrefix "[" (lib.removeSuffix "]" rawHost);
           canonical =
-            if rawHost == null || !portValid then
+            if rawHost == null || !portValid || !pathValid then
               null
             else if isBracketed then
               let
@@ -446,9 +541,30 @@
             rawHost
             bareHost
             port
+            urlPath
             canonical
             ;
         };
+
+      parseDurationMs =
+        dur:
+        let
+          m = builtins.match "^([1-9][0-9]*)(ms|s|m|h)$" dur;
+          val = if m == null then null else lib.toInt (builtins.elemAt m 0);
+          unit = if m == null then null else builtins.elemAt m 1;
+          mult =
+            if unit == "ms" then
+              1
+            else if unit == "s" then
+              1000
+            else if unit == "m" then
+              60000
+            else if unit == "h" then
+              3600000
+            else
+              null;
+        in
+        if val == null || mult == null then null else val * mult;
 
       isLocalBindTarget =
         targetCanon: listenerCanon:
@@ -489,9 +605,11 @@
               oof-vector-github-actions-config = assets.oofVectorGhaConfig;
               oof-fluent-bit-config = assets.oofFluentBitConfig;
               oof-otelcol-config = assets.oofOtelcolConfig;
+              oof-prometheus-config = assets.oofPrometheusConfig;
               oof-vector = assets.oofVector;
               oof-vector-github-actions = assets.oofVectorGha;
               oof-fluent-bit = assets.oofFluentBit;
+              oof-prometheus = assets.oofPrometheus;
             }
           )
         );
@@ -512,6 +630,8 @@
             ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [
               pkgs.vector
               pkgs.fluent-bit
+              pkgs.prometheus
+              pkgs.prometheus.cli
             ];
           };
         }
@@ -535,6 +655,35 @@
           bridgeHttpParsed = parseSocketAddr cfg.otelBridge.httpListen;
           bridgeTargetParsed = parseHttpUrlHostPort cfg.otelBridge.bridgeEndpoint;
           ghaWebhookParsed = parseSocketAddr cfg.githubActionsWebhook.listen;
+          promListenParsed = parseSocketAddr cfg.prometheus.listenAddress;
+
+          promTargetEntries = lib.mapAttrsToList (
+            name: target:
+            let
+              parsed = parseHttpUrlHostPort target.endpoint;
+              effInterval = if target.scrapeInterval != null then target.scrapeInterval else cfg.prometheus.defaultScrapeInterval;
+              effTimeout = if target.scrapeTimeout != null then target.scrapeTimeout else cfg.prometheus.defaultScrapeTimeout;
+              intervalMs = parseDurationMs effInterval;
+              timeoutMs = parseDurationMs effTimeout;
+            in
+            {
+              inherit
+                name
+                target
+                parsed
+                effInterval
+                effTimeout
+                intervalMs
+                timeoutMs
+                ;
+            }
+          ) cfg.prometheus.targets;
+
+          customPrometheusConfig = assets.mkPrometheusConfig {
+            defaultScrapeInterval = cfg.prometheus.defaultScrapeInterval;
+            defaultScrapeTimeout = cfg.prometheus.defaultScrapeTimeout;
+            targets = cfg.prometheus.targets;
+          };
 
           customFluentBitConfig = assets.mkFluentBitConfig {
             listenHost = if httpParsed.valid then httpParsed.bareHost else "127.0.0.1";
@@ -545,47 +694,53 @@
           };
 
           activeListeners =
-            (lib.optional (cfg.collector == "vector") {
-              name = "services.oof-collector.otlp.grpcListen";
-              parsed = grpcParsed;
-            })
-            ++ [
-              {
-                name = "services.oof-collector.otlp.httpListen";
-                parsed = httpParsed;
-              }
-            ]
-            ++ (lib.optional (cfg.collector == "fluent-bit") {
-              name = "services.oof-collector.fluentBit.forwardPort";
-              parsed = {
-                valid = true;
-                rawHost = "127.0.0.1";
-                bareHost = "127.0.0.1";
-                port = cfg.fluentBit.forwardPort;
-                canonical = {
-                  kind = "ipv4";
-                  octets = [
-                    127
-                    0
-                    0
-                    1
-                  ];
+            (lib.optionals cfg.enable (
+              (lib.optional (cfg.collector == "vector") {
+                name = "services.oof-collector.otlp.grpcListen";
+                parsed = grpcParsed;
+              })
+              ++ [
+                {
+                  name = "services.oof-collector.otlp.httpListen";
+                  parsed = httpParsed;
+                }
+              ]
+              ++ (lib.optional (cfg.collector == "fluent-bit") {
+                name = "services.oof-collector.fluentBit.forwardPort";
+                parsed = {
+                  valid = true;
+                  rawHost = "127.0.0.1";
+                  bareHost = "127.0.0.1";
+                  port = cfg.fluentBit.forwardPort;
+                  canonical = {
+                    kind = "ipv4";
+                    octets = [
+                      127
+                      0
+                      0
+                      1
+                    ];
+                  };
                 };
-              };
-            })
-            ++ (lib.optionals cfg.otelBridge.enable [
-              {
-                name = "services.oof-collector.otelBridge.grpcListen";
-                parsed = bridgeGrpcParsed;
-              }
-              {
-                name = "services.oof-collector.otelBridge.httpListen";
-                parsed = bridgeHttpParsed;
-              }
-            ])
-            ++ (lib.optional cfg.githubActionsWebhook.enable {
-              name = "services.oof-collector.githubActionsWebhook.listen";
-              parsed = ghaWebhookParsed;
+              })
+              ++ (lib.optionals cfg.otelBridge.enable [
+                {
+                  name = "services.oof-collector.otelBridge.grpcListen";
+                  parsed = bridgeGrpcParsed;
+                }
+                {
+                  name = "services.oof-collector.otelBridge.httpListen";
+                  parsed = bridgeHttpParsed;
+                }
+              ])
+              ++ (lib.optional cfg.githubActionsWebhook.enable {
+                name = "services.oof-collector.githubActionsWebhook.listen";
+                parsed = ghaWebhookParsed;
+              })
+            ))
+            ++ (lib.optional cfg.prometheus.enable {
+              name = "services.oof-collector.prometheus.listenAddress";
+              parsed = promListenParsed;
             });
 
           listenerPairs =
@@ -730,182 +885,335 @@
               default = { };
               description = "Additional non-secret environment variables passed to oof-collector.service.";
             };
+
+            prometheus = {
+              enable = lib.mkEnableOption "Open Observability Framework Prometheus pull metrics collector (disabled by default)";
+
+              package = lib.mkPackageOption pkgs "prometheus" { };
+
+              listenAddress = lib.mkOption {
+                type = lib.types.str;
+                default = "127.0.0.1:9090";
+                description = "Host:port for Prometheus HTTP query API (defaults to loopback 127.0.0.1:9090).";
+              };
+
+              retentionTime = lib.mkOption {
+                type = lib.types.strMatching "^[1-9][0-9]*(y|w|d|h|m|s)$";
+                default = "15d";
+                description = "Local Prometheus TSDB retention duration (--storage.tsdb.retention.time).";
+              };
+
+              defaultScrapeInterval = lib.mkOption {
+                type = lib.types.strMatching "^[1-9][0-9]*(ms|s|m|h)$";
+                default = "30s";
+                description = "Default Prometheus pull scrape interval.";
+              };
+
+              defaultScrapeTimeout = lib.mkOption {
+                type = lib.types.strMatching "^[1-9][0-9]*(ms|s|m|h)$";
+                default = "5s";
+                description = "Default Prometheus pull scrape timeout (must be <= scrape interval).";
+              };
+
+              targets = lib.mkOption {
+                type = lib.types.attrsOf (
+                  lib.types.submodule {
+                    options = {
+                      endpoint = lib.mkOption {
+                        type = lib.types.str;
+                        description = "Prometheus /metrics HTTP(S) endpoint URL (examples are restricted to loopback, e.g. http://127.0.0.1:20241/metrics).";
+                      };
+
+                      scrapeInterval = lib.mkOption {
+                        type = lib.types.nullOr (lib.types.strMatching "^[1-9][0-9]*(ms|s|m|h)$");
+                        default = null;
+                        description = "Optional per-target scrape interval override.";
+                      };
+
+                      scrapeTimeout = lib.mkOption {
+                        type = lib.types.nullOr (lib.types.strMatching "^[1-9][0-9]*(ms|s|m|h)$");
+                        default = null;
+                        description = "Optional per-target scrape timeout override.";
+                      };
+
+                      metrics = lib.mkOption {
+                        type = lib.types.listOf (lib.types.strMatching "^[a-zA-Z_:][a-zA-Z0-9_:]*$");
+                        description = "Strict allowlist of Prometheus metric names to retain (all other metrics are dropped).";
+                      };
+
+                      allowedLabels = lib.mkOption {
+                        type = lib.types.listOf (lib.types.strMatching "^[a-zA-Z_][a-zA-Z0-9_]*$");
+                        default = [ ];
+                        description = "Optional allowlist of extra labels to keep alongside __name__ and job (empty by default so tunnel IDs, IPs, hostnames, and instance labels are dropped).";
+                      };
+                    };
+                  }
+                );
+                default = { };
+                example = {
+                  cloudflared = {
+                    endpoint = "http://127.0.0.1:20241/metrics";
+                    scrapeInterval = "30s";
+                    scrapeTimeout = "5s";
+                    metrics = [ "cloudflared_tunnel_ha_connections" ];
+                  };
+                };
+                description = "Named Prometheus pull scrape targets with strict metric and label allowlists.";
+              };
+            };
           };
 
-          config = lib.mkIf cfg.enable {
-            assertions = [
-              {
-                assertion = !(lib.hasPrefix builtins.storeDir cfg.environmentFile);
-                message = "services.oof-collector.environmentFile must NOT point inside /nix/store; store secrets out-of-band (sops-nix, agenix, or /run/secrets/...).";
-              }
-              {
-                assertion = httpParsed.valid;
-                message = "services.oof-collector.otlp.httpListen ('${cfg.otlp.httpListen}') must be a valid IPv4/IPv6 socket address (ip:port, e.g. 127.0.0.1:4318 or [::1]:4318; DNS hostnames are rejected by Vector).";
-              }
-              {
-                assertion = (cfg.collector != "vector") || grpcParsed.valid;
-                message = "services.oof-collector.otlp.grpcListen ('${cfg.otlp.grpcListen}') must be a valid IPv4/IPv6 socket address (ip:port, e.g. 127.0.0.1:4317 or [::1]:4317) when using Vector.";
-              }
-              {
-                assertion = (!cfg.otelBridge.enable) || (bridgeGrpcParsed.valid && bridgeHttpParsed.valid);
-                message = "services.oof-collector.otelBridge.grpcListen/httpListen must be valid IPv4/IPv6 socket addresses (ip:port).";
-              }
-              {
-                assertion = (!cfg.otelBridge.enable) || bridgeTargetParsed.valid;
-                message = "services.oof-collector.otelBridge.bridgeEndpoint ('${cfg.otelBridge.bridgeEndpoint}') must be a valid non-wildcard http(s)://host:port URL (unspecified 0.0.0.0/[::] targets are not allowed).";
-              }
-              {
-                assertion = collidingPairs == [ ];
-                message =
-                  "TCP listener port collision in services.oof-collector: "
-                  + lib.concatMapStringsSep "; " (
-                    p:
-                    "${p.first.name} (${p.first.parsed.rawHost}:${toString p.first.parsed.port}) conflicts with ${p.second.name} (${p.second.parsed.rawHost}:${toString p.second.parsed.port})"
-                  ) collidingPairs;
-              }
-              {
-                assertion = !selfLoopDetected;
-                message = "services.oof-collector.otelBridge.bridgeEndpoint ('${cfg.otelBridge.bridgeEndpoint}') must not point to its own otelBridge.httpListen (${cfg.otelBridge.httpListen}).";
-              }
-              {
-                assertion = (!cfg.githubActionsWebhook.enable) || ghaWebhookParsed.valid;
-                message = "services.oof-collector.githubActionsWebhook.listen ('${cfg.githubActionsWebhook.listen}') must be a valid IPv4/IPv6 socket address (ip:port, e.g. 127.0.0.1:8088).";
-              }
-              {
-                assertion =
-                  (!cfg.githubActionsWebhook.enable)
-                  || cfg.githubActionsWebhook.environmentFile == null
-                  || !(lib.hasPrefix builtins.storeDir cfg.githubActionsWebhook.environmentFile);
-                message = "services.oof-collector.githubActionsWebhook.environmentFile must NOT point inside /nix/store.";
-              }
-            ];
-
-            systemd.services.oof-collector = {
-              description = "Open Observability Framework Collector (${cfg.collector})";
-              wantedBy = [ "multi-user.target" ];
-              after = [ "network-online.target" ];
-              wants = [ "network-online.target" ];
-
-              environment =
-                (lib.optionalAttrs (cfg.collector == "vector") {
-                  VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION = "true";
-                  OOF_VECTOR_DATA_DIR = "/var/lib/oof-collector";
-                  OOF_OTLP_GRPC_LISTEN = cfg.otlp.grpcListen;
-                  OOF_OTLP_HTTP_LISTEN = cfg.otlp.httpListen;
-                })
-                // cfg.extraEnvironment;
-
-              serviceConfig = {
-                Type = "simple";
-                DynamicUser = true;
-                StateDirectory = "oof-collector";
-                SupplementaryGroups = [ "systemd-journal" ];
-                EnvironmentFile = cfg.environmentFile;
-                Restart = "on-failure";
-                RestartSec = "5s";
-                NoNewPrivileges = true;
-                ProtectSystem = "strict";
-                ProtectHome = true;
-                PrivateTmp = true;
-                ExecStart = utils.escapeSystemdExecArgs (
-                  if cfg.collector == "vector" then
-                    [
-                      (lib.getExe cfg.vectorPackage)
-                      "--dangerously-allow-env-var-interpolation"
-                      "--config"
-                      assets.oofVectorConfig
-                    ]
-                    ++ lib.concatMap (f: [
-                      "--config"
-                      f
-                    ]) cfg.extraConfigFiles
-                  else
-                    [
-                      (lib.getExe cfg.fluentBitPackage)
-                      "-c"
-                      customFluentBitConfig
-                    ]
-                );
-              };
-            };
-
-            systemd.services.oof-otel-bridge = lib.mkIf cfg.otelBridge.enable {
-              description = "Open Observability Framework OTel Collector OTLP Bridge";
-              wantedBy = [ "multi-user.target" ];
-              after = [
-                "network-online.target"
-                "oof-collector.service"
+          config = lib.mkMerge [
+            (lib.mkIf (cfg.enable || cfg.prometheus.enable) {
+              assertions = [
+                {
+                  assertion = collidingPairs == [ ];
+                  message =
+                    "TCP listener port collision in services.oof-collector: "
+                    + lib.concatMapStringsSep "; " (
+                      p:
+                      "${p.first.name} (${p.first.parsed.rawHost}:${toString p.first.parsed.port}) conflicts with ${p.second.name} (${p.second.parsed.rawHost}:${toString p.second.parsed.port})"
+                    ) collidingPairs;
+                }
               ];
-              wants = [
-                "network-online.target"
-                "oof-collector.service"
+            })
+
+            (lib.mkIf cfg.enable {
+              assertions = [
+                {
+                  assertion = !(lib.hasPrefix builtins.storeDir cfg.environmentFile);
+                  message = "services.oof-collector.environmentFile must NOT point inside /nix/store; store secrets out-of-band (sops-nix, agenix, or /run/secrets/...).";
+                }
+                {
+                  assertion = httpParsed.valid;
+                  message = "services.oof-collector.otlp.httpListen ('${cfg.otlp.httpListen}') must be a valid IPv4/IPv6 socket address (ip:port, e.g. 127.0.0.1:4318 or [::1]:4318; DNS hostnames are rejected by Vector).";
+                }
+                {
+                  assertion = (cfg.collector != "vector") || grpcParsed.valid;
+                  message = "services.oof-collector.otlp.grpcListen ('${cfg.otlp.grpcListen}') must be a valid IPv4/IPv6 socket address (ip:port, e.g. 127.0.0.1:4317 or [::1]:4317) when using Vector.";
+                }
+                {
+                  assertion = (!cfg.otelBridge.enable) || (bridgeGrpcParsed.valid && bridgeHttpParsed.valid);
+                  message = "services.oof-collector.otelBridge.grpcListen/httpListen must be valid IPv4/IPv6 socket addresses (ip:port).";
+                }
+                {
+                  assertion = (!cfg.otelBridge.enable) || bridgeTargetParsed.valid;
+                  message = "services.oof-collector.otelBridge.bridgeEndpoint ('${cfg.otelBridge.bridgeEndpoint}') must be a valid non-wildcard http(s)://host:port URL (unspecified 0.0.0.0/[::] targets are not allowed).";
+                }
+                {
+                  assertion = !selfLoopDetected;
+                  message = "services.oof-collector.otelBridge.bridgeEndpoint ('${cfg.otelBridge.bridgeEndpoint}') must not point to its own otelBridge.httpListen (${cfg.otelBridge.httpListen}).";
+                }
+                {
+                  assertion = (!cfg.githubActionsWebhook.enable) || ghaWebhookParsed.valid;
+                  message = "services.oof-collector.githubActionsWebhook.listen ('${cfg.githubActionsWebhook.listen}') must be a valid IPv4/IPv6 socket address (ip:port, e.g. 127.0.0.1:8088).";
+                }
+                {
+                  assertion =
+                    (!cfg.githubActionsWebhook.enable)
+                    || cfg.githubActionsWebhook.environmentFile == null
+                    || !(lib.hasPrefix builtins.storeDir cfg.githubActionsWebhook.environmentFile);
+                  message = "services.oof-collector.githubActionsWebhook.environmentFile must NOT point inside /nix/store.";
+                }
               ];
 
-              environment = {
-                OOF_OTEL_GRPC_LISTEN = cfg.otelBridge.grpcListen;
-                OOF_OTEL_HTTP_LISTEN = cfg.otelBridge.httpListen;
-                OOF_OTLP_BRIDGE_ENDPOINT = cfg.otelBridge.bridgeEndpoint;
+              systemd.services.oof-collector = {
+                description = "Open Observability Framework Collector (${cfg.collector})";
+                wantedBy = [ "multi-user.target" ];
+                after = [ "network-online.target" ];
+                wants = [ "network-online.target" ];
+
+                environment =
+                  (lib.optionalAttrs (cfg.collector == "vector") {
+                    VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION = "true";
+                    OOF_VECTOR_DATA_DIR = "/var/lib/oof-collector";
+                    OOF_OTLP_GRPC_LISTEN = cfg.otlp.grpcListen;
+                    OOF_OTLP_HTTP_LISTEN = cfg.otlp.httpListen;
+                  })
+                  // cfg.extraEnvironment;
+
+                serviceConfig = {
+                  Type = "simple";
+                  DynamicUser = true;
+                  StateDirectory = "oof-collector";
+                  SupplementaryGroups = [ "systemd-journal" ];
+                  EnvironmentFile = cfg.environmentFile;
+                  Restart = "on-failure";
+                  RestartSec = "5s";
+                  NoNewPrivileges = true;
+                  ProtectSystem = "strict";
+                  ProtectHome = true;
+                  PrivateTmp = true;
+                  ExecStart = utils.escapeSystemdExecArgs (
+                    if cfg.collector == "vector" then
+                      [
+                        (lib.getExe cfg.vectorPackage)
+                        "--dangerously-allow-env-var-interpolation"
+                        "--config"
+                        assets.oofVectorConfig
+                      ]
+                      ++ lib.concatMap (f: [
+                        "--config"
+                        f
+                      ]) cfg.extraConfigFiles
+                    else
+                      [
+                        (lib.getExe cfg.fluentBitPackage)
+                        "-c"
+                        customFluentBitConfig
+                      ]
+                  );
+                };
               };
 
-              serviceConfig = {
-                Type = "simple";
-                DynamicUser = true;
-                StateDirectory = "oof-otel-bridge";
-                Restart = "on-failure";
-                RestartSec = "5s";
-                NoNewPrivileges = true;
-                ProtectSystem = "strict";
-                ProtectHome = true;
-                PrivateTmp = true;
-                ExecStart = utils.escapeSystemdExecArgs (
-                  [
-                    (lib.getExe cfg.otelBridge.package)
-                    "--config=file:${assets.oofOtelcolConfig}"
-                  ]
-                  ++ map (f: "--config=file:${f}") cfg.otelBridge.extraConfigFiles
-                );
-              };
-            };
-
-            systemd.services.oof-github-actions-webhook = lib.mkIf cfg.githubActionsWebhook.enable {
-              description = "Open Observability Framework GitHub Actions Webhook Collector (Vector)";
-              wantedBy = [ "multi-user.target" ];
-              after = [ "network-online.target" ];
-              wants = [ "network-online.target" ];
-
-              environment = {
-                VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION = "true";
-                OOF_VECTOR_DATA_DIR = "/var/lib/oof-github-actions-webhook";
-                OOF_GHA_WEBHOOK_LISTEN = cfg.githubActionsWebhook.listen;
-              };
-
-              serviceConfig = {
-                Type = "simple";
-                DynamicUser = true;
-                StateDirectory = "oof-github-actions-webhook";
-                EnvironmentFile =
-                  if cfg.githubActionsWebhook.environmentFile != null then
-                    [
-                      cfg.environmentFile
-                      cfg.githubActionsWebhook.environmentFile
-                    ]
-                  else
-                    cfg.environmentFile;
-                Restart = "on-failure";
-                RestartSec = "5s";
-                NoNewPrivileges = true;
-                ProtectSystem = "strict";
-                ProtectHome = true;
-                PrivateTmp = true;
-                ExecStart = utils.escapeSystemdExecArgs [
-                  (lib.getExe cfg.vectorPackage)
-                  "--dangerously-allow-env-var-interpolation"
-                  "--config"
-                  assets.oofVectorGhaConfig
+              systemd.services.oof-otel-bridge = lib.mkIf cfg.otelBridge.enable {
+                description = "Open Observability Framework OTel Collector OTLP Bridge";
+                wantedBy = [ "multi-user.target" ];
+                after = [
+                  "network-online.target"
+                  "oof-collector.service"
                 ];
+                wants = [
+                  "network-online.target"
+                  "oof-collector.service"
+                ];
+
+                environment = {
+                  OOF_OTEL_GRPC_LISTEN = cfg.otelBridge.grpcListen;
+                  OOF_OTEL_HTTP_LISTEN = cfg.otelBridge.httpListen;
+                  OOF_OTLP_BRIDGE_ENDPOINT = cfg.otelBridge.bridgeEndpoint;
+                };
+
+                serviceConfig = {
+                  Type = "simple";
+                  DynamicUser = true;
+                  StateDirectory = "oof-otel-bridge";
+                  Restart = "on-failure";
+                  RestartSec = "5s";
+                  NoNewPrivileges = true;
+                  ProtectSystem = "strict";
+                  ProtectHome = true;
+                  PrivateTmp = true;
+                  ExecStart = utils.escapeSystemdExecArgs (
+                    [
+                      (lib.getExe cfg.otelBridge.package)
+                      "--config=file:${assets.oofOtelcolConfig}"
+                    ]
+                    ++ map (f: "--config=file:${f}") cfg.otelBridge.extraConfigFiles
+                  );
+                };
               };
-            };
-          };
+
+              systemd.services.oof-github-actions-webhook = lib.mkIf cfg.githubActionsWebhook.enable {
+                description = "Open Observability Framework GitHub Actions Webhook Collector (Vector)";
+                wantedBy = [ "multi-user.target" ];
+                after = [ "network-online.target" ];
+                wants = [ "network-online.target" ];
+
+                environment = {
+                  VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION = "true";
+                  OOF_VECTOR_DATA_DIR = "/var/lib/oof-github-actions-webhook";
+                  OOF_GHA_WEBHOOK_LISTEN = cfg.githubActionsWebhook.listen;
+                };
+
+                serviceConfig = {
+                  Type = "simple";
+                  DynamicUser = true;
+                  StateDirectory = "oof-github-actions-webhook";
+                  EnvironmentFile =
+                    if cfg.githubActionsWebhook.environmentFile != null then
+                      [
+                        cfg.environmentFile
+                        cfg.githubActionsWebhook.environmentFile
+                      ]
+                    else
+                      cfg.environmentFile;
+                  Restart = "on-failure";
+                  RestartSec = "5s";
+                  NoNewPrivileges = true;
+                  ProtectSystem = "strict";
+                  ProtectHome = true;
+                  PrivateTmp = true;
+                  ExecStart = utils.escapeSystemdExecArgs [
+                    (lib.getExe cfg.vectorPackage)
+                    "--dangerously-allow-env-var-interpolation"
+                    "--config"
+                    assets.oofVectorGhaConfig
+                  ];
+                };
+              };
+            })
+
+            (lib.mkIf cfg.prometheus.enable {
+              assertions =
+                [
+                  {
+                    assertion = promListenParsed.valid;
+                    message = "services.oof-collector.prometheus.listenAddress ('${cfg.prometheus.listenAddress}') must be a valid IPv4/IPv6 socket address (ip:port, e.g. 127.0.0.1:9090 or [::1]:9090).";
+                  }
+                  {
+                    assertion = promTargetEntries != [ ];
+                    message = "services.oof-collector.prometheus.targets must define at least one scrape target when prometheus.enable = true.";
+                  }
+                  {
+                    assertion =
+                      (parseDurationMs cfg.prometheus.defaultScrapeTimeout)
+                      <= (parseDurationMs cfg.prometheus.defaultScrapeInterval);
+                    message = "services.oof-collector.prometheus.defaultScrapeTimeout ('${cfg.prometheus.defaultScrapeTimeout}') must not exceed defaultScrapeInterval ('${cfg.prometheus.defaultScrapeInterval}').";
+                  }
+                ]
+                ++ lib.concatMap (
+                  entry:
+                  [
+                    {
+                      assertion = builtins.match "^[a-zA-Z0-9._-]+$" entry.name != null;
+                      message = "services.oof-collector.prometheus.targets.${entry.name}: target name must match ^[a-zA-Z0-9._-]+$.";
+                    }
+                    {
+                      assertion = entry.parsed.valid;
+                      message = "services.oof-collector.prometheus.targets.${entry.name}.endpoint ('${entry.target.endpoint}') must be a valid non-wildcard http(s)://host[:port][/path] URL without query strings or fragments.";
+                    }
+                    {
+                      assertion = entry.target.metrics != [ ];
+                      message = "services.oof-collector.prometheus.targets.${entry.name}.metrics must specify at least one allowlisted metric name.";
+                    }
+                    {
+                      assertion =
+                        entry.timeoutMs != null
+                        && entry.intervalMs != null
+                        && entry.timeoutMs <= entry.intervalMs;
+                      message = "services.oof-collector.prometheus.targets.${entry.name}: scrapeTimeout ('${entry.effTimeout}') must not exceed scrapeInterval ('${entry.effInterval}').";
+                    }
+                  ]
+                ) promTargetEntries;
+
+              systemd.services.oof-prometheus = {
+                description = "Open Observability Framework Prometheus Pull Metrics Collector";
+                wantedBy = [ "multi-user.target" ];
+                after = [ "network-online.target" ];
+                wants = [ "network-online.target" ];
+
+                serviceConfig = {
+                  Type = "simple";
+                  DynamicUser = true;
+                  StateDirectory = "oof-prometheus";
+                  Restart = "on-failure";
+                  RestartSec = "5s";
+                  NoNewPrivileges = true;
+                  ProtectSystem = "strict";
+                  ProtectHome = true;
+                  PrivateTmp = true;
+                  ExecStart = utils.escapeSystemdExecArgs [
+                    (lib.getExe cfg.prometheus.package)
+                    "--config.file=${customPrometheusConfig}"
+                    "--storage.tsdb.path=/var/lib/oof-prometheus"
+                    "--storage.tsdb.retention.time=${cfg.prometheus.retentionTime}"
+                    "--web.listen-address=${cfg.prometheus.listenAddress}"
+                  ];
+                };
+              };
+            })
+          ];
         };
 
       checks = forSystems allSystems (
@@ -1174,10 +1482,86 @@
                 };
               };
 
+              promDefaultDisabledCfg = evalNixos { };
+
+              promEnabledCfg = evalNixos {
+                services.oof-collector.prometheus = {
+                  enable = true;
+                  listenAddress = "127.0.0.1:9090";
+                  defaultScrapeInterval = "30s";
+                  defaultScrapeTimeout = "5s";
+                  targets.cloudflared = {
+                    endpoint = "http://127.0.0.1:20241/metrics";
+                    scrapeInterval = "15s";
+                    scrapeTimeout = "3s";
+                    metrics = [ "cloudflared_tunnel_ha_connections" ];
+                  };
+                };
+              };
+
+              badPromEmptyTargetsCfg = evalNixos {
+                services.oof-collector.prometheus = {
+                  enable = true;
+                };
+              };
+
+              badPromEmptyMetricsCfg = evalNixos {
+                services.oof-collector.prometheus = {
+                  enable = true;
+                  targets.cloudflared = {
+                    endpoint = "http://127.0.0.1:20241/metrics";
+                    metrics = [ ];
+                  };
+                };
+              };
+
+              badPromTimeoutExceedsIntervalCfg = evalNixos {
+                services.oof-collector.prometheus = {
+                  enable = true;
+                  targets.cloudflared = {
+                    endpoint = "http://127.0.0.1:20241/metrics";
+                    scrapeInterval = "5s";
+                    scrapeTimeout = "10s";
+                    metrics = [ "cloudflared_tunnel_ha_connections" ];
+                  };
+                };
+              };
+
+              badPromWildcardTargetCfg = evalNixos {
+                services.oof-collector.prometheus = {
+                  enable = true;
+                  targets.cloudflared = {
+                    endpoint = "http://0.0.0.0:20241/metrics";
+                    metrics = [ "cloudflared_tunnel_ha_connections" ];
+                  };
+                };
+              };
+
+              badPromPortCollisionCfg = evalNixos {
+                services.oof-collector = {
+                  enable = true;
+                  collector = "vector";
+                  environmentFile = "/run/secrets/oof-collector.env";
+                  otlp.httpListen = "127.0.0.1:9090";
+                  prometheus = {
+                    enable = true;
+                    listenAddress = "127.0.0.1:9090";
+                    targets.cloudflared = {
+                      endpoint = "http://127.0.0.1:20241/metrics";
+                      metrics = [ "cloudflared_tunnel_ha_connections" ];
+                    };
+                  };
+                };
+              };
+
               # Discard string context so nixpkgs#opentelemetry-collector-contrib is not compiled during flake check.
               fbUnitConfigMatch =
                 builtins.match ".* \"?-c\"? \"?([^ \"]+)\"?.*"
                   (builtins.unsafeDiscardStringContext fbBridgeCfg.config.systemd.services.oof-collector.serviceConfig.ExecStart);
+
+              promUnitConfigMatch =
+                builtins.match ".*\"?--config\\.file=([^ \"]+)\"?.*"
+                  (builtins.unsafeDiscardStringContext promEnabledCfg.config.systemd.services.oof-prometheus.serviceConfig.ExecStart);
 
               evalSummary = builtins.unsafeDiscardStringContext (
                 builtins.toJSON {
@@ -1204,6 +1588,13 @@
                   ghaWebhookListen = ghaWebhookCfg.config.systemd.services.oof-github-actions-webhook.environment.OOF_GHA_WEBHOOK_LISTEN;
                   badGhaCollisionRejected = !(checkAssertionsPass badGhaPortCollisionCfg);
 
+                  promDefaultDisabled = !(promDefaultDisabledCfg.config.services.oof-collector.prometheus.enable);
+                  promDefaultHasUnit = builtins.hasAttr "oof-prometheus" promDefaultDisabledCfg.config.systemd.services;
+                  promEnabledOk = checkAssertionsPass promEnabledCfg;
+                  promExec = promEnabledCfg.config.systemd.services.oof-prometheus.serviceConfig.ExecStart;
+                  promDynUser = promEnabledCfg.config.systemd.services.oof-prometheus.serviceConfig.DynamicUser;
+                  promConfRef = if promUnitConfigMatch == null then "" else builtins.elemAt promUnitConfigMatch 0;
+
                   badHostnameRejected = !(checkAssertionsPass badHostnameListenerCfg);
                   badIpv4OctetRejected = !(checkAssertionsPass badIpv4OctetCfg);
                   badIpv6SyntaxRejected = !(checkAssertionsPass badIpv6SyntaxCfg);
@@ -1216,6 +1607,11 @@
                   badIpv4MappedCollisionRejected = !(checkAssertionsPass badIpv4MappedCollisionCfg);
                   badWildcardTargetIpv4Rejected = !(checkAssertionsPass badWildcardTargetIpv4Cfg);
                   badWildcardTargetIpv6Rejected = !(checkAssertionsPass badWildcardTargetIpv6Cfg);
+                  badPromEmptyTargetsRejected = !(checkAssertionsPass badPromEmptyTargetsCfg);
+                  badPromEmptyMetricsRejected = !(checkAssertionsPass badPromEmptyMetricsCfg);
+                  badPromTimeoutExceedsIntervalRejected = !(checkAssertionsPass badPromTimeoutExceedsIntervalCfg);
+                  badPromWildcardTargetRejected = !(checkAssertionsPass badPromWildcardTargetCfg);
+                  badPromPortCollisionRejected = !(checkAssertionsPass badPromPortCollisionCfg);
                 }
               );
 
@@ -1226,15 +1622,31 @@
                 dbPath = "/var/lib/oof-collector/journald.db";
                 extraConfigFiles = [ "/etc/oof/fb-extra.conf" ];
               };
+
+              actualPromConf = assets.mkPrometheusConfig {
+                defaultScrapeInterval = "30s";
+                defaultScrapeTimeout = "5s";
+                targets.cloudflared = {
+                  endpoint = "http://127.0.0.1:20241/metrics";
+                  scrapeInterval = "15s";
+                  scrapeTimeout = "3s";
+                  metrics = [ "cloudflared_tunnel_ha_connections" ];
+                  allowedLabels = [ ];
+                };
+              };
             in
             {
               nixos-module-eval =
                 pkgs.runCommand "oof-nixos-module-eval"
                   {
-                    nativeBuildInputs = [ pkgs.nodejs ];
-                    inherit evalSummary actualFbBridgeConf;
+                    nativeBuildInputs = [
+                      pkgs.nodejs
+                      pkgs.prometheus.cli
+                    ];
+                    inherit evalSummary actualFbBridgeConf actualPromConf;
                   }
                   ''
+                    promtool check config "$actualPromConf"
                     node -e '
                       const assert = require("node:assert/strict");
                       const fs = require("node:fs");
@@ -1267,6 +1679,14 @@
                       assert.equal(s.ghaWebhookListen, "127.0.0.1:8088");
                       assert.equal(s.badGhaCollisionRejected, true);
 
+                      assert.equal(s.promDefaultDisabled, true);
+                      assert.equal(s.promDefaultHasUnit, false);
+                      assert.equal(s.promEnabledOk, true);
+                      assert.equal(s.promDynUser, true);
+                      assert.match(s.promExec, /--web\.listen-address=127\.0\.0\.1:9090/);
+                      assert.match(s.promExec, /--storage\.tsdb\.path=\/var\/lib\/oof-prometheus/);
+                      assert.equal(s.promConfRef, process.env.actualPromConf);
+
                       assert.equal(s.badHostnameRejected, true);
                       assert.equal(s.badIpv4OctetRejected, true);
                       assert.equal(s.badIpv6SyntaxRejected, true);
@@ -1279,13 +1699,42 @@
                       assert.equal(s.badIpv4MappedCollisionRejected, true);
                       assert.equal(s.badWildcardTargetIpv4Rejected, true);
                       assert.equal(s.badWildcardTargetIpv6Rejected, true);
+                      assert.equal(s.badPromEmptyTargetsRejected, true);
+                      assert.equal(s.badPromEmptyMetricsRejected, true);
+                      assert.equal(s.badPromTimeoutExceedsIntervalRejected, true);
+                      assert.equal(s.badPromWildcardTargetRejected, true);
+                      assert.equal(s.badPromPortCollisionRejected, true);
 
                       const fb = fs.readFileSync(process.env.actualFbBridgeConf, "utf8");
                       assert.match(fb, /Port               4320/);
                       assert.match(fb, /Script             \/nix\/store\/.*ocsf\.lua/);
                       assert.match(fb, /DB                 \/var\/lib\/oof-collector\/journald\.db/);
                       assert.match(fb, /@INCLUDE \/etc\/oof\/fb-extra\.conf/);
+
+                      const prom = fs.readFileSync(process.env.actualPromConf, "utf8");
+                      assert.match(prom, /job_name:\s*cloudflared/);
+                      assert.match(prom, /127\.0\.0\.1:20241/);
+                      assert.match(prom, /\^\(cloudflared_tunnel_ha_connections\)\$/);
+                      assert.match(prom, /\^\(__name__\|job\)\$/);
                     '
+                    touch "$out"
+                  '';
+
+              prometheus-metrics =
+                pkgs.runCommand "oof-prometheus-metrics"
+                  {
+                    nativeBuildInputs = [
+                      pkgs.nodejs
+                      pkgs.prometheus
+                      pkgs.prometheus.cli
+                    ];
+                  }
+                  ''
+                    export HOME="$TMPDIR/home"
+                    mkdir -p "$HOME"
+                    promtool check config ${assets.oofPrometheusConfig}
+                    ${assets.oofPrometheus}/bin/prometheus --version
+                    node --test ${self}/tests/prometheus-metrics.test.mjs
                     touch "$out"
                   '';
 
