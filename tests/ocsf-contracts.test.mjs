@@ -1709,9 +1709,11 @@ test("8. Live E2E wire conformance: Vector and Fluent Bit emit identical valid O
     const otlpPayload = encodeOtlpLogsRequest({
       resourceAttrs: {
         "service.name": "billing-api",
-        "host.name": "app-01",
+        "host.name": "other",
+        "host.id": "forged-machine-id",
         "os.type": "linux",
         "process.pid": 888,
+        "process.executable.name": "sshd",
         "deployment.environment": "prod",
       },
       scopeName: "billing.logger",
@@ -1722,7 +1724,7 @@ test("8. Live E2E wire conformance: Vector and Fluent Bit emit identical valid O
           severityNumber: 17,
           severityText: "ERROR",
           body: "card charge timeout",
-          attributes: { "user.id": "1001", "user.name": "alice", "order.id": "ord-7" },
+          attributes: { "user.id": "0", "user.name": "root", "order.id": "ord-7" },
           traceIdHex: "0af7651916cd43dd8448eb211c80319c",
           spanIdHex: "b7ad6b7169203331",
         },
@@ -1804,21 +1806,28 @@ test("8. Live E2E wire conformance: Vector and Fluent Bit emit identical valid O
     const vecOtlpOut = vectorRecords.find((r) => r.message === "card charge timeout");
     assert.ok(vecOtlpOut, "missing Vector normal OTLP output");
     assert.equal(vecOtlpOut.severity_id, 4);
-    assert.equal(vecOtlpOut.device.os.name, "Linux");
-    assert.equal(vecOtlpOut.device.os.type_id, 200);
+    assert.equal(vecOtlpOut.actor, undefined, "sender-claimed OTLP identity must never populate actor");
+    assert.equal(vecOtlpOut.device.hostname, os.hostname(), "device.hostname must be the collector host");
+    assert.equal(vecOtlpOut.device.uid, undefined, "sender-claimed host.id must never populate device.uid");
+    assert.equal(vecOtlpOut.device.os, undefined, "sender-claimed os.type must never populate device.os");
+    assert.equal(vecOtlpOut.unmapped.attributes["user.id"], "0");
+    assert.equal(vecOtlpOut.unmapped.attributes["user.name"], "root");
+    assert.equal(vecOtlpOut.unmapped.resource["host.name"], "other");
+    assert.equal(vecOtlpOut.unmapped.resource["host.id"], "forged-machine-id");
+    assert.equal(vecOtlpOut.unmapped.resource["process.executable.name"], "sshd");
     assert.equal(vecOtlpOut.metadata.correlation_uid, "0af7651916cd43dd8448eb211c80319c");
     assert.equal(vecOtlpOut.unmapped.span_id, "b7ad6b7169203331");
     assert.equal(vecOtlpOut.unmapped.attributes["order.id"], "ord-7");
 
     const vecOtlpEdgeOut = vectorRecords.find((r) => r.log_name === "bsd-svc" && r.message !== "sub-ms observed fallback");
     assert.ok(vecOtlpEdgeOut, "missing Vector edge OTLP output");
-    assert.equal(vecOtlpEdgeOut.device.os, undefined, "unknown os.type must omit device.os");
+    assert.equal(vecOtlpEdgeOut.device.os, undefined, "OTLP os.type must never populate device.os");
     assert.equal(vecOtlpEdgeOut.metadata.correlation_uid, undefined, "all-zero trace_id must be omitted");
     assert.equal(vecOtlpEdgeOut.time, 1736496005122, "must fall back to truncated observed_timestamp when timeUnixNano=0");
     assert.equal(vecOtlpEdgeOut.metadata.logged_time, 1736496005122);
-    assert.equal(vecOtlpEdgeOut.actor.process.pid, 777);
-    assert.equal(vecOtlpEdgeOut.actor.user.uid, "2002");
-    assert.equal(vecOtlpEdgeOut.actor.user.uid_numeric, 2002);
+    assert.equal(vecOtlpEdgeOut.actor, undefined);
+    assert.equal(vecOtlpEdgeOut.unmapped.attributes["process.pid"], 777);
+    assert.equal(vecOtlpEdgeOut.unmapped.attributes["enduser.id"], "2002");
     assert.equal(typeof vecOtlpEdgeOut.message, "string");
 
     const vecOtlpSubMsOut = vectorRecords.find((r) => r.message === "sub-ms observed fallback");
@@ -1990,17 +1999,21 @@ test("8. Live E2E wire conformance: Vector and Fluent Bit emit identical valid O
     assert.equal(fbOtlpOut.time, vecOtlpOut.time);
     assert.equal(fbOtlpOut.time_dt, vecOtlpOut.time_dt);
     assert.equal(fbOtlpOut.metadata.correlation_uid, vecOtlpOut.metadata.correlation_uid);
+    assert.equal(fbOtlpOut.actor, undefined, "sender-claimed OTLP identity must never populate actor");
+    assert.equal(fbOtlpOut.device.hostname, os.hostname(), "device.hostname must be the collector host");
     assert.deepEqual(fbOtlpOut.device, vecOtlpOut.device);
     assert.deepEqual(fbOtlpOut.actor, vecOtlpOut.actor);
     assert.deepEqual(fbOtlpOut.unmapped, vecOtlpOut.unmapped);
 
     const fbOtlpEdgeOut = fbRecords.find((r) => r.log_name === "bsd-svc" && r.message !== "sub-ms observed fallback");
     assert.ok(fbOtlpEdgeOut, "missing Fluent Bit edge OTLP output");
-    assert.equal(fbOtlpEdgeOut.device.os, undefined, "unknown os.type must omit device.os");
+    assert.equal(fbOtlpEdgeOut.device.os, undefined, "OTLP os.type must never populate device.os");
     assert.equal(fbOtlpEdgeOut.metadata.correlation_uid, undefined, "all-zero binary trace_id must be omitted");
     assert.equal(fbOtlpEdgeOut.time, vecOtlpEdgeOut.time);
     assert.equal(fbOtlpEdgeOut.metadata.logged_time, vecOtlpEdgeOut.metadata.logged_time);
     assert.deepEqual(fbOtlpEdgeOut.actor, vecOtlpEdgeOut.actor);
+    assert.deepEqual(fbOtlpEdgeOut.device, vecOtlpEdgeOut.device);
+    assert.deepEqual(fbOtlpEdgeOut.unmapped, vecOtlpEdgeOut.unmapped);
     assert.equal(typeof fbOtlpEdgeOut.message, "string");
 
     const fbOtlpSubMsOut = fbRecords.find((r) => r.message === "sub-ms observed fallback");

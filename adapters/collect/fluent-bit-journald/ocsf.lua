@@ -296,26 +296,36 @@ local JOURNALD_CONSUMED = {
   span_id = true,
 }
 
+-- OTLP senders are unauthenticated: sender-claimed host / process / user attributes are never
+-- consumed into `device` / `actor`; they stay under `unmapped.attributes` / `unmapped.resource`.
 local OTLP_CONSUMED_ATTRS = {
   ["event.id"] = true,
-  ["process.pid"] = true,
-  ["user.id"] = true,
-  ["enduser.id"] = true,
-  ["user.name"] = true,
-  ["user.full_name"] = true,
 }
 
 local OTLP_CONSUMED_RESOURCES = {
-  ["host.name"] = true,
-  ["service.instance.id"] = true,
-  ["host.id"] = true,
-  ["os.type"] = true,
-  ["process.pid"] = true,
-  ["process.executable.name"] = true,
   ["service.name"] = true,
-  ["process.executable.path"] = true,
-  ["process.command_line"] = true,
 }
+
+local function read_first_line(path)
+  local f = io.open(path, "r")
+  if f == nil then
+    return nil
+  end
+  local line = f:read("*l")
+  f:close()
+  if type(line) ~= "string" then
+    return nil
+  end
+  line = line:match("^%s*(.-)%s*$")
+  if line == "" then
+    return nil
+  end
+  return line
+end
+
+-- Collector host's own hostname (same source as gethostname(2) used by Vector `get_hostname()`).
+local COLLECTOR_HOSTNAME = read_first_line("/proc/sys/kernel/hostname")
+  or read_first_line("/etc/hostname")
 
 local function transform_journald(ts, record)
   local rec = type(record) == "table" and record or {}
@@ -477,15 +487,6 @@ local function transform_journald(ts, record)
   return out
 end
 
-local function parse_otlp_uid(raw)
-  if is_non_empty_string(raw) then
-    return raw, parse_uint(raw)
-  elseif type(raw) == "number" and raw == raw and raw >= 0 and raw <= 9007199254740991 and math.floor(raw) == raw then
-    return string.format("%.0f", raw), raw
-  end
-  return nil, nil
-end
-
 local function transform_otlp(ts, group, metadata, record)
   local rec = type(record) == "table" and record or {}
   local grp = type(group) == "table" and group or {}
@@ -540,50 +541,6 @@ local function transform_otlp(ts, group, metadata, record)
   local span_clean = normalize_otlp_id(otlp.span_id, 8)
   local event_uid = first_non_empty(attrs["event.id"], span_clean)
 
-  local hostname = first_non_empty(res["host.name"], res["service.instance.id"])
-  local host_id = first_non_empty(res["host.id"])
-
-  local dev_os = nil
-  if is_non_empty_string(res["os.type"]) then
-    local os_lc = string.lower(res["os.type"])
-    if os_lc == "linux" then
-      dev_os = { name = "Linux", type_id = 200 }
-    elseif os_lc == "windows" then
-      dev_os = { name = "Windows", type_id = 100 }
-    elseif os_lc == "darwin" or os_lc == "macos" then
-      dev_os = { name = "macOS", type_id = 300 }
-    end
-  end
-
-  local pid_val = parse_uint(res["process.pid"])
-  if pid_val == nil then
-    pid_val = parse_uint(attrs["process.pid"])
-  end
-
-  local proc = {}
-  if pid_val ~= nil then proc.pid = pid_val end
-  local proc_name = first_non_empty(res["process.executable.name"], service_name)
-  if proc_name ~= nil then proc.name = proc_name end
-  local proc_path = first_non_empty(res["process.executable.path"])
-  if proc_path ~= nil then proc.path = proc_path end
-  local proc_cmd = first_non_empty(res["process.command_line"])
-  if proc_cmd ~= nil then proc.cmd_line = proc_cmd end
-
-  local uid_str, uid_num = parse_otlp_uid(attrs["user.id"])
-  if uid_str == nil then
-    uid_str, uid_num = parse_otlp_uid(attrs["enduser.id"])
-  end
-  local user_name = first_non_empty(attrs["user.name"], attrs["user.full_name"])
-
-  local usr = {}
-  if uid_str ~= nil then usr.uid = uid_str end
-  if uid_num ~= nil then usr.uid_numeric = uid_num end
-  if user_name ~= nil then usr.name = user_name end
-
-  local actor = {}
-  if next(proc) ~= nil then actor.process = proc end
-  if next(usr) ~= nil then actor.user = usr end
-
   local meta = {
     version = "1.3.0",
     product = {
@@ -602,9 +559,7 @@ local function transform_otlp(ts, group, metadata, record)
     type_id = 0,
     type = "Unknown",
   }
-  if hostname ~= nil then dev.hostname = hostname end
-  if host_id ~= nil then dev.uid = host_id end
-  if dev_os ~= nil then dev.os = dev_os end
+  if COLLECTOR_HOSTNAME ~= nil then dev.hostname = COLLECTOR_HOSTNAME end
 
   local unmapped_attrs = {}
   for k, v in pairs(attrs) do
@@ -647,7 +602,6 @@ local function transform_otlp(ts, group, metadata, record)
   if msg ~= nil then out.message = msg end
   if log_name ~= nil then out.log_name = log_name end
   out.log_provider = log_provider
-  if next(actor) ~= nil then out.actor = actor end
   if next(unmapped) ~= nil then out.unmapped = unmapped end
   return out
 end
