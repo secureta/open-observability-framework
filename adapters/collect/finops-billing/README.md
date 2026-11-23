@@ -12,8 +12,8 @@ Zero-dependency Node.js 20+ collector that pulls daily usage and billing records
 - `CLOUDFLARE_ACCOUNT_ID`: 32-character hexadecimal Cloudflare account ID
 - `CLOUDFLARE_API_TOKEN`: Scoped read-only API token with `Account Analytics:Read`
 - `CLOUDFLARE_ACCOUNT_NAME` *(optional)*: Human-readable billing account name
-- `OOF_CF_INCLUDE_PIPELINES` *(optional)*: Set to `"true"` to also query `pipelinesOperatorAdaptiveGroups.sum.bytesIn` for Cloudflare Pipelines usage
-- `OOF_CF_PRICING_JSON` *(optional)*: JSON object overriding default USD list prices (`r2StoragePerGbMonth`, `r2ClassAPerMillionOps`, `r2ClassBPerMillionOps`, `pipelinesPerGbIngested`, `daysPerBillingMonth`). Note: Cloudflare Analytics rows emit `ListCost` estimates with `BilledCost = 0` / `EffectiveCost = 0` (`Tags.cost_basis = "list_price_estimate"`) so they are not conflated with invoice charges.
+- `OOF_CF_INCLUDE_PIPELINES` *(optional)*: Set to `"true"` to also query `pipelinesOperatorAdaptiveGroups.sum.bytesIn` (`streamId_neq: ""`) for Cloudflare Pipelines free stream ingress usage
+- `OOF_CF_PRICING_JSON` *(optional)*: JSON object overriding default USD list prices (`r2StoragePerGbMonth`, `r2ClassAPerMillionOps`, `r2ClassBPerMillionOps`, `daysPerBillingMonth`). Note: Cloudflare Analytics rows emit `ListCost` / `ContractedCost` estimates with `BilledCost = 0` / `EffectiveCost = 0` (`Tags.cost_basis = "list_price_estimate"`) so they are not conflated with invoice charges, and Pipelines stream ingress is recorded at `$0` (free ingress).
 
 ### GitHub Source (enable GitHub Actions / Packages / Storage collection)
 - `GITHUB_ORG` or `GITHUB_USER`: Target GitHub organization or user login

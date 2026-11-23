@@ -7,10 +7,10 @@ const DEFAULT_GITHUB_API_BASE = "https://api.github.com";
 export const DEFAULT_CLOUDFLARE_PRICING = {
   // Public Cloudflare standard list prices (USD) used for pre-allowance list-price estimates.
   // Actual billed/effective spend is kept at 0 for analytics-derived rows until invoice billing data is ingested.
+  // Note: Cloudflare Basin Pipelines stream ingress is free ($0); SQL transforms and sink delivery are billed separately.
   r2StoragePerGbMonth: 0.015,
   r2ClassAPerMillionOps: 4.5,
   r2ClassBPerMillionOps: 0.36,
-  pipelinesPerGbIngested: 0.025,
   daysPerBillingMonth: 30,
 };
 
@@ -130,6 +130,7 @@ export function buildFocusRecord(input) {
     ChargeDescription: cleanNonEmptyString(input.ChargeDescription) || "Cloud usage charge",
     ChargePeriodEnd: cleanNonEmptyString(input.ChargePeriodEnd),
     ChargePeriodStart: cleanNonEmptyString(input.ChargePeriodStart),
+    ContractedCost: roundCost(input.ContractedCost ?? input.ListCost ?? input.BilledCost),
     EffectiveCost: roundCost(input.EffectiveCost ?? input.BilledCost),
     InvoiceIssuerName: cleanNonEmptyString(input.InvoiceIssuerName) || cleanNonEmptyString(input.ProviderName) || "Unknown",
     ProviderName: cleanNonEmptyString(input.ProviderName) || "Unknown",
@@ -168,7 +169,6 @@ export function buildFocusRecord(input) {
 
   const optionalNumbers = [
     "ConsumedQuantity",
-    "ContractedCost",
     "ContractedUnitPrice",
     "ListCost",
     "ListUnitPrice",
@@ -261,12 +261,15 @@ export function normalizeCloudflareAnalyticsToFocus(
         PricingUnit: "GB-Month",
         ListUnitPrice: effectivePricing.r2StoragePerGbMonth,
         ListCost: listEstimate,
+        ContractedUnitPrice: effectivePricing.r2StoragePerGbMonth,
+        ContractedCost: listEstimate,
         // Analytics data does not reflect account-wide monthly free allowances or invoices.
         BilledCost: 0,
         EffectiveCost: 0,
         Tags: {
           oof_collector: "oof-finops-billing",
           source_api: "cloudflare-graphql-analytics",
+          dataset: "cloudflare_r2",
           cost_basis: "list_price_estimate",
           snapshot_ts_ms: snapshotTsMs,
           snapshot_date: window.dateString,
@@ -341,11 +344,14 @@ export function normalizeCloudflareAnalyticsToFocus(
         PricingUnit: "1M Requests",
         ListUnitPrice: unitPricePerMillion,
         ListCost: listEstimate,
+        ContractedUnitPrice: unitPricePerMillion,
+        ContractedCost: listEstimate,
         BilledCost: 0,
         EffectiveCost: 0,
         Tags: {
           oof_collector: "oof-finops-billing",
           source_api: "cloudflare-graphql-analytics",
+          dataset: "cloudflare_r2",
           cost_basis: "list_price_estimate",
           snapshot_ts_ms: snapshotTsMs,
           snapshot_date: window.dateString,
@@ -356,7 +362,8 @@ export function normalizeCloudflareAnalyticsToFocus(
     );
   }
 
-  // 3. Cloudflare Pipelines / Basin ingestion volume (`pipelinesOperatorAdaptiveGroups.sum.bytesIn`)
+  // 3. Cloudflare Pipelines / Basin stream ingress volume (`pipelinesOperatorAdaptiveGroups.sum.bytesIn` with `streamId_neq: ""`)
+  // Stream ingress is free ($0) under Cloudflare Pipelines pricing; emit usage-only ($0 list/contracted/billed cost).
   const pipelineGroups = Array.isArray(acct.pipelinesOperatorAdaptiveGroups)
     ? acct.pipelinesOperatorAdaptiveGroups
     : [];
@@ -370,7 +377,6 @@ export function normalizeCloudflareAnalyticsToFocus(
 
   for (const [pipelineId, bytesIn] of bytesByPipeline.entries()) {
     const gb = bytesIn / 1e9;
-    const listEstimate = gb * effectivePricing.pipelinesPerGbIngested;
     records.push(
       buildFocusRecord({
         BillingAccountId: accountId,
@@ -379,7 +385,7 @@ export function normalizeCloudflareAnalyticsToFocus(
         BillingPeriodStart: window.billingPeriodStart,
         BillingPeriodEnd: window.billingPeriodEnd,
         ChargeCategory: "Usage",
-        ChargeDescription: `Cloudflare Pipelines ingestion (list-price estimate) for ${pipelineId} (${window.dateString})`,
+        ChargeDescription: `Cloudflare Pipelines stream ingress usage (free ingress) for ${pipelineId} (${window.dateString})`,
         ChargeFrequency: "Usage-Based",
         ChargePeriodStart: window.chargePeriodStart,
         ChargePeriodEnd: window.chargePeriodEnd,
@@ -391,19 +397,22 @@ export function normalizeCloudflareAnalyticsToFocus(
         ResourceId: `pipelines:${accountId}:${pipelineId}`,
         ResourceName: pipelineId,
         ResourceType: "Basin Pipeline",
-        SkuId: "pipelines_ingest_gb",
+        SkuId: "pipelines_stream_ingress_gb",
         PricingCategory: "Standard",
         ConsumedQuantity: gb,
         ConsumedUnit: "GB",
         PricingQuantity: gb,
         PricingUnit: "GB",
-        ListUnitPrice: effectivePricing.pipelinesPerGbIngested,
-        ListCost: listEstimate,
+        ListUnitPrice: 0,
+        ListCost: 0,
+        ContractedUnitPrice: 0,
+        ContractedCost: 0,
         BilledCost: 0,
         EffectiveCost: 0,
         Tags: {
           oof_collector: "oof-finops-billing",
           source_api: "cloudflare-graphql-analytics",
+          dataset: "cloudflare_pipelines",
           cost_basis: "list_price_estimate",
           snapshot_ts_ms: snapshotTsMs,
           snapshot_date: window.dateString,
@@ -422,7 +431,7 @@ export function buildCloudflareGraphqlQuery({ includePipelines = false } = {}) {
     ? `
           pipelinesOperatorAdaptiveGroups(
             limit: 1000
-            filter: { datetime_geq: $start, datetime_lt: $end }
+            filter: { datetime_geq: $start, datetime_lt: $end, streamId_neq: "" }
           ) {
             dimensions { pipelineId }
             sum { bytesIn }
@@ -594,6 +603,7 @@ export function normalizeGitHubBillingUsageToFocus(
         Tags: {
           oof_collector: "oof-finops-billing",
           source_api: "github-billing-usage",
+          dataset: "github_billing_usage",
           cost_basis: "billed_usage",
           snapshot_ts_ms: snapshotTsMs,
           snapshot_date: itemWindow.dateString,

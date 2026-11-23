@@ -170,6 +170,7 @@ test("FinOps monitoring SQL queries (DuckDB & Basin SQL dialects) deduplicate sn
     assert.match(sql, /estimated_waste_usd/);
     assert.match(sql, /approx_payload_mib/);
     assert.match(sql, /max_snapshot_ts_ms/);
+    assert.match(sql, /GROUP BY ProviderName, BillingAccountId, dataset, charge_day/);
     assert.match(sql, /cost_basis = 'billed_usage'/);
     assert.match(sql, /INTERVAL '7' DAY/);
     assert.match(sql, /spike_ratio/);
@@ -244,6 +245,7 @@ test("Cloudflare and GitHub FOCUS normalizers classify R2 free/unknown ops safel
 
   const withPipelinesQuery = buildCloudflareGraphqlQuery({ includePipelines: true });
   assert.match(withPipelinesQuery, /pipelinesOperatorAdaptiveGroups/);
+  assert.match(withPipelinesQuery, /streamId_neq:\s*""/);
   assert.match(withPipelinesQuery, /pipelineId/);
   assert.match(withPipelinesQuery, /bytesIn/);
 
@@ -297,16 +299,65 @@ test("Cloudflare and GitHub FOCUS normalizers classify R2 free/unknown ops safel
   const classBRec = cfRecords.find((r) => r.SkuId === "r2_class_b_ops");
   const freeRec = cfRecords.find((r) => r.SkuId === "r2_free_ops");
   const unknownRec = cfRecords.find((r) => r.SkuId === "r2_unclassified_ops");
-  const pipeRec = cfRecords.find((r) => r.SkuId === "pipelines_ingest_gb");
+  const pipeRec = cfRecords.find((r) => r.SkuId === "pipelines_stream_ingress_gb");
 
   assert.equal(storageRec.ListCost, 0.015);
+  assert.equal(storageRec.ContractedCost, 0.015);
+  assert.equal(storageRec.Tags.dataset, "cloudflare_r2");
   assert.equal(classARec.ListCost, 4.5);
+  assert.equal(classARec.ContractedCost, 4.5);
   assert.equal(classBRec.ListCost, 0.72);
+  assert.equal(classBRec.ContractedCost, 0.72);
   assert.equal(freeRec.ListCost, 0);
+  assert.equal(freeRec.ContractedCost, 0);
   assert.equal(freeRec.ConsumedQuantity, 100_000);
   assert.equal(unknownRec.ListCost, 0);
+  assert.equal(unknownRec.ContractedCost, 0);
   assert.equal(unknownRec.ConsumedQuantity, 50_000);
-  assert.equal(pipeRec.ListCost, 0.1);
+  // Pipelines stream ingress is free ($0) under Cloudflare Pipelines pricing
+  assert.equal(pipeRec.ListCost, 0);
+  assert.equal(pipeRec.ContractedCost, 0);
+  assert.equal(pipeRec.ConsumedQuantity, 4);
+  assert.equal(pipeRec.Tags.dataset, "cloudflare_pipelines");
+
+  // Regression: R2-only rerun must not hide earlier Pipelines snapshot when deduplicating per dataset
+  const r2OnlyRerun = normalizeCloudflareAnalyticsToFocus(
+    {
+      data: {
+        viewer: {
+          accounts: [
+            {
+              r2StorageAdaptiveGroups: [
+                { dimensions: { bucketName: "oof-telemetry" }, max: { payloadSize: 60_000_000_000, metadataSize: 0 } },
+              ],
+              r2OperationsAdaptiveGroups: [],
+            },
+          ],
+        },
+      },
+    },
+    {
+      accountId: "0123456789abcdef0123456789abcdef",
+      accountName: "oof-prod",
+      window,
+      pricing: DEFAULT_CLOUDFLARE_PRICING,
+      snapshotTsMs: snapshotTsMs + 60_000,
+    }
+  );
+  const combined = [...cfRecords, ...r2OnlyRerun];
+  const latestByDataset = new Map();
+  for (const r of combined) {
+    const key = `${r.ProviderName}::${r.BillingAccountId}::${r.Tags.dataset}::${r.ChargePeriodStart}`;
+    const prev = latestByDataset.get(key) ?? -1;
+    if (r.Tags.snapshot_ts_ms > prev) latestByDataset.set(key, r.Tags.snapshot_ts_ms);
+  }
+  const deduped = combined.filter((r) => {
+    const key = `${r.ProviderName}::${r.BillingAccountId}::${r.Tags.dataset}::${r.ChargePeriodStart}`;
+    return r.Tags.snapshot_ts_ms === latestByDataset.get(key);
+  });
+  assert.equal(deduped.filter((r) => r.Tags.dataset === "cloudflare_r2").length, 1);
+  assert.equal(deduped.find((r) => r.Tags.dataset === "cloudflare_r2").ListCost, 0.03);
+  assert.equal(deduped.filter((r) => r.Tags.dataset === "cloudflare_pipelines").length, 1);
 
   const ghRecords = normalizeGitHubBillingUsageToFocus(
     {
@@ -473,6 +524,7 @@ test("E2E FinOps collector fetches Cloudflare R2+Pipelines + GitHub APIs, gzips 
     });
 
     assert.match(receivedGraphqlQuery, /pipelinesOperatorAdaptiveGroups/);
+    assert.match(receivedGraphqlQuery, /streamId_neq:\s*""/);
     assert.match(receivedGraphqlQuery, /bytesIn/);
     assert.equal(result.status, 200);
     assert.equal(result.count, 5);
@@ -483,11 +535,21 @@ test("E2E FinOps collector fetches Cloudflare R2+Pipelines + GitHub APIs, gzips 
     for (const rec of receivedBasinRecords) {
       assertFocusRecordMatchesSchema(rec, schema.fields);
       assert.equal(rec.Tags.snapshot_ts_ms, 1795305600123);
+      assert.equal(typeof rec.ContractedCost, "number");
     }
 
     const providers = new Set(receivedBasinRecords.map((r) => r.ProviderName));
     assert.deepEqual(providers, new Set(["Cloudflare", "GitHub"]));
-    assert.ok(receivedBasinRecords.some((r) => r.ServiceName === "Cloudflare Pipelines" && r.ListCost === 0.05));
+    assert.ok(
+      receivedBasinRecords.some(
+        (r) =>
+          r.ServiceName === "Cloudflare Pipelines" &&
+          r.SkuId === "pipelines_stream_ingress_gb" &&
+          r.ConsumedQuantity === 2 &&
+          r.ListCost === 0 &&
+          r.ContractedCost === 0
+      )
+    );
     assert.ok(receivedBasinRecords.some((r) => r.SkuId === "r2_free_ops" && r.ListCost === 0));
 
     // 3. Error messages must never leak tokens
