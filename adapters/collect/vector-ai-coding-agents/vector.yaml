@@ -21,6 +21,11 @@
 #   OOF_AGY_TRANSCRIPT_GLOB   (e.g. /home/<user>/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl)
 #   OOF_PI_SESSIONS_GLOB      (e.g. /home/<user>/.pi/agent/sessions/**/*.jsonl)
 #
+# Security note (shared hosts):
+#   Loopback OTLP ports (127.0.0.1:4327/4328) are intended for single-user developer workstations.
+#   On multi-tenant/shared hosts, isolate the collector per user network namespace or front it with
+#   an authenticated mTLS/token proxy before forwarding to Basin.
+#
 # Vector >= 0.60 note:
 #   Run with VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true or --dangerously-allow-env-var-interpolation.
 
@@ -66,19 +71,20 @@ transforms:
       time_ms = to_unix_timestamp(event_ts, unit: "milliseconds")
       time_dt = format_timestamp!(event_ts, "%Y-%m-%dT%H:%M:%S%.3fZ")
 
-      raw_event = if exists(attrs."event.name") && is_string(attrs."event.name") && string!(attrs."event.name") != "" {
+      # Never fall back to raw log body (.message) so untrusted text cannot leak into event_name.
+      raw_event_in = if exists(attrs."event.name") && is_string(attrs."event.name") && string!(attrs."event.name") != "" {
         string!(attrs."event.name")
-      } else if exists(.message) && is_string(.message) && string!(.message) != "" && length(string!(.message)) <= 128 {
-        string!(.message)
+      } else if exists(.event_name) && is_string(.event_name) && string!(.event_name) != "" {
+        string!(.event_name)
       } else {
         "gen_ai.client.event"
       }
 
       raw_service = if exists(res."service.name") && is_string(res."service.name") && string!(res."service.name") != "" {
         downcase(string!(res."service.name"))
-      } else if starts_with(raw_event, "claude_code.") {
+      } else if starts_with(raw_event_in, "claude_code.") {
         "claude-code"
-      } else if starts_with(raw_event, "codex.") {
+      } else if starts_with(raw_event_in, "codex.") {
         "codex-cli"
       } else {
         "unknown-agent"
@@ -92,16 +98,26 @@ transforms:
         raw_service
       }
 
+      # Canonicalize short Claude Code event.name values (e.g. api_error -> claude_code.api_error)
+      is_short_claude = raw_event_in == "api_request" || raw_event_in == "api_error" || raw_event_in == "tool_result" || raw_event_in == "tool_decision" || raw_event_in == "user_prompt" || raw_event_in == "assistant_response"
+      raw_event = if svc_name == "claude-code" && is_short_claude {
+        "claude_code." + raw_event_in
+      } else {
+        raw_event_in
+      }
+
       svc_version = if exists(res."service.version") && is_string(res."service.version") && string!(res."service.version") != "" {
         string!(res."service.version")
       } else { null }
 
       op_name = if exists(attrs."gen_ai.operation.name") && is_string(attrs."gen_ai.operation.name") {
         string!(attrs."gen_ai.operation.name")
-      } else if raw_event == "claude_code.api_request" || raw_event == "claude_code.api_error" || raw_event == "codex.api_request" || raw_event == "codex.sse_event" {
+      } else if raw_event == "claude_code.api_request" || raw_event == "claude_code.api_error" || raw_event == "claude_code.assistant_response" || raw_event == "codex.api_request" || raw_event == "codex.sse_event" || raw_event == "codex.agent_response" {
         "chat"
-      } else if raw_event == "claude_code.tool_result" || raw_event == "codex.tool_result" || raw_event == "codex.tool_decision" {
+      } else if raw_event == "claude_code.tool_result" || raw_event == "codex.tool_result" {
         "execute_tool"
+      } else if raw_event == "claude_code.tool_decision" || raw_event == "codex.tool_decision" {
+        "tool_decision"
       } else if raw_event == "claude_code.user_prompt" || raw_event == "codex.user_prompt" || raw_event == "codex.conversation_starts" {
         "session"
       } else {
@@ -177,6 +193,11 @@ transforms:
         status = "error"
         error_type = string!(attrs."error.type")
       }
+      # Codex emits error.message on failed SSE events or API requests without an HTTP status; never persist the message text.
+      if status == "ok" && (raw_event == "codex.sse_event" || raw_event == "codex.api_request") && exists(attrs."error.message") && is_string(attrs."error.message") && string!(attrs."error.message") != "" {
+        status = "error"
+        error_type = if raw_event == "codex.sse_event" { "stream_error" } else { "api_error" }
+      }
 
       duration_ms = null
       if exists(attrs.duration_ms) {
@@ -185,9 +206,11 @@ transforms:
       }
 
       in_tok = null
+      in_tok_excludes_cache = false
       for_in = if exists(attrs."gen_ai.usage.input_tokens") && attrs."gen_ai.usage.input_tokens" != null {
         attrs."gen_ai.usage.input_tokens"
       } else if exists(attrs.input_tokens) && attrs.input_tokens != null {
+        in_tok_excludes_cache = true
         attrs.input_tokens
       } else if exists(attrs.input_token_count) && attrs.input_token_count != null {
         attrs.input_token_count
@@ -245,14 +268,17 @@ transforms:
         if e == null { reason_tok = v }
       }
 
+      # Codex (input_token_count/output_token_count) and OTel GenAI (gen_ai.usage.*) report inclusive totals;
+      # Claude Code native input_tokens excludes cache_read_tokens and cache_creation_tokens.
       total_tok = null
-      if in_tok != null || out_tok != null || cache_read != null || cache_create != null || reason_tok != null {
+      if in_tok != null || out_tok != null || (in_tok_excludes_cache && (cache_read != null || cache_create != null)) {
         t_sum = 0
         if in_tok != null { t_sum = t_sum + int!(in_tok) }
         if out_tok != null { t_sum = t_sum + int!(out_tok) }
-        if cache_read != null { t_sum = t_sum + int!(cache_read) }
-        if cache_create != null { t_sum = t_sum + int!(cache_create) }
-        if reason_tok != null { t_sum = t_sum + int!(reason_tok) }
+        if in_tok_excludes_cache {
+          if cache_read != null { t_sum = t_sum + int!(cache_read) }
+          if cache_create != null { t_sum = t_sum + int!(cache_create) }
+        }
         total_tok = t_sum
       }
 
@@ -334,6 +360,8 @@ transforms:
           string!(attrs.completion)
         } else if exists(attrs."gen_ai.completion") && is_string(attrs."gen_ai.completion") && string!(attrs."gen_ai.completion") != "" {
           string!(attrs."gen_ai.completion")
+        } else if (raw_event == "claude_code.assistant_response" || raw_event == "codex.agent_response") && exists(attrs.response) && is_string(attrs.response) && string!(attrs.response) != "" {
+          string!(attrs.response)
         } else { null }
         if raw_c != null { out._raw_completion = raw_c }
       }
@@ -770,8 +798,75 @@ tests:
               assert_eq!(.operation_name, "chat")
               assert_eq!(.gen_ai.provider_name, "openai")
               assert_eq!(.gen_ai.usage.reasoning_tokens, 400)
-              assert_eq!(.gen_ai.usage.total_tokens, 3900)
+              assert_eq!(.gen_ai.usage.total_tokens, 2500)
               assert_eq!(.session_id, "conv-codex-001")
+
+  - name: claude_code_short_event_names_and_error_classification
+    inputs:
+      - insert_at: genai_otlp_logs
+        type: log
+        log_fields:
+          timestamp: "2026-11-23T03:01:10Z"
+          resources:
+            service.name: "claude-code"
+          attributes:
+            event.name: "api_error"
+            model: "claude-sonnet-4-6"
+            status_code: 429
+            duration_ms: 120
+            session.id: "sess-claude-err"
+    outputs:
+      - extract_from: genai_content_policy
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event_name, "claude_code.api_error")
+              assert_eq!(.operation_name, "chat")
+              assert_eq!(.status, "error")
+              assert_eq!(.error_type, "429")
+
+  - name: codex_sse_error_message_marks_error_without_leaking_body
+    inputs:
+      - insert_at: genai_otlp_logs
+        type: log
+        log_fields:
+          timestamp: "2026-11-23T03:01:20Z"
+          message: "SENSITIVE_RAW_BODY_MUST_NOT_LEAK"
+          resources:
+            service.name: "codex-cli"
+          attributes:
+            event.name: "codex.sse_event"
+            event.kind: "response.completed"
+            error.message: "SECRET_UPSTREAM_ERR_DETAIL"
+            conversation.id: "conv-codex-err"
+    outputs:
+      - extract_from: genai_content_policy
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.status, "error")
+              assert_eq!(.error_type, "stream_error")
+              raw = encode_json(.)
+              assert!(!contains(raw, "SECRET_UPSTREAM_ERR_DETAIL"))
+              assert!(!contains(raw, "SENSITIVE_RAW_BODY_MUST_NOT_LEAK"))
+
+  - name: otlp_missing_event_name_never_copies_raw_body
+    inputs:
+      - insert_at: genai_otlp_logs
+        type: log
+        log_fields:
+          timestamp: "2026-11-23T03:01:30Z"
+          message: "PRIVATE_PROMPT_IN_BODY"
+          resources:
+            service.name: "claude-code"
+          attributes: {}
+    outputs:
+      - extract_from: genai_content_policy
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event_name, "gen_ai.client.event")
+              assert!(!contains(encode_json(.), "PRIVATE_PROMPT_IN_BODY"))
 
   - name: antigravity_transcript_strips_content_and_thinking
     inputs:
