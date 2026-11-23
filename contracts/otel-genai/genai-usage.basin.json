@@ -1,0 +1,188 @@
+{
+  "fields": [
+    {
+      "name": "time",
+      "type": "int64",
+      "required": true
+    },
+    {
+      "name": "time_dt",
+      "type": "timestamp",
+      "unit": "millisecond",
+      "required": false
+    },
+    {
+      "name": "event_name",
+      "type": "string",
+      "required": true
+    },
+    {
+      "name": "operation_name",
+      "type": "string",
+      "required": true
+    },
+    {
+      "name": "trace_id",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "span_id",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "session_id",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "status",
+      "type": "string",
+      "required": true
+    },
+    {
+      "name": "error_type",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "duration_ms",
+      "type": "float64",
+      "required": false
+    },
+    {
+      "name": "service",
+      "type": "struct",
+      "required": true,
+      "fields": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "version",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "source_protocol",
+          "type": "string",
+          "required": true
+        }
+      ]
+    },
+    {
+      "name": "host",
+      "type": "struct",
+      "required": true,
+      "fields": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "workspace",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "vcs_repository",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "vcs_ref",
+          "type": "string",
+          "required": false
+        }
+      ]
+    },
+    {
+      "name": "gen_ai",
+      "type": "struct",
+      "required": true,
+      "fields": [
+        {
+          "name": "provider_name",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "request_model",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "response_model",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "finish_reason",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "tool_name",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "tool_decision",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "usage",
+          "type": "struct",
+          "required": false,
+          "fields": [
+            {
+              "name": "input_tokens",
+              "type": "int64",
+              "required": false
+            },
+            {
+              "name": "output_tokens",
+              "type": "int64",
+              "required": false
+            },
+            {
+              "name": "cache_read_tokens",
+              "type": "int64",
+              "required": false
+            },
+            {
+              "name": "cache_creation_tokens",
+              "type": "int64",
+              "required": false
+            },
+            {
+              "name": "reasoning_tokens",
+              "type": "int64",
+              "required": false
+            },
+            {
+              "name": "total_tokens",
+              "type": "int64",
+              "required": false
+            },
+            {
+              "name": "cost_usd",
+              "type": "float64",
+              "required": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "attributes",
+      "type": "json",
+      "required": false
+    }
+  ]
+}

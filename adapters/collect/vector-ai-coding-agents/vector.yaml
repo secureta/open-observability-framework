@@ -1,0 +1,1097 @@
+# Open Observability Framework — Vector Coding-Agent AI Usage Collector
+#
+# Collects metadata-only AI usage telemetry (capture_content: none) from:
+#   1. Authenticated OTLP/HTTP JSON logs (127.0.0.1:4328/v1/logs, HTTP 401 on missing/invalid auth): Claude Code, Codex CLI, generic OTel GenAI
+#   2. Local JSONL transcripts: Antigravity (agy) / herdr sessions
+#   3. Local JSONL sessions: Pi (pi-coding-agent)
+#
+# Normalizes all events into contracts/otel-genai/genai-usage.basin.json (ai.genai_usage)
+# without persisting prompts, completions, chain-of-thought, or tool arguments, and ships
+# gzipped JSON arrays directly to Cloudflare Basin HTTP (direct-basin-http).
+#
+# Required environment variables:
+#   OOF_AI_BASIN_ENDPOINT   (e.g. https://<AI_STREAM_ID>.ingest.cloudflare.com)
+#   OOF_AI_INGEST_TOKEN     (Cloudflare Account API Token with Pipelines Send)
+#   OOF_AI_OTLP_AUTH_TOKEN  (Shared local auth secret enforced at the HTTP listener; returns HTTP 401 on mismatch)
+#
+# Optional environment variables:
+#   OOF_VECTOR_AI_DATA_DIR    (default: /var/lib/vector-ai)
+#   OOF_AI_OTLP_HTTP_LISTEN   (default: 127.0.0.1:4328)
+#   OOF_AI_CAPTURE_CONTENT    (default: none; set to redacted or full to opt into prompt/completion capture)
+#   OOF_AGY_TRANSCRIPT_GLOB   (e.g. /home/<user>/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl)
+#   OOF_PI_SESSIONS_GLOB      (e.g. /home/<user>/.pi/agent/sessions/**/*.jsonl)
+#
+# Security note:
+#   Local OTLP/HTTP JSON ingestion enforces HTTP authentication at the listener before accepting
+#   batches (returning HTTP 401 on missing/invalid credentials), exposes no unauthenticated gRPC
+#   listener, and never forwards local credentials to Basin.
+#
+# Vector >= 0.60 note:
+#   Run with VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true or --dangerously-allow-env-var-interpolation.
+
+data_dir: "${OOF_VECTOR_AI_DATA_DIR:-/var/lib/vector-ai}"
+
+sources:
+  otlp_http:
+    type: http_server
+    address: "${OOF_AI_OTLP_HTTP_LISTEN:-127.0.0.1:4328}"
+    path: "/v1/logs"
+    strict_path: true
+    framing:
+      method: bytes
+    decoding:
+      codec: json
+    auth:
+      strategy: bearer
+      token: "${OOF_AI_OTLP_AUTH_TOKEN}"
+
+  antigravity_transcripts:
+    type: file
+    include:
+      - "${OOF_AGY_TRANSCRIPT_GLOB:-/var/empty/agy-transcripts/*.jsonl}"
+    read_from: beginning
+
+  pi_sessions:
+    type: file
+    include:
+      - "${OOF_PI_SESSIONS_GLOB:-/var/empty/pi-sessions/*.jsonl}"
+    read_from: beginning
+
+transforms:
+  genai_otlp_decode:
+    type: remap
+    inputs:
+      - otlp_http
+    source: |
+      # Expand OTLP/HTTP JSON ExportLogsServiceRequest (resourceLogs[].scopeLogs[].logRecords[])
+      # into flat log events consumed by genai_otlp_logs.
+      events = []
+      if exists(.resourceLogs) && is_array(.resourceLogs) {
+        for_each(array!(.resourceLogs)) -> |_ri, rl| {
+          if is_object(rl) {
+            res_map = {}
+            if exists(rl.resource) && is_object(rl.resource) && exists(rl.resource.attributes) && is_array(rl.resource.attributes) {
+              for_each(array!(rl.resource.attributes)) -> |_ai, kv| {
+                if is_object(kv) && exists(kv.key) && is_string(kv.key) && exists(kv.value) && is_object(kv.value) {
+                  k = string!(kv.key)
+                  v = kv.value
+                  val = if exists(v.stringValue) { v.stringValue } else if exists(v.intValue) { v.intValue } else if exists(v.doubleValue) { v.doubleValue } else if exists(v.boolValue) { v.boolValue } else { null }
+                  if val != null { res_map = set!(res_map, [k], val) }
+                }
+              }
+            }
+            if exists(rl.scopeLogs) && is_array(rl.scopeLogs) {
+              for_each(array!(rl.scopeLogs)) -> |_si, sl| {
+                if is_object(sl) && exists(sl.logRecords) && is_array(sl.logRecords) {
+                  for_each(array!(sl.logRecords)) -> |_li, lr| {
+                    if is_object(lr) {
+                      attr_map = {}
+                      if exists(lr.attributes) && is_array(lr.attributes) {
+                        for_each(array!(lr.attributes)) -> |_ki, kv| {
+                          if is_object(kv) && exists(kv.key) && is_string(kv.key) && exists(kv.value) && is_object(kv.value) {
+                            k = string!(kv.key)
+                            v = kv.value
+                            val = if exists(v.stringValue) { v.stringValue } else if exists(v.intValue) { v.intValue } else if exists(v.doubleValue) { v.doubleValue } else if exists(v.boolValue) { v.boolValue } else { null }
+                            if val != null { attr_map = set!(attr_map, [k], val) }
+                          }
+                        }
+                      }
+                      ts_val = null
+                      if exists(lr.timeUnixNano) && lr.timeUnixNano != null {
+                        ns_int, ns_err = to_int(lr.timeUnixNano)
+                        if ns_err == null && ns_int > 0 {
+                          parsed_ns, p_err = from_unix_timestamp(ns_int, unit: "nanoseconds")
+                          if p_err == null { ts_val = parsed_ns }
+                        }
+                      }
+                      if ts_val == null && exists(lr.observedTimeUnixNano) && lr.observedTimeUnixNano != null {
+                        obs_int, obs_err = to_int(lr.observedTimeUnixNano)
+                        if obs_err == null && obs_int > 0 {
+                          parsed_obs, p_err = from_unix_timestamp(obs_int, unit: "nanoseconds")
+                          if p_err == null { ts_val = parsed_obs }
+                        }
+                      }
+                      ev = {
+                        "resources": res_map,
+                        "attributes": attr_map
+                      }
+                      if ts_val != null { ev.timestamp = ts_val }
+                      if exists(lr.eventName) && is_string(lr.eventName) && string!(lr.eventName) != "" {
+                        ev.event_name = string!(lr.eventName)
+                      }
+                      if exists(lr.traceId) && is_string(lr.traceId) && string!(lr.traceId) != "" {
+                        ev.trace_id = string!(lr.traceId)
+                      }
+                      if exists(lr.spanId) && is_string(lr.spanId) && string!(lr.spanId) != "" {
+                        ev.span_id = string!(lr.spanId)
+                      }
+                      events = push(events, ev)
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      . = events
+
+  genai_otlp_logs:
+    type: remap
+    inputs:
+      - genai_otlp_decode
+    source: |
+      now_ts = now()
+      res = if exists(.resources) && is_object(.resources) { .resources } else { {} }
+      attrs = if exists(.attributes) && is_object(.attributes) { .attributes } else { {} }
+
+      event_ts = now_ts
+      if exists(.timestamp) && is_timestamp(.timestamp) {
+        event_ts = timestamp!(.timestamp)
+      } else if exists(.timestamp) && is_string(.timestamp) {
+        parsed_ts, p_err = parse_timestamp(string!(.timestamp), "%+")
+        if p_err == null { event_ts = parsed_ts }
+      }
+      time_ms = to_unix_timestamp(event_ts, unit: "milliseconds")
+      time_dt = format_timestamp!(event_ts, "%Y-%m-%dT%H:%M:%S%.3fZ")
+
+      # Never fall back to raw log body (.message) so untrusted text cannot leak into event_name.
+      raw_event_in = if exists(attrs."event.name") && is_string(attrs."event.name") && string!(attrs."event.name") != "" {
+        string!(attrs."event.name")
+      } else if exists(.event_name) && is_string(.event_name) && string!(.event_name) != "" {
+        string!(.event_name)
+      } else {
+        "gen_ai.client.event"
+      }
+
+      raw_service = if exists(res."service.name") && is_string(res."service.name") && string!(res."service.name") != "" {
+        downcase(string!(res."service.name"))
+      } else if starts_with(raw_event_in, "claude_code.") {
+        "claude-code"
+      } else if starts_with(raw_event_in, "codex.") {
+        "codex-cli"
+      } else {
+        "unknown-agent"
+      }
+
+      svc_name = if contains(raw_service, "claude") {
+        "claude-code"
+      } else if contains(raw_service, "codex") {
+        "codex-cli"
+      } else {
+        raw_service
+      }
+
+      # Canonicalize short Claude Code event.name values (e.g. api_error -> claude_code.api_error)
+      is_short_claude = raw_event_in == "api_request" || raw_event_in == "api_error" || raw_event_in == "tool_result" || raw_event_in == "tool_decision" || raw_event_in == "user_prompt" || raw_event_in == "assistant_response"
+      raw_event = if svc_name == "claude-code" && is_short_claude {
+        "claude_code." + raw_event_in
+      } else {
+        raw_event_in
+      }
+
+      svc_version = if exists(res."service.version") && is_string(res."service.version") && string!(res."service.version") != "" {
+        string!(res."service.version")
+      } else { null }
+
+      op_name = if exists(attrs."gen_ai.operation.name") && is_string(attrs."gen_ai.operation.name") {
+        string!(attrs."gen_ai.operation.name")
+      } else if raw_event == "claude_code.api_request" || raw_event == "claude_code.api_error" || raw_event == "claude_code.assistant_response" || raw_event == "codex.api_request" || raw_event == "codex.websocket_request" || raw_event == "codex.sse_event" || raw_event == "codex.websocket_event" || raw_event == "codex.agent_response" {
+        "chat"
+      } else if raw_event == "claude_code.tool_result" || raw_event == "codex.tool_result" {
+        "execute_tool"
+      } else if raw_event == "claude_code.tool_decision" || raw_event == "codex.tool_decision" {
+        "tool_decision"
+      } else if raw_event == "claude_code.user_prompt" || raw_event == "codex.user_prompt" || raw_event == "codex.conversation_starts" {
+        "session"
+      } else {
+        "invoke_agent"
+      }
+
+      provider_name = if exists(attrs."gen_ai.provider.name") && is_string(attrs."gen_ai.provider.name") {
+        string!(attrs."gen_ai.provider.name")
+      } else if exists(attrs."gen_ai.system") && is_string(attrs."gen_ai.system") {
+        string!(attrs."gen_ai.system")
+      } else if exists(attrs.provider_name) && is_string(attrs.provider_name) {
+        string!(attrs.provider_name)
+      } else if svc_name == "claude-code" {
+        "anthropic"
+      } else if svc_name == "codex-cli" {
+        "openai"
+      } else { null }
+
+      req_model = if exists(attrs."gen_ai.request.model") && is_string(attrs."gen_ai.request.model") {
+        string!(attrs."gen_ai.request.model")
+      } else if exists(attrs.model) && is_string(attrs.model) {
+        string!(attrs.model)
+      } else if exists(attrs.slug) && is_string(attrs.slug) {
+        string!(attrs.slug)
+      } else { null }
+
+      res_model = if exists(attrs."gen_ai.response.model") && is_string(attrs."gen_ai.response.model") {
+        string!(attrs."gen_ai.response.model")
+      } else { req_model }
+
+      session_id = if exists(attrs."session.id") && is_string(attrs."session.id") {
+        string!(attrs."session.id")
+      } else if exists(attrs."conversation.id") && is_string(attrs."conversation.id") {
+        string!(attrs."conversation.id")
+      } else if exists(attrs."gen_ai.conversation.id") && is_string(attrs."gen_ai.conversation.id") {
+        string!(attrs."gen_ai.conversation.id")
+      } else { null }
+
+      trace_id = if exists(.trace_id) && is_string(.trace_id) && string!(.trace_id) != "" {
+        string!(.trace_id)
+      } else { null }
+      span_id = if exists(.span_id) && is_string(.span_id) && string!(.span_id) != "" {
+        string!(.span_id)
+      } else { null }
+
+      tool_name = if exists(attrs."gen_ai.tool.name") && is_string(attrs."gen_ai.tool.name") {
+        string!(attrs."gen_ai.tool.name")
+      } else if exists(attrs.tool_name) && is_string(attrs.tool_name) {
+        string!(attrs.tool_name)
+      } else { null }
+
+      tool_decision = if exists(attrs.decision) && is_string(attrs.decision) {
+        string!(attrs.decision)
+      } else if exists(attrs.decision_type) && is_string(attrs.decision_type) {
+        string!(attrs.decision_type)
+      } else { null }
+
+      status = "ok"
+      error_type = null
+      if raw_event == "claude_code.api_error" {
+        status = "error"
+        if exists(attrs.status_code) { error_type = to_string!(attrs.status_code) }
+      } else if exists(attrs.success) && (attrs.success == false || attrs.success == "false") {
+        status = "error"
+        error_type = "tool_failed"
+      } else if exists(attrs."http.response.status_code") {
+        sc, sc_err = to_int(attrs."http.response.status_code")
+        if sc_err == null && sc >= 400 {
+          status = "error"
+          error_type = to_string(sc)
+        }
+      } else if exists(attrs."error.type") && is_string(attrs."error.type") {
+        status = "error"
+        error_type = string!(attrs."error.type")
+      }
+      # Codex emits error.message on failed SSE/WebSocket events or API requests without an HTTP status; never persist the message text.
+      if status == "ok" && (raw_event == "codex.sse_event" || raw_event == "codex.websocket_event" || raw_event == "codex.api_request" || raw_event == "codex.websocket_request") && exists(attrs."error.message") && is_string(attrs."error.message") && string!(attrs."error.message") != "" {
+        status = "error"
+        error_type = if raw_event == "codex.sse_event" || raw_event == "codex.websocket_event" { "stream_error" } else { "api_error" }
+      }
+
+      duration_ms = null
+      if exists(attrs.duration_ms) {
+        d, d_err = to_float(attrs.duration_ms)
+        if d_err == null { duration_ms = d }
+      }
+
+      in_tok = null
+      in_tok_excludes_cache = false
+      for_in = if exists(attrs."gen_ai.usage.input_tokens") && attrs."gen_ai.usage.input_tokens" != null {
+        attrs."gen_ai.usage.input_tokens"
+      } else if exists(attrs.input_tokens) && attrs.input_tokens != null {
+        in_tok_excludes_cache = true
+        attrs.input_tokens
+      } else if exists(attrs.input_token_count) && attrs.input_token_count != null {
+        attrs.input_token_count
+      } else { null }
+      if for_in != null {
+        v, e = to_int(for_in)
+        if e == null { in_tok = v }
+      }
+
+      out_tok = null
+      for_out = if exists(attrs."gen_ai.usage.output_tokens") && attrs."gen_ai.usage.output_tokens" != null {
+        attrs."gen_ai.usage.output_tokens"
+      } else if exists(attrs.output_tokens) && attrs.output_tokens != null {
+        attrs.output_tokens
+      } else if exists(attrs.output_token_count) && attrs.output_token_count != null {
+        attrs.output_token_count
+      } else { null }
+      if for_out != null {
+        v, e = to_int(for_out)
+        if e == null { out_tok = v }
+      }
+
+      cache_read = null
+      for_cr = if exists(attrs.cache_read_tokens) && attrs.cache_read_tokens != null {
+        attrs.cache_read_tokens
+      } else if exists(attrs.cached_token_count) && attrs.cached_token_count != null {
+        attrs.cached_token_count
+      } else if exists(attrs."gen_ai.usage.cache_read.input_tokens") && attrs."gen_ai.usage.cache_read.input_tokens" != null {
+        attrs."gen_ai.usage.cache_read.input_tokens"
+      } else { null }
+      if for_cr != null {
+        v, e = to_int(for_cr)
+        if e == null { cache_read = v }
+      }
+
+      cache_create = null
+      for_cc = if exists(attrs.cache_creation_tokens) && attrs.cache_creation_tokens != null {
+        attrs.cache_creation_tokens
+      } else if exists(attrs."gen_ai.usage.cache_creation.input_tokens") && attrs."gen_ai.usage.cache_creation.input_tokens" != null {
+        attrs."gen_ai.usage.cache_creation.input_tokens"
+      } else { null }
+      if for_cc != null {
+        v, e = to_int(for_cc)
+        if e == null { cache_create = v }
+      }
+
+      reason_tok = null
+      for_rt = if exists(attrs.reasoning_token_count) && attrs.reasoning_token_count != null {
+        attrs.reasoning_token_count
+      } else if exists(attrs."gen_ai.usage.reasoning_tokens") && attrs."gen_ai.usage.reasoning_tokens" != null {
+        attrs."gen_ai.usage.reasoning_tokens"
+      } else { null }
+      if for_rt != null {
+        v, e = to_int(for_rt)
+        if e == null { reason_tok = v }
+      }
+
+      # Codex (input_token_count/output_token_count) and OTel GenAI (gen_ai.usage.*) report inclusive totals;
+      # Claude Code native input_tokens excludes cache_read_tokens and cache_creation_tokens.
+      total_tok = null
+      if in_tok != null || out_tok != null || (in_tok_excludes_cache && (cache_read != null || cache_create != null)) {
+        t_sum = 0
+        if in_tok != null { t_sum = t_sum + int!(in_tok) }
+        if out_tok != null { t_sum = t_sum + int!(out_tok) }
+        if in_tok_excludes_cache {
+          if cache_read != null { t_sum = t_sum + int!(cache_read) }
+          if cache_create != null { t_sum = t_sum + int!(cache_create) }
+        }
+        total_tok = t_sum
+      }
+
+      cost_usd = null
+      if exists(attrs.cost_usd) {
+        c, c_err = to_float(attrs.cost_usd)
+        if c_err == null { cost_usd = c }
+      }
+
+      usage = {}
+      if in_tok != null { usage.input_tokens = in_tok }
+      if out_tok != null { usage.output_tokens = out_tok }
+      if cache_read != null { usage.cache_read_tokens = cache_read }
+      if cache_create != null { usage.cache_creation_tokens = cache_create }
+      if reason_tok != null { usage.reasoning_tokens = reason_tok }
+      if total_tok != null { usage.total_tokens = total_tok }
+      if cost_usd != null { usage.cost_usd = cost_usd }
+
+      gen_ai = {}
+      if provider_name != null { gen_ai.provider_name = provider_name }
+      if req_model != null { gen_ai.request_model = req_model }
+      if res_model != null { gen_ai.response_model = res_model }
+      if tool_name != null { gen_ai.tool_name = tool_name }
+      if tool_decision != null { gen_ai.tool_decision = tool_decision }
+      if length(usage) > 0 { gen_ai.usage = usage }
+
+      svc = {
+        "name": svc_name,
+        "source_protocol": "otlp"
+      }
+      if svc_version != null { svc.version = svc_version }
+
+      host_obj = {}
+      if exists(res."host.name") && is_string(res."host.name") && string!(res."host.name") != "" {
+        host_obj.name = string!(res."host.name")
+      }
+      if exists(attrs."vcs.repository.name") && is_string(attrs."vcs.repository.name") {
+        host_obj.vcs_repository = string!(attrs."vcs.repository.name")
+      }
+      if exists(attrs."vcs.ref.head.name") && is_string(attrs."vcs.ref.head.name") {
+        host_obj.vcs_ref = string!(attrs."vcs.ref.head.name")
+      }
+
+      safe_attrs = {}
+      if exists(attrs.attempt) { safe_attrs.attempt = attrs.attempt }
+      if exists(attrs.reasoning_effort) && is_string(attrs.reasoning_effort) { safe_attrs.reasoning_effort = string!(attrs.reasoning_effort) }
+      if exists(attrs.approval_policy) && is_string(attrs.approval_policy) { safe_attrs.approval_policy = string!(attrs.approval_policy) }
+      if exists(attrs.decision_source) && is_string(attrs.decision_source) { safe_attrs.decision_source = string!(attrs.decision_source) }
+      if exists(attrs.prompt_length) { safe_attrs.prompt_length = attrs.prompt_length }
+      if exists(attrs."event.kind") && is_string(attrs."event.kind") { safe_attrs.sse_event_kind = string!(attrs."event.kind") }
+
+      out = {
+        "time": time_ms,
+        "time_dt": time_dt,
+        "event_name": raw_event,
+        "operation_name": op_name,
+        "status": status,
+        "service": svc,
+        "host": host_obj,
+        "gen_ai": gen_ai
+      }
+      if trace_id != null { out.trace_id = trace_id }
+      if span_id != null { out.span_id = span_id }
+      if session_id != null { out.session_id = session_id }
+      if error_type != null { out.error_type = error_type }
+      if duration_ms != null { out.duration_ms = duration_ms }
+      if length(safe_attrs) > 0 { out.attributes = safe_attrs }
+
+      capture_mode = downcase("${OOF_AI_CAPTURE_CONTENT:-none}")
+      if capture_mode == "redacted" || capture_mode == "full" {
+        raw_p = if exists(attrs.prompt) && is_string(attrs.prompt) && string!(attrs.prompt) != "" {
+          string!(attrs.prompt)
+        } else if exists(attrs."gen_ai.prompt") && is_string(attrs."gen_ai.prompt") && string!(attrs."gen_ai.prompt") != "" {
+          string!(attrs."gen_ai.prompt")
+        } else { null }
+        if raw_p != null { out._raw_prompt = raw_p }
+
+        raw_c = if exists(attrs.completion) && is_string(attrs.completion) && string!(attrs.completion) != "" {
+          string!(attrs.completion)
+        } else if exists(attrs."gen_ai.completion") && is_string(attrs."gen_ai.completion") && string!(attrs."gen_ai.completion") != "" {
+          string!(attrs."gen_ai.completion")
+        } else if (raw_event == "claude_code.assistant_response" || raw_event == "codex.agent_response") && exists(attrs.response) && is_string(attrs.response) && string!(attrs.response) != "" {
+          string!(attrs.response)
+        } else { null }
+        if raw_c != null { out._raw_completion = raw_c }
+      }
+
+      . = out
+
+  genai_antigravity_parse:
+    type: remap
+    inputs:
+      - antigravity_transcripts
+    source: |
+      file_path = if exists(.file) && is_string(.file) { string!(.file) } else { "" }
+      host_name = if exists(.host) && is_string(.host) { string!(.host) } else { null }
+      parsed, err = parse_json(string!(.message))
+      if err != null || !is_object(parsed) {
+        . = { "_keep": false }
+      } else {
+        step_type = if exists(parsed.type) && is_string(parsed.type) { string!(parsed.type) } else { "" }
+        if step_type != "PLANNER_RESPONSE" && step_type != "USER_INPUT" {
+          . = { "_keep": false }
+        } else {
+          now_ts = now()
+          event_ts = now_ts
+          if exists(parsed.created_at) && is_string(parsed.created_at) {
+            ts_p, ts_e = parse_timestamp(string!(parsed.created_at), "%+")
+            if ts_e == null { event_ts = ts_p }
+          }
+          time_ms = to_unix_timestamp(event_ts, unit: "milliseconds")
+          time_dt = format_timestamp!(event_ts, "%Y-%m-%dT%H:%M:%S%.3fZ")
+
+          # Extract conversation_id from .../brain/<conversation-id>/.system_generated/logs/transcript.jsonl
+          conv_id = null
+          m, m_err = parse_regex(file_path, r'/brain/(?P<cid>[^/]+)/\.system_generated/logs/transcript\.jsonl$')
+          if m_err == null && exists(m.cid) && is_string(m.cid) {
+            conv_id = string!(m.cid)
+          }
+
+          # Strip all prompt/response/thinking/tool arguments; extract only tool names & count
+          tool_names = []
+          first_tool = null
+          if exists(parsed.tool_calls) && is_array(parsed.tool_calls) {
+            for_each(array!(parsed.tool_calls)) -> |_i, tc| {
+              if is_object(tc) && exists(tc.name) && is_string(tc.name) {
+                tname = string!(tc.name)
+                tool_names = push(tool_names, tname)
+                if first_tool == null { first_tool = tname }
+              }
+            }
+          }
+
+          op_name = if step_type == "USER_INPUT" {
+            "session"
+          } else if length(tool_names) > 0 {
+            "execute_tool"
+          } else {
+            "invoke_agent"
+          }
+
+          raw_status = if exists(parsed.status) && is_string(parsed.status) { upcase(string!(parsed.status)) } else { "DONE" }
+          status = if raw_status == "ERROR" || raw_status == "FAILED" { "error" } else { "ok" }
+
+          gen_ai = {
+            "provider_name": "google"
+          }
+          if first_tool != null { gen_ai.tool_name = first_tool }
+
+          host_obj = {}
+          if host_name != null { host_obj.name = host_name }
+
+          safe_attrs = {
+            "step_type": step_type
+          }
+          if exists(parsed.step_index) && is_integer(parsed.step_index) { safe_attrs.step_index = int!(parsed.step_index) }
+          if exists(parsed.source) && is_string(parsed.source) { safe_attrs.step_source = string!(parsed.source) }
+          if length(tool_names) > 0 {
+            safe_attrs.tool_names = tool_names
+            safe_attrs.tool_call_count = length(tool_names)
+          }
+
+          out = {
+            "_keep": true,
+            "time": time_ms,
+            "time_dt": time_dt,
+            "event_name": "antigravity." + downcase(step_type),
+            "operation_name": op_name,
+            "status": status,
+            "service": {
+              "name": "antigravity",
+              "source_protocol": "jsonl-transcript"
+            },
+            "host": host_obj,
+            "gen_ai": gen_ai,
+            "attributes": safe_attrs
+          }
+          if conv_id != null { out.session_id = conv_id }
+          if status == "error" { out.error_type = raw_status }
+
+          capture_mode = downcase("${OOF_AI_CAPTURE_CONTENT:-none}")
+          if (capture_mode == "redacted" || capture_mode == "full") && exists(parsed.content) && is_string(parsed.content) && string!(parsed.content) != "" {
+            if step_type == "USER_INPUT" {
+              out._raw_prompt = string!(parsed.content)
+            } else if step_type == "PLANNER_RESPONSE" {
+              out._raw_completion = string!(parsed.content)
+            }
+          }
+
+          . = out
+        }
+      }
+
+  genai_antigravity_filter:
+    type: filter
+    inputs:
+      - genai_antigravity_parse
+    condition: '._keep == true'
+
+  genai_antigravity_clean:
+    type: remap
+    inputs:
+      - genai_antigravity_filter
+    source: |
+      del(._keep)
+
+  genai_pi_parse:
+    type: remap
+    inputs:
+      - pi_sessions
+    source: |
+      file_path = if exists(.file) && is_string(.file) { string!(.file) } else { "" }
+      host_name = if exists(.host) && is_string(.host) { string!(.host) } else { null }
+      parsed, err = parse_json(string!(.message))
+      if err != null || !is_object(parsed) {
+        . = { "_keep": false }
+      } else {
+        rec_type = if exists(parsed.type) && is_string(parsed.type) { string!(parsed.type) } else { "" }
+        capture_mode = downcase("${OOF_AI_CAPTURE_CONTENT:-none}")
+        capture_enabled = capture_mode == "redacted" || capture_mode == "full"
+        is_assistant_msg = rec_type == "message" && exists(parsed.message) && is_object(parsed.message) && exists(parsed.message.role) && parsed.message.role == "assistant"
+        is_user_msg = capture_enabled && rec_type == "message" && exists(parsed.message) && is_object(parsed.message) && exists(parsed.message.role) && parsed.message.role == "user"
+        if !is_assistant_msg && !is_user_msg && rec_type != "session" && rec_type != "model_change" {
+          . = { "_keep": false }
+        } else {
+          now_ts = now()
+          event_ts = now_ts
+          if exists(parsed.timestamp) && is_string(parsed.timestamp) {
+            ts_p, ts_e = parse_timestamp(string!(parsed.timestamp), "%+")
+            if ts_e == null { event_ts = ts_p }
+          } else if is_assistant_msg && exists(parsed.message.timestamp) && is_integer(parsed.message.timestamp) {
+            ts_p, ts_e = from_unix_timestamp(int!(parsed.message.timestamp), unit: "milliseconds")
+            if ts_e == null { event_ts = ts_p }
+          }
+          time_ms = to_unix_timestamp(event_ts, unit: "milliseconds")
+          time_dt = format_timestamp!(event_ts, "%Y-%m-%dT%H:%M:%S%.3fZ")
+
+          # Extract session_id from filename <timestamp>_<uuid>.jsonl or session record id
+          session_id = null
+          if rec_type == "session" && exists(parsed.id) && is_string(parsed.id) {
+            session_id = string!(parsed.id)
+          } else {
+            m, m_err = parse_regex(file_path, r'_(?P<sid>[0-9a-fA-F-]+)\.jsonl$')
+            if m_err == null && exists(m.sid) && is_string(m.sid) {
+              session_id = string!(m.sid)
+            }
+          }
+
+          host_obj = {}
+          if host_name != null { host_obj.name = host_name }
+          if rec_type == "session" && exists(parsed.cwd) && is_string(parsed.cwd) {
+            wm, wm_err = parse_regex(string!(parsed.cwd), r'(?P<ws>[^/]+)/?$')
+            if wm_err == null && exists(wm.ws) && is_string(wm.ws) && string!(wm.ws) != "" {
+              host_obj.workspace = string!(wm.ws)
+            }
+          }
+
+          gen_ai = {}
+          safe_attrs = {}
+          op_name = "session"
+          ev_name = "pi." + rec_type
+          status = "ok"
+          error_type = null
+          raw_prompt = null
+          raw_completion = null
+
+          if rec_type == "model_change" {
+            if exists(parsed.provider) && is_string(parsed.provider) { gen_ai.provider_name = string!(parsed.provider) }
+            if exists(parsed.modelId) && is_string(parsed.modelId) { gen_ai.request_model = string!(parsed.modelId) }
+          } else if is_user_msg {
+            msg = parsed.message
+            op_name = "session"
+            ev_name = "pi.user_message"
+            if exists(msg.content) && is_string(msg.content) && string!(msg.content) != "" {
+              raw_prompt = string!(msg.content)
+            } else if exists(msg.content) && is_array(msg.content) {
+              user_texts = []
+              for_each(array!(msg.content)) -> |_i, blk| {
+                if is_object(blk) && exists(blk.type) && blk.type == "text" && exists(blk.text) && is_string(blk.text) {
+                  user_texts = push(user_texts, string!(blk.text))
+                }
+              }
+              if length(user_texts) > 0 { raw_prompt = join!(user_texts, "\n") }
+            }
+          } else if is_assistant_msg {
+            msg = parsed.message
+            op_name = "chat"
+            ev_name = "pi.assistant_message"
+            if exists(msg.provider) && is_string(msg.provider) { gen_ai.provider_name = string!(msg.provider) }
+            if exists(msg.model) && is_string(msg.model) {
+              gen_ai.request_model = string!(msg.model)
+              gen_ai.response_model = string!(msg.model)
+            }
+            if exists(msg.stopReason) && is_string(msg.stopReason) {
+              gen_ai.finish_reason = string!(msg.stopReason)
+              if string!(msg.stopReason) == "error" || string!(msg.stopReason) == "aborted" {
+                status = "error"
+                error_type = string!(msg.stopReason)
+              }
+            }
+
+            # Always strip thinking/arguments; collect toolCall names and (when opted-in) assistant text
+            tool_names = []
+            first_tool = null
+            assistant_texts = []
+            if exists(msg.content) && is_array(msg.content) {
+              for_each(array!(msg.content)) -> |_i, blk| {
+                if is_object(blk) && exists(blk.type) && blk.type == "toolCall" && exists(blk.name) && is_string(blk.name) {
+                  tname = string!(blk.name)
+                  tool_names = push(tool_names, tname)
+                  if first_tool == null { first_tool = tname }
+                } else if capture_enabled && is_object(blk) && exists(blk.type) && blk.type == "text" && exists(blk.text) && is_string(blk.text) {
+                  assistant_texts = push(assistant_texts, string!(blk.text))
+                }
+              }
+            }
+            if length(assistant_texts) > 0 { raw_completion = join!(assistant_texts, "\n") }
+            if first_tool != null { gen_ai.tool_name = first_tool }
+            if length(tool_names) > 0 {
+              safe_attrs.tool_names = tool_names
+              safe_attrs.tool_call_count = length(tool_names)
+            }
+
+            usage = {}
+            if exists(msg.usage) && is_object(msg.usage) {
+              u = msg.usage
+              if exists(u.input) {
+                v, e = to_int(u.input)
+                if e == null { usage.input_tokens = v }
+              }
+              if exists(u.output) {
+                v, e = to_int(u.output)
+                if e == null { usage.output_tokens = v }
+              }
+              if exists(u.cacheRead) {
+                v, e = to_int(u.cacheRead)
+                if e == null { usage.cache_read_tokens = v }
+              }
+              if exists(u.cacheWrite) {
+                v, e = to_int(u.cacheWrite)
+                if e == null { usage.cache_creation_tokens = v }
+              }
+              if exists(u.totalTokens) {
+                v, e = to_int(u.totalTokens)
+                if e == null { usage.total_tokens = v }
+              }
+              if exists(u.cost) && is_object(u.cost) && exists(u.cost.total) {
+                c, e = to_float(u.cost.total)
+                if e == null { usage.cost_usd = c }
+              }
+            }
+            if length(usage) > 0 { gen_ai.usage = usage }
+          }
+
+          out = {
+            "_keep": true,
+            "time": time_ms,
+            "time_dt": time_dt,
+            "event_name": ev_name,
+            "operation_name": op_name,
+            "status": status,
+            "service": {
+              "name": "pi",
+              "source_protocol": "jsonl-transcript"
+            },
+            "host": host_obj,
+            "gen_ai": gen_ai
+          }
+          if session_id != null { out.session_id = session_id }
+          if error_type != null { out.error_type = error_type }
+          if length(safe_attrs) > 0 { out.attributes = safe_attrs }
+          if raw_prompt != null { out._raw_prompt = raw_prompt }
+          if raw_completion != null { out._raw_completion = raw_completion }
+
+          . = out
+        }
+      }
+
+  genai_pi_filter:
+    type: filter
+    inputs:
+      - genai_pi_parse
+    condition: '._keep == true'
+
+  genai_pi_clean:
+    type: remap
+    inputs:
+      - genai_pi_filter
+    source: |
+      del(._keep)
+
+  genai_content_policy:
+    type: remap
+    inputs:
+      - genai_otlp_logs
+      - genai_antigravity_clean
+      - genai_pi_clean
+    source: |
+      capture_mode = downcase("${OOF_AI_CAPTURE_CONTENT:-none}")
+      if capture_mode == "redacted" || capture_mode == "full" {
+        attrs = if exists(.attributes) && is_object(.attributes) { object!(.attributes) } else { {} }
+        if exists(._raw_prompt) && is_string(._raw_prompt) && string!(._raw_prompt) != "" {
+          p = string!(._raw_prompt)
+          if capture_mode == "redacted" {
+            p = replace(p, r'-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----', "[REDACTED_PRIVATE_KEY]")
+            p = replace(p, r'(?i)Bearer\s+[A-Za-z0-9._~+/-]+=*', "Bearer [REDACTED]")
+            p = replace(p, r'(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,})', "[REDACTED_SECRET]")
+            p = replace(p, r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', "[REDACTED_EMAIL]")
+          }
+          if length(p) > 8192 {
+            p = truncate(p, limit: 8192, suffix: "...[TRUNCATED]")
+            attrs.content_truncated = true
+          }
+          attrs.prompt = p
+          attrs.capture_content = capture_mode
+        }
+        if exists(._raw_completion) && is_string(._raw_completion) && string!(._raw_completion) != "" {
+          c = string!(._raw_completion)
+          if capture_mode == "redacted" {
+            c = replace(c, r'-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----', "[REDACTED_PRIVATE_KEY]")
+            c = replace(c, r'(?i)Bearer\s+[A-Za-z0-9._~+/-]+=*', "Bearer [REDACTED]")
+            c = replace(c, r'(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,})', "[REDACTED_SECRET]")
+            c = replace(c, r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', "[REDACTED_EMAIL]")
+          }
+          if length(c) > 8192 {
+            c = truncate(c, limit: 8192, suffix: "...[TRUNCATED]")
+            attrs.content_truncated = true
+          }
+          attrs.completion = c
+          attrs.capture_content = capture_mode
+        }
+        if length(attrs) > 0 { .attributes = attrs }
+      }
+      del(._raw_prompt)
+      del(._raw_completion)
+
+sinks:
+  basin_ai_http:
+    type: http
+    inputs:
+      - genai_content_policy
+    uri: "${OOF_AI_BASIN_ENDPOINT}"
+    method: post
+    compression: gzip
+    encoding:
+      codec: json
+    auth:
+      strategy: bearer
+      token: "${OOF_AI_INGEST_TOKEN}"
+    batch:
+      max_events: 200
+      max_bytes: 2000000
+      timeout_secs: 5
+
+tests:
+  - name: claude_code_otlp_api_request
+    inputs:
+      - insert_at: genai_otlp_logs
+        type: log
+        log_fields:
+          timestamp: "2026-11-23T03:00:00Z"
+          trace_id: "4bf92f3577b34da6a3ce929d0e0e4736"
+          resources:
+            service.name: "claude-code"
+            service.version: "2.1.0"
+            host.name: "dev-workstation"
+          attributes:
+            event.name: "claude_code.api_request"
+            model: "claude-sonnet-4-6"
+            input_tokens: 1200
+            output_tokens: 350
+            cache_read_tokens: 8000
+            cost_usd: 0.0142
+            duration_ms: 1840.5
+            session.id: "sess-claude-001"
+            prompt: "SECRET_SHOULD_NOT_APPEAR"
+    outputs:
+      - extract_from: genai_content_policy
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.service.name, "claude-code")
+              assert_eq!(.operation_name, "chat")
+              assert_eq!(.gen_ai.provider_name, "anthropic")
+              assert_eq!(.gen_ai.request_model, "claude-sonnet-4-6")
+              assert_eq!(.gen_ai.usage.input_tokens, 1200)
+              assert_eq!(.gen_ai.usage.output_tokens, 350)
+              assert_eq!(.gen_ai.usage.cache_read_tokens, 8000)
+              assert_eq!(.gen_ai.usage.total_tokens, 9550)
+              assert_eq!(.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736")
+              assert!(!contains(encode_json(.), "SECRET_SHOULD_NOT_APPEAR"))
+
+  - name: codex_cli_otlp_sse_event
+    inputs:
+      - insert_at: genai_otlp_logs
+        type: log
+        log_fields:
+          timestamp: "2026-11-23T03:01:00Z"
+          resources:
+            service.name: "codex-cli"
+            host.name: "dev-workstation"
+          attributes:
+            event.name: "codex.sse_event"
+            model: "gpt-5-codex"
+            input_token_count: 2000
+            output_token_count: 500
+            cached_token_count: 1000
+            reasoning_token_count: 400
+            duration_ms: 2100
+            conversation.id: "conv-codex-001"
+    outputs:
+      - extract_from: genai_content_policy
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.service.name, "codex-cli")
+              assert_eq!(.operation_name, "chat")
+              assert_eq!(.gen_ai.provider_name, "openai")
+              assert_eq!(.gen_ai.usage.reasoning_tokens, 400)
+              assert_eq!(.gen_ai.usage.total_tokens, 2500)
+              assert_eq!(.session_id, "conv-codex-001")
+
+  - name: claude_code_short_event_names_and_error_classification
+    inputs:
+      - insert_at: genai_otlp_logs
+        type: log
+        log_fields:
+          timestamp: "2026-11-23T03:01:10Z"
+          resources:
+            service.name: "claude-code"
+          attributes:
+            event.name: "api_error"
+            model: "claude-sonnet-4-6"
+            status_code: 429
+            duration_ms: 120
+            session.id: "sess-claude-err"
+    outputs:
+      - extract_from: genai_content_policy
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event_name, "claude_code.api_error")
+              assert_eq!(.operation_name, "chat")
+              assert_eq!(.status, "error")
+              assert_eq!(.error_type, "429")
+
+  - name: codex_sse_error_message_marks_error_without_leaking_body
+    inputs:
+      - insert_at: genai_otlp_logs
+        type: log
+        log_fields:
+          timestamp: "2026-11-23T03:01:20Z"
+          message: "SENSITIVE_RAW_BODY_MUST_NOT_LEAK"
+          resources:
+            service.name: "codex-cli"
+          attributes:
+            event.name: "codex.sse_event"
+            event.kind: "response.completed"
+            error.message: "SECRET_UPSTREAM_ERR_DETAIL"
+            conversation.id: "conv-codex-err"
+    outputs:
+      - extract_from: genai_content_policy
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.status, "error")
+              assert_eq!(.error_type, "stream_error")
+              raw = encode_json(.)
+              assert!(!contains(raw, "SECRET_UPSTREAM_ERR_DETAIL"))
+              assert!(!contains(raw, "SENSITIVE_RAW_BODY_MUST_NOT_LEAK"))
+
+  - name: codex_websocket_request_classified_as_chat
+    inputs:
+      - insert_at: genai_otlp_logs
+        type: log
+        log_fields:
+          timestamp: "2026-11-23T03:01:25Z"
+          resources:
+            service.name: "codex-cli"
+          attributes:
+            event.name: "codex.websocket_request"
+            model: "gpt-5-codex"
+            duration_ms: 45.2
+            conversation.id: "conv-codex-ws"
+    outputs:
+      - extract_from: genai_content_policy
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event_name, "codex.websocket_request")
+              assert_eq!(.operation_name, "chat")
+              assert_eq!(.status, "ok")
+              assert_eq!(.duration_ms, 45.2)
+
+  - name: otlp_missing_event_name_never_copies_raw_body
+    inputs:
+      - insert_at: genai_otlp_logs
+        type: log
+        log_fields:
+          timestamp: "2026-11-23T03:01:30Z"
+          message: "PRIVATE_PROMPT_IN_BODY"
+          resources:
+            service.name: "claude-code"
+          attributes: {}
+    outputs:
+      - extract_from: genai_content_policy
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event_name, "gen_ai.client.event")
+              assert!(!contains(encode_json(.), "PRIVATE_PROMPT_IN_BODY"))
+
+  - name: otlp_http_json_export_decodes_and_normalizes
+    inputs:
+      - insert_at: genai_otlp_decode
+        type: log
+        log_fields:
+          resourceLogs:
+            - resource:
+                attributes:
+                  - key: "service.name"
+                    value:
+                      stringValue: "claude-code"
+              scopeLogs:
+                - logRecords:
+                    - timeUnixNano: "1795402902000000000"
+                      eventName: "api_request"
+                      traceId: "4bf92f3577b34da6a3ce929d0e0e4736"
+                      attributes:
+                        - key: "model"
+                          value:
+                            stringValue: "claude-sonnet-4-6"
+                        - key: "input_tokens"
+                          value:
+                            intValue: "100"
+                        - key: "output_tokens"
+                          value:
+                            intValue: "50"
+                        - key: "session.id"
+                          value:
+                            stringValue: "sess-otlp-json-ok"
+    outputs:
+      - extract_from: genai_content_policy
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.service.name, "claude-code")
+              assert_eq!(.event_name, "claude_code.api_request")
+              assert_eq!(.operation_name, "chat")
+              assert_eq!(.gen_ai.usage.total_tokens, 150)
+              assert_eq!(.session_id, "sess-otlp-json-ok")
+              assert_eq!(.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736")
+
+  - name: otlp_http_json_zero_time_falls_back_to_observed_time
+    inputs:
+      - insert_at: genai_otlp_decode
+        type: log
+        log_fields:
+          resourceLogs:
+            - resource:
+                attributes:
+                  - key: "service.name"
+                    value:
+                      stringValue: "codex-cli"
+              scopeLogs:
+                - logRecords:
+                    - timeUnixNano: "0"
+                      observedTimeUnixNano: "1795402902000000000"
+                      eventName: "codex.api_request"
+                      attributes:
+                        - key: "model"
+                          value:
+                            stringValue: "gpt-5-codex"
+                        - key: "conversation.id"
+                          value:
+                            stringValue: "conv-observed-ts"
+    outputs:
+      - extract_from: genai_content_policy
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.time, 1795402902000)
+              assert_eq!(.time_dt, "2026-11-23T03:01:42.000Z")
+              assert_eq!(.session_id, "conv-observed-ts")
+
+  - name: antigravity_transcript_strips_content_and_thinking
+    inputs:
+      - insert_at: genai_antigravity_parse
+        type: log
+        log_fields:
+          host: "dev-workstation"
+          file: "/home/dev/.gemini/antigravity-cli/brain/00000000-0000-4000-8000-000000000001/.system_generated/logs/transcript.jsonl"
+          message: '{"step_index":4,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-23T03:02:00Z","content":"SECRET_REPLY","thinking":"SECRET_THOUGHT","tool_calls":[{"name":"read_file","arguments":{"Path":"/etc/passwd"}}]}'
+    outputs:
+      - extract_from: genai_content_policy
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.service.name, "antigravity")
+              assert_eq!(.operation_name, "execute_tool")
+              assert_eq!(.gen_ai.tool_name, "read_file")
+              assert_eq!(.session_id, "00000000-0000-4000-8000-000000000001")
+              assert_eq!(.attributes.tool_call_count, 1)
+              raw = encode_json(.)
+              assert!(!contains(raw, "SECRET_REPLY"))
+              assert!(!contains(raw, "SECRET_THOUGHT"))
+              assert!(!contains(raw, "/etc/passwd"))
+
+  - name: pi_session_strips_text_and_extracts_usage
+    inputs:
+      - insert_at: genai_pi_parse
+        type: log
+        log_fields:
+          host: "dev-workstation"
+          file: "/home/dev/.pi/agent/sessions/--home-dev-repo--/2026-11-23T03-00-00_abc12345.jsonl"
+          message: '{"type":"message","timestamp":"2026-11-23T03:03:00Z","message":{"role":"assistant","provider":"anthropic","model":"claude-sonnet-4-6","stopReason":"toolUse","content":[{"type":"thinking","thinking":"SECRET_PI_THINK"},{"type":"text","text":"SECRET_PI_TEXT"},{"type":"toolCall","name":"bash","arguments":{"command":"echo secret"}}],"usage":{"input":900,"output":220,"cacheRead":4000,"cacheWrite":100,"totalTokens":5220,"cost":{"total":0.0085}}}}'
+    outputs:
+      - extract_from: genai_content_policy
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.service.name, "pi")
+              assert_eq!(.operation_name, "chat")
+              assert_eq!(.gen_ai.provider_name, "anthropic")
+              assert_eq!(.gen_ai.request_model, "claude-sonnet-4-6")
+              assert_eq!(.gen_ai.tool_name, "bash")
+              assert_eq!(.gen_ai.usage.total_tokens, 5220)
+              assert_eq!(.session_id, "abc12345")
+              raw = encode_json(.)
+              assert!(!contains(raw, "SECRET_PI_THINK"))
+              assert!(!contains(raw, "SECRET_PI_TEXT"))
+              assert!(!contains(raw, "echo secret"))
