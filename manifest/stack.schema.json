@@ -202,6 +202,56 @@
         }
       }
     },
+    "ai": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "description": "Optional AI / Coding-Agent observability slot based on OpenTelemetry GenAI Semantic Conventions.",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "schema_profile": {
+          "type": "string",
+          "enum": ["otel-genai"],
+          "description": "Standard AI telemetry schema profile (zero proprietary schemas)."
+        },
+        "capture_content": {
+          "type": "string",
+          "enum": ["none", "redacted", "full"],
+          "description": "Prompt/completion capture policy (recommended: none for metadata-only usage tracking)."
+        },
+        "contract_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "collector_adapter": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "options": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "if": {
+        "properties": {
+          "enabled": { "const": true }
+        },
+        "required": ["enabled"]
+      },
+      "then": {
+        "required": ["schema_profile", "capture_content", "contract_path"]
+      }
+    },
     "query": {
       "type": "object",
       "additionalProperties": false,
