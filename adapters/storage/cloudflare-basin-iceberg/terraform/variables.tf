@@ -175,6 +175,39 @@ variable "pipeline_sql_file" {
   description = "Optional override path to Basin pipeline SQL template (defaults to ../pipeline.sql)."
 }
 
+variable "logpush_jobs" {
+  type = map(object({
+    scope            = optional(string, "zone")
+    zone_id          = optional(string, null)
+    dataset          = string
+    destination_conf = string
+    enabled          = optional(bool, true)
+    frequency        = optional(string, "high")
+    name             = optional(string, null)
+    filter           = optional(string, null)
+    output_options = optional(object({
+      field_names      = optional(list(string), null)
+      timestamp_format = optional(string, "rfc3339")
+      output_type      = optional(string, "ndjson")
+    }), null)
+  }))
+  default     = {}
+  sensitive   = true
+  description = "Optional map of Cloudflare Logpush jobs (zone or account scoped) shipping edge/audit logs to OOF vector-cloudflare-logpush or R2. Marked sensitive because destination_conf may embed custom HTTP auth headers."
+
+  validation {
+    condition = alltrue([
+      for _, job in var.logpush_jobs :
+      contains(["zone", "account"], job.scope) &&
+      (job.scope == "account" ? job.zone_id == null : (job.zone_id != null && can(regex("^[a-fA-F0-9]{32}$", job.zone_id)))) &&
+      contains(["high", "low"], job.frequency) &&
+      length(trimspace(job.dataset)) > 0 &&
+      length(trimspace(job.destination_conf)) > 0
+    ])
+    error_message = "Each logpush_jobs entry must specify scope ('zone' or 'account'), a 32-hex zone_id iff scope == 'zone', frequency ('high' or 'low'), non-empty dataset, and non-empty destination_conf."
+  }
+}
+
 variable "enable_ai_usage" {
   type        = bool
   default     = false
