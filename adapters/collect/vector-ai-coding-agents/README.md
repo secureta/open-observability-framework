@@ -6,22 +6,28 @@ Prompts, completions, chain-of-thought (`thinking`), and tool arguments are stri
 
 ## Supported Coding Agents
 
-### 1. Claude Code (OTLP)
+First, generate a local shared Bearer token for authenticated OTLP HTTP ingestion (`OOF_AI_OTLP_AUTH_TOKEN`):
+```bash
+export OOF_AI_OTLP_AUTH_TOKEN="$(openssl rand -hex 32)"
+```
+
+### 1. Claude Code (OTLP HTTP)
 Export these environment variables in your shell / dev environment:
 ```bash
 export CLAUDE_CODE_ENABLE_TELEMETRY=1
 export OTEL_LOGS_EXPORTER=otlp
 export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4328
+export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer ${OOF_AI_OTLP_AUTH_TOKEN}"
 export OTEL_LOG_USER_PROMPTS=0
 ```
 
-### 2. Codex CLI (OTLP)
-Add the `[otel]` block to `~/.codex/config.toml`:
+### 2. Codex CLI (OTLP HTTP)
+Add the `[otel]` block to `~/.codex/config.toml` (replace `<OOF_AI_OTLP_AUTH_TOKEN>` with your token):
 ```toml
 [otel]
 log_user_prompt = false
-exporter = { otlp-http = { endpoint = "http://127.0.0.1:4328/v1/logs", protocol = "binary" } }
+exporter = { otlp-http = { endpoint = "http://127.0.0.1:4328/v1/logs", protocol = "binary", headers = { Authorization = "Bearer <OOF_AI_OTLP_AUTH_TOKEN>" } } }
 ```
 
 ### 3. Antigravity (`agy`) / herdr Sessions (Local JSONL)
@@ -67,11 +73,13 @@ VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true \
 OOF_VECTOR_AI_DATA_DIR="$(mktemp -d)" \
 OOF_AI_BASIN_ENDPOINT="https://example.ingest.cloudflare.com" \
 OOF_AI_INGEST_TOKEN="dummy" \
+OOF_AI_OTLP_AUTH_TOKEN="dummy-local-otlp-token" \
   vector validate --no-environment adapters/collect/vector-ai-coding-agents/vector.yaml
 
 VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true \
 OOF_VECTOR_AI_DATA_DIR="$(mktemp -d)" \
 OOF_AI_BASIN_ENDPOINT="https://example.ingest.cloudflare.com" \
 OOF_AI_INGEST_TOKEN="dummy" \
+OOF_AI_OTLP_AUTH_TOKEN="dummy-local-otlp-token" \
   vector test adapters/collect/vector-ai-coding-agents/vector.yaml
 ```

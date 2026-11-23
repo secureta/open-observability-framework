@@ -1,7 +1,7 @@
 # Open Observability Framework — Vector Coding-Agent AI Usage Collector
 #
 # Collects metadata-only AI usage telemetry (capture_content: none) from:
-#   1. OTLP logs (127.0.0.1:4327 gRPC / 127.0.0.1:4328 HTTP): Claude Code, Codex CLI, generic OTel GenAI
+#   1. Authenticated OTLP HTTP logs (127.0.0.1:4328, Bearer token required): Claude Code, Codex CLI, generic OTel GenAI
 #   2. Local JSONL transcripts: Antigravity (agy) / herdr sessions
 #   3. Local JSONL sessions: Pi (pi-coding-agent)
 #
@@ -12,19 +12,18 @@
 # Required environment variables:
 #   OOF_AI_BASIN_ENDPOINT   (e.g. https://<AI_STREAM_ID>.ingest.cloudflare.com)
 #   OOF_AI_INGEST_TOKEN     (Cloudflare Account API Token with Pipelines Send)
+#   OOF_AI_OTLP_AUTH_TOKEN  (Shared local Bearer token required on OTLP HTTP Authorization header)
 #
 # Optional environment variables:
 #   OOF_VECTOR_AI_DATA_DIR    (default: /var/lib/vector-ai)
-#   OOF_AI_OTLP_GRPC_LISTEN   (default: 127.0.0.1:4327)
 #   OOF_AI_OTLP_HTTP_LISTEN   (default: 127.0.0.1:4328)
 #   OOF_AI_CAPTURE_CONTENT    (default: none; set to redacted or full to opt into prompt/completion capture)
 #   OOF_AGY_TRANSCRIPT_GLOB   (e.g. /home/<user>/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl)
 #   OOF_PI_SESSIONS_GLOB      (e.g. /home/<user>/.pi/agent/sessions/**/*.jsonl)
 #
-# Security note (shared hosts):
-#   Loopback OTLP ports (127.0.0.1:4327/4328) are intended for single-user developer workstations.
-#   On multi-tenant/shared hosts, isolate the collector per user network namespace or front it with
-#   an authenticated mTLS/token proxy before forwarding to Basin.
+# Security note:
+#   Local OTLP HTTP ingestion requires `Authorization: Bearer <OOF_AI_OTLP_AUTH_TOKEN>` on every request;
+#   unauthenticated or mismatched requests are dropped before normalization and the token is never forwarded to Basin.
 #
 # Vector >= 0.60 note:
 #   Run with VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true or --dangerously-allow-env-var-interpolation.
@@ -34,10 +33,14 @@ data_dir: "${OOF_VECTOR_AI_DATA_DIR:-/var/lib/vector-ai}"
 sources:
   otlp:
     type: opentelemetry
+    # Vector requires the grpc block; unauthenticated gRPC submissions carry no HTTP authorization header
+    # and are dropped by genai_otlp_auth so only authenticated OTLP HTTP requests are accepted.
     grpc:
       address: "${OOF_AI_OTLP_GRPC_LISTEN:-127.0.0.1:4327}"
     http:
       address: "${OOF_AI_OTLP_HTTP_LISTEN:-127.0.0.1:4328}"
+      headers:
+        - authorization
 
   antigravity_transcripts:
     type: file
@@ -52,10 +55,25 @@ sources:
     read_from: beginning
 
 transforms:
+  genai_otlp_auth:
+    type: filter
+    inputs:
+      - otlp.logs
+    condition: |
+      expected = "Bearer " + "${OOF_AI_OTLP_AUTH_TOKEN}"
+      auth_hdr = if exists(.authorization) && is_string(.authorization) {
+        string!(.authorization)
+      } else if exists(%opentelemetry.headers.authorization) && is_string(%opentelemetry.headers.authorization) {
+        string!(%opentelemetry.headers.authorization)
+      } else {
+        ""
+      }
+      "${OOF_AI_OTLP_AUTH_TOKEN}" != "" && auth_hdr == expected
+
   genai_otlp_logs:
     type: remap
     inputs:
-      - otlp.logs
+      - genai_otlp_auth
     source: |
       now_ts = now()
       res = if exists(.resources) && is_object(.resources) { .resources } else { {} }
@@ -890,6 +908,46 @@ tests:
             source: |
               assert_eq!(.event_name, "gen_ai.client.event")
               assert!(!contains(encode_json(.), "PRIVATE_PROMPT_IN_BODY"))
+
+  - name: otlp_auth_rejects_unauthenticated_and_allows_valid_bearer
+    inputs:
+      - insert_at: genai_otlp_auth
+        type: log
+        log_fields:
+          timestamp: "2026-11-23T03:01:40Z"
+          resources:
+            service.name: "claude-code"
+          attributes:
+            event.name: "api_request"
+            model: "claude-sonnet-4-6"
+      - insert_at: genai_otlp_auth
+        type: log
+        log_fields:
+          timestamp: "2026-11-23T03:01:41Z"
+          authorization: "Bearer wrong-token"
+          resources:
+            service.name: "claude-code"
+          attributes:
+            event.name: "api_request"
+            model: "claude-sonnet-4-6"
+      - insert_at: genai_otlp_auth
+        type: log
+        log_fields:
+          timestamp: "2026-11-23T03:01:42Z"
+          authorization: "Bearer ${OOF_AI_OTLP_AUTH_TOKEN}"
+          resources:
+            service.name: "claude-code"
+          attributes:
+            event.name: "api_request"
+            model: "claude-sonnet-4-6"
+            session.id: "sess-auth-ok"
+    outputs:
+      - extract_from: genai_content_policy
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.session_id, "sess-auth-ok")
+              assert!(!exists(.authorization))
 
   - name: antigravity_transcript_strips_content_and_thinking
     inputs:

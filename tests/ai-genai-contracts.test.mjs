@@ -133,6 +133,7 @@ test("vector-ai-coding-agents config obeys comment interpolation safety and pass
     OOF_VECTOR_AI_DATA_DIR: tmpDir,
     OOF_AI_BASIN_ENDPOINT: "https://example.ingest.cloudflare.com",
     OOF_AI_INGEST_TOKEN: "dummy-token-for-validation",
+    OOF_AI_OTLP_AUTH_TOKEN: "dummy-local-otlp-auth-token",
   };
   try {
     const val = spawnSync(vectorBin, ["validate", "--no-environment", VECTOR_AI_CONFIG_PATH], {
