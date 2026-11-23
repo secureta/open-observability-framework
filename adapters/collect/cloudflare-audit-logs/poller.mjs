@@ -7,6 +7,7 @@ const DEFAULT_API_BASE_URL = "https://api.cloudflare.com/client/v4";
 const DEFAULT_POLL_INTERVAL_SECS = 60;
 const DEFAULT_PER_PAGE = 100;
 const DEFAULT_LOOKBACK_SECS = 300;
+const DEFAULT_OVERLAP_MS = 5000;
 const DEFAULT_BATCH_SIZE = 500;
 const MAX_RFC3339_MS = 253402300799999;
 const MAX_RECENT_IDS = 2000;
@@ -160,11 +161,12 @@ export function normalizeAuditLogToOcsf(entry, { nowMs = Date.now() } = {}) {
 
 export function loadCheckpoint(checkpointPath) {
   if (!checkpointPath || !fs.existsSync(checkpointPath)) {
-    return { lastBefore: null, recentIds: [] };
+    return { lastBefore: null, initialSince: null, recentIds: [] };
   }
   const raw = JSON.parse(fs.readFileSync(checkpointPath, "utf8"));
   return {
     lastBefore: typeof raw.lastBefore === "string" ? raw.lastBefore : null,
+    initialSince: typeof raw.initialSince === "string" ? raw.initialSince : null,
     recentIds: Array.isArray(raw.recentIds) ? raw.recentIds.filter((x) => typeof x === "string") : [],
   };
 }
@@ -176,7 +178,15 @@ export function saveCheckpoint(checkpointPath, state) {
   const trimmedIds = Array.isArray(state.recentIds) ? state.recentIds.slice(-MAX_RECENT_IDS) : [];
   fs.writeFileSync(
     tmpPath,
-    JSON.stringify({ lastBefore: state.lastBefore, recentIds: trimmedIds }, null, 2) + "\n",
+    JSON.stringify(
+      {
+        lastBefore: state.lastBefore ?? null,
+        initialSince: state.initialSince ?? null,
+        recentIds: trimmedIds,
+      },
+      null,
+      2
+    ) + "\n",
     { mode: 0o600 }
   );
   fs.renameSync(tmpPath, checkpointPath);
@@ -238,6 +248,7 @@ export async function pollOnce(options) {
     apiBaseUrl = DEFAULT_API_BASE_URL,
     perPage = DEFAULT_PER_PAGE,
     initialLookbackSecs = DEFAULT_LOOKBACK_SECS,
+    overlapMs = DEFAULT_OVERLAP_MS,
     timeoutMs = 15000,
     nowMs = Date.now(),
     fetchImpl = fetch,
@@ -252,7 +263,28 @@ export async function pollOnce(options) {
 
   const checkpoint = loadCheckpoint(checkpointPath);
   const beforeIso = new Date(nowMs).toISOString();
-  const sinceIso = checkpoint.lastBefore || new Date(nowMs - initialLookbackSecs * 1000).toISOString();
+  const safeOverlapMs = Math.max(1000, Math.floor(overlapMs));
+
+  let sinceIso;
+  if (checkpoint.lastBefore) {
+    const prevMs = Date.parse(checkpoint.lastBefore);
+    const overlappedMs = Number.isNaN(prevMs)
+      ? nowMs - initialLookbackSecs * 1000
+      : Math.max(1, prevMs - safeOverlapMs);
+    sinceIso = new Date(overlappedMs).toISOString();
+  } else if (checkpoint.initialSince) {
+    sinceIso = checkpoint.initialSince;
+  } else {
+    sinceIso = new Date(nowMs - initialLookbackSecs * 1000).toISOString();
+    // Persist the initial lower bound before the first upload attempt so startup
+    // retries (even across restarts) never lose records from the oldest lookback minute.
+    saveCheckpoint(checkpointPath, {
+      lastBefore: null,
+      initialSince: sinceIso,
+      recentIds: checkpoint.recentIds,
+    });
+  }
+
   const seenIds = new Set(checkpoint.recentIds);
   const newIds = [...checkpoint.recentIds];
 
@@ -326,6 +358,7 @@ export async function pollOnce(options) {
   // Advance checkpoint ONLY after all pages have been fetched and shipped to Basin.
   saveCheckpoint(checkpointPath, {
     lastBefore: beforeIso,
+    initialSince: null,
     recentIds: newIds,
   });
 

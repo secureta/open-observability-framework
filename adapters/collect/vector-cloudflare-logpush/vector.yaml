@@ -35,7 +35,7 @@ sources:
     strict_path: true
     auth:
       username: "${OOF_CLOUDFLARE_LOGPUSH_USER:-logpush}"
-      password: "${OOF_CLOUDFLARE_LOGPUSH_TOKEN}"
+      password: "${OOF_CLOUDFLARE_LOGPUSH_TOKEN:?OOF_CLOUDFLARE_LOGPUSH_TOKEN must be set and non-empty}"
     framing:
       method: newline_delimited
     decoding:
