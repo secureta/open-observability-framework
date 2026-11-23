@@ -43,3 +43,10 @@ output "ingest_token" {
   value       = var.create_ingest_token ? cloudflare_account_token.ingest[0].value : null
   sensitive   = true
 }
+
+output "logpush_job_ids" {
+  description = "Map of provisioned Cloudflare Logpush job names to their numeric IDs (omits destination_conf secrets)."
+  value = {
+    for k, job in cloudflare_logpush_job.telemetry : k => job.id
+  }
+}
