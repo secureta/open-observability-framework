@@ -162,26 +162,28 @@ test("Cloudflare Audit Logs poller: multi-page burst pagination, checkpoint pres
   const { server: basinServer, receivedEvents, setFailNext } = startMockBasinServer(basinToken);
   await new Promise((resolve) => basinServer.listen(basinPort, "127.0.0.1", resolve));
 
-  // 5 audit records across 3 pages (per_page=2), plus a 6th record added after restart
+  // 5 audit records across 3 pages (per_page=2), including one in the oldest minute of initial lookback (11:55:30Z)
   const allRecords = [
-    { id: "audit-001", when: "2026-03-01T12:00:01Z", interface: "API", action: { type: "rec_add", result: true }, actor: { id: "u1", email: "alice@example.com", ip: "198.51.100.1", type: "user" }, owner: { id: accountId }, resource: { id: "r1", type: "DNS_record" } },
-    { id: "audit-002", when: "2026-03-01T12:00:02Z", interface: "API", action: { type: "rec_add", result: true }, actor: { id: "u1", email: "alice@example.com", ip: "198.51.100.1", type: "user" }, owner: { id: accountId }, resource: { id: "r2", type: "DNS_record" } },
-    { id: "audit-003", when: "2026-03-01T12:00:03Z", interface: "UI", action: { type: "delete", result: true }, actor: { id: "u2", email: "secops@example.com", ip: "198.51.100.2", type: "user" }, owner: { id: accountId }, resource: { id: "w1", type: "firewall_rule" } },
-    { id: "audit-004", when: "2026-03-01T12:00:04Z", interface: "API", action: { type: "token_create", result: false }, actor: { id: "u3", email: "bob@example.com", ip: "203.0.113.5", type: "user" }, owner: { id: accountId }, resource: { id: "t1", type: "api_token" } },
-    { id: "audit-005", when: "2026-03-01T12:00:05Z", interface: "API", action: { type: "rec_add", result: true }, actor: { id: "u1", email: "alice@example.com", ip: "198.51.100.1", type: "user" }, owner: { id: accountId }, resource: { id: "r5", type: "DNS_record" } },
+    { id: "audit-001", when: "2026-03-01T11:55:30Z", interface: "API", action: { type: "rec_add", result: true }, actor: { id: "u1", email: "alice@example.com", ip: "198.51.100.1", type: "user" }, owner: { id: accountId }, resource: { id: "r1", type: "DNS_record" } },
+    { id: "audit-002", when: "2026-03-01T11:58:02Z", interface: "API", action: { type: "rec_add", result: true }, actor: { id: "u1", email: "alice@example.com", ip: "198.51.100.1", type: "user" }, owner: { id: accountId }, resource: { id: "r2", type: "DNS_record" } },
+    { id: "audit-003", when: "2026-03-01T11:59:03Z", interface: "UI", action: { type: "delete", result: true }, actor: { id: "u2", email: "secops@example.com", ip: "198.51.100.2", type: "user" }, owner: { id: accountId }, resource: { id: "w1", type: "firewall_rule" } },
+    { id: "audit-004", when: "2026-03-01T11:59:30Z", interface: "API", action: { type: "token_create", result: false }, actor: { id: "u3", email: "bob@example.com", ip: "203.0.113.5", type: "user" }, owner: { id: accountId }, resource: { id: "t1", type: "api_token" } },
+    { id: "audit-005", when: "2026-03-01T12:01:58Z", interface: "API", action: { type: "rec_add", result: true }, actor: { id: "u1", email: "alice@example.com", ip: "198.51.100.1", type: "user" }, owner: { id: accountId }, resource: { id: "r5", type: "DNS_record" } },
   ];
 
-  const requestedQueries = [];
   const cfServer = http.createServer((req, res) => {
     assert.equal(req.headers.authorization, `Bearer ${cfToken}`);
     const u = new URL(req.url, `http://127.0.0.1:${cfPort}`);
     const page = Number(u.searchParams.get("page") || "1");
     const perPage = Number(u.searchParams.get("per_page") || "100");
-    const since = u.searchParams.get("since");
-    const before = u.searchParams.get("before");
-    requestedQueries.push({ page, perPage, since, before });
+    const sinceMs = Date.parse(u.searchParams.get("since"));
+    const beforeMs = Date.parse(u.searchParams.get("before"));
 
-    const filtered = allRecords.filter((r) => r.when >= since && r.when <= before);
+    // Enforce Cloudflare's strict open-interval timestamp bounds (since < when < before)
+    const filtered = allRecords.filter((r) => {
+      const t = Date.parse(r.when);
+      return t > sinceMs && t < beforeMs;
+    });
     const totalPages = Math.ceil(filtered.length / perPage);
     const slice = filtered.slice((page - 1) * perPage, page * perPage);
 
@@ -197,7 +199,7 @@ test("Cloudflare Audit Logs poller: multi-page burst pagination, checkpoint pres
   await new Promise((resolve) => cfServer.listen(cfPort, "127.0.0.1", resolve));
 
   try {
-    // 1. Simulated Basin failure must NOT advance checkpoint
+    // 1. Startup Basin failure persists initialSince (11:55:00Z) without advancing lastBefore
     setFailNext(true);
     await assert.rejects(
       () =>
@@ -209,14 +211,16 @@ test("Cloudflare Audit Logs poller: multi-page burst pagination, checkpoint pres
           checkpointPath,
           apiBaseUrl: `http://127.0.0.1:${cfPort}/client/v4`,
           perPage: 2,
-          initialLookbackSecs: 600,
-          nowMs: Date.parse("2026-03-01T12:01:00.000Z"),
+          initialLookbackSecs: 300,
+          nowMs: Date.parse("2026-03-01T12:00:00.000Z"),
         }),
       /Basin HTTP ingest failed/
     );
-    assert.equal(fs.existsSync(checkpointPath), false, "Checkpoint must not be written when Basin fails");
+    const failedCp = mod.loadCheckpoint(checkpointPath);
+    assert.equal(failedCp.lastBefore, null, "lastBefore must remain null when startup upload fails");
+    assert.equal(failedCp.initialSince, "2026-03-01T11:55:00.000Z", "initialSince must be persisted before first upload");
 
-    // 2. Successful poll fetches all 3 pages (5 records) and advances checkpoint
+    // 2. Retry with advanced nowMs (12:02:00Z): reuses persisted initialSince so 11:55:30Z is NOT lost
     const res1 = await mod.pollOnce({
       accountId,
       apiToken: cfToken,
@@ -225,9 +229,10 @@ test("Cloudflare Audit Logs poller: multi-page burst pagination, checkpoint pres
       checkpointPath,
       apiBaseUrl: `http://127.0.0.1:${cfPort}/client/v4`,
       perPage: 2,
-      initialLookbackSecs: 600,
-      nowMs: Date.parse("2026-03-01T12:01:00.000Z"),
+      initialLookbackSecs: 300,
+      nowMs: Date.parse("2026-03-01T12:02:00.000Z"),
     });
+    assert.equal(res1.since, "2026-03-01T11:55:00.000Z");
     assert.equal(res1.pagesFetched, 3);
     assert.equal(res1.shipped, 5);
     assert.equal(receivedEvents.length, 5);
@@ -238,10 +243,11 @@ test("Cloudflare Audit Logs poller: multi-page burst pagination, checkpoint pres
     const ids1 = new Set(receivedEvents.map((e) => e.metadata.original_event_uid));
     assert.deepEqual(ids1, new Set(["audit-001", "audit-002", "audit-003", "audit-004", "audit-005"]));
 
-    // 3. Restart simulation: boundary record at exact checkpoint timestamp + 1 new record
+    // 3. Strict boundary cutoff test: unseen record timestamped EXACTLY at previous cutoff (12:02:00.000Z)
+    //    must be captured by overlap while already-seen audit-005 (12:01:58Z) is deduplicated.
     allRecords.push(
-      { id: "audit-005", when: "2026-03-01T12:01:00.000Z", interface: "API", action: { type: "rec_add", result: true }, actor: { id: "u1", email: "alice@example.com", type: "user" }, owner: { id: accountId }, resource: { id: "r5", type: "DNS_record" } },
-      { id: "audit-006", when: "2026-03-01T12:01:30.000Z", interface: "API", action: { type: "rec_add", result: true }, actor: { id: "u1", email: "alice@example.com", type: "user" }, owner: { id: accountId }, resource: { id: "r6", type: "DNS_record" } }
+      { id: "audit-boundary", when: "2026-03-01T12:02:00.000Z", interface: "API", action: { type: "rec_add", result: true }, actor: { id: "u1", email: "alice@example.com", type: "user" }, owner: { id: accountId }, resource: { id: "r-bnd", type: "DNS_record" } },
+      { id: "audit-006", when: "2026-03-01T12:02:30Z", interface: "API", action: { type: "rec_add", result: true }, actor: { id: "u1", email: "alice@example.com", type: "user" }, owner: { id: accountId }, resource: { id: "r6", type: "DNS_record" } }
     );
     const res2 = await mod.pollOnce({
       accountId,
@@ -251,12 +257,14 @@ test("Cloudflare Audit Logs poller: multi-page burst pagination, checkpoint pres
       checkpointPath,
       apiBaseUrl: `http://127.0.0.1:${cfPort}/client/v4`,
       perPage: 2,
-      nowMs: Date.parse("2026-03-01T12:02:00.000Z"),
+      nowMs: Date.parse("2026-03-01T12:03:00.000Z"),
     });
-    assert.equal(res2.since, "2026-03-01T12:01:00.000Z");
-    assert.equal(res2.shipped, 1, "Duplicate boundary audit-005 must be skipped, shipping only audit-006");
-    assert.equal(receivedEvents.length, 6);
-    assert.equal(receivedEvents[5].metadata.original_event_uid, "audit-006");
+    assert.equal(res2.since, "2026-03-01T12:01:55.000Z", "Next window must overlap previous cutoff by 5s");
+    assert.equal(res2.shipped, 2, "Must ship exact-boundary audit-boundary + audit-006 and skip duplicate audit-005");
+    assert.equal(receivedEvents.length, 7);
+    const ids2 = new Set(receivedEvents.map((e) => e.metadata.original_event_uid));
+    assert.ok(ids2.has("audit-boundary"));
+    assert.ok(ids2.has("audit-006"));
   } finally {
     await new Promise((resolve) => cfServer.close(resolve));
     await new Promise((resolve) => basinServer.close(resolve));
@@ -289,6 +297,13 @@ test("Vector Cloudflare Logpush: validate + built-in VRL unit tests", () => {
       encoding: "utf8",
     });
     assert.equal(tst.status, 0, `vector test failed:\n${tst.stdout}\n${tst.stderr}`);
+
+    // Empty OOF_CLOUDFLARE_LOGPUSH_TOKEN must be rejected so Vector never boots with a blank Basic password
+    const emptyPassVal = spawnSync(vectorBin, ["validate", "--no-environment", VECTOR_CF_LOGPUSH_PATH], {
+      env: { ...env, OOF_CLOUDFLARE_LOGPUSH_TOKEN: "" },
+      encoding: "utf8",
+    });
+    assert.notEqual(emptyPassVal.status, 0, "Empty OOF_CLOUDFLARE_LOGPUSH_TOKEN must fail Vector config validation");
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
