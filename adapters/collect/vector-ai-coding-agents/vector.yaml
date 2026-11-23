@@ -37,6 +37,8 @@ sources:
     address: "${OOF_AI_OTLP_HTTP_LISTEN:-127.0.0.1:4328}"
     path: "/v1/logs"
     strict_path: true
+    framing:
+      method: bytes
     decoding:
       codec: json
     auth:
@@ -95,16 +97,18 @@ transforms:
                         }
                       }
                       ts_val = null
-                      raw_nano = if exists(lr.timeUnixNano) && lr.timeUnixNano != null {
-                        lr.timeUnixNano
-                      } else if exists(lr.observedTimeUnixNano) && lr.observedTimeUnixNano != null {
-                        lr.observedTimeUnixNano
-                      } else { null }
-                      if raw_nano != null {
-                        ns_int, ns_err = to_int(raw_nano)
+                      if exists(lr.timeUnixNano) && lr.timeUnixNano != null {
+                        ns_int, ns_err = to_int(lr.timeUnixNano)
                         if ns_err == null && ns_int > 0 {
                           parsed_ns, p_err = from_unix_timestamp(ns_int, unit: "nanoseconds")
                           if p_err == null { ts_val = parsed_ns }
+                        }
+                      }
+                      if ts_val == null && exists(lr.observedTimeUnixNano) && lr.observedTimeUnixNano != null {
+                        obs_int, obs_err = to_int(lr.observedTimeUnixNano)
+                        if obs_err == null && obs_int > 0 {
+                          parsed_obs, p_err = from_unix_timestamp(obs_int, unit: "nanoseconds")
+                          if p_err == null { ts_val = parsed_obs }
                         }
                       }
                       ev = {
@@ -1011,6 +1015,38 @@ tests:
               assert_eq!(.gen_ai.usage.total_tokens, 150)
               assert_eq!(.session_id, "sess-otlp-json-ok")
               assert_eq!(.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736")
+
+  - name: otlp_http_json_zero_time_falls_back_to_observed_time
+    inputs:
+      - insert_at: genai_otlp_decode
+        type: log
+        log_fields:
+          resourceLogs:
+            - resource:
+                attributes:
+                  - key: "service.name"
+                    value:
+                      stringValue: "codex-cli"
+              scopeLogs:
+                - logRecords:
+                    - timeUnixNano: "0"
+                      observedTimeUnixNano: "1795402902000000000"
+                      eventName: "codex.api_request"
+                      attributes:
+                        - key: "model"
+                          value:
+                            stringValue: "gpt-5-codex"
+                        - key: "conversation.id"
+                          value:
+                            stringValue: "conv-observed-ts"
+    outputs:
+      - extract_from: genai_content_policy
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.time, 1795402902000)
+              assert_eq!(.time_dt, "2026-11-23T03:01:42.000Z")
+              assert_eq!(.session_id, "conv-observed-ts")
 
   - name: antigravity_transcript_strips_content_and_thinking
     inputs:
