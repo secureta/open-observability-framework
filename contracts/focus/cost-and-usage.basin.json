@@ -107,7 +107,7 @@
     {
       "name": "ContractedCost",
       "type": "float64",
-      "required": false
+      "required": true
     },
     {
       "name": "ContractedUnitPrice",

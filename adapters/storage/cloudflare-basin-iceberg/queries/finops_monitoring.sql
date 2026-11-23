@@ -152,7 +152,8 @@ LIMIT 200;
 -- ============================================================================
 -- Part 3: FOCUS v1.0 Cost & Usage (Iceberg Table: finops.focus_cost_and_usage)
 -- Note: Every Part 3 query selects only the latest snapshot (`Tags.snapshot_ts_ms`)
--- per (ProviderName, BillingAccountId, charge_day) so reruns never double-count,
+-- per (ProviderName, BillingAccountId, dataset, charge_day) so reruns (including
+-- R2-only reruns alongside Pipelines snapshots) never double-count or drop datasets,
 -- and separates invoice-backed `billed_usage` from `list_price_estimate` rows.
 -- ============================================================================
 
@@ -162,6 +163,7 @@ WITH tagged AS (
     *,
     DATE_TRUNC('day', ChargePeriodStart) AS charge_day,
     COALESCE(TRY_CAST(json_extract(Tags, '$.snapshot_ts_ms') AS BIGINT), 0) AS snapshot_ts_ms,
+    COALESCE(json_extract_string(Tags, '$.dataset'), ServiceName) AS dataset,
     COALESCE(json_extract_string(Tags, '$.cost_basis'), 'billed_usage') AS cost_basis
   FROM finops.focus_cost_and_usage
 ),
@@ -169,10 +171,11 @@ latest_run AS (
   SELECT
     ProviderName,
     BillingAccountId,
+    dataset,
     charge_day,
     MAX(snapshot_ts_ms) AS max_snapshot_ts_ms
   FROM tagged
-  GROUP BY ProviderName, BillingAccountId, charge_day
+  GROUP BY ProviderName, BillingAccountId, dataset, charge_day
 ),
 dedup_focus AS (
   SELECT t.*
@@ -180,6 +183,7 @@ dedup_focus AS (
   INNER JOIN latest_run l
     ON t.ProviderName = l.ProviderName
     AND t.BillingAccountId = l.BillingAccountId
+    AND t.dataset = l.dataset
     AND t.charge_day = l.charge_day
     AND t.snapshot_ts_ms = l.max_snapshot_ts_ms
 )
@@ -215,6 +219,7 @@ WITH tagged AS (
     *,
     DATE_TRUNC('day', ChargePeriodStart) AS charge_day,
     COALESCE(TRY_CAST(json_extract(Tags, '$.snapshot_ts_ms') AS BIGINT), 0) AS snapshot_ts_ms,
+    COALESCE(json_extract_string(Tags, '$.dataset'), ServiceName) AS dataset,
     COALESCE(json_extract_string(Tags, '$.cost_basis'), 'billed_usage') AS cost_basis
   FROM finops.focus_cost_and_usage
 ),
@@ -222,10 +227,11 @@ latest_run AS (
   SELECT
     ProviderName,
     BillingAccountId,
+    dataset,
     charge_day,
     MAX(snapshot_ts_ms) AS max_snapshot_ts_ms
   FROM tagged
-  GROUP BY ProviderName, BillingAccountId, charge_day
+  GROUP BY ProviderName, BillingAccountId, dataset, charge_day
 ),
 dedup_focus AS (
   SELECT t.*
@@ -233,6 +239,7 @@ dedup_focus AS (
   INNER JOIN latest_run l
     ON t.ProviderName = l.ProviderName
     AND t.BillingAccountId = l.BillingAccountId
+    AND t.dataset = l.dataset
     AND t.charge_day = l.charge_day
     AND t.snapshot_ts_ms = l.max_snapshot_ts_ms
 )
@@ -261,6 +268,7 @@ WITH tagged AS (
     *,
     DATE_TRUNC('day', ChargePeriodStart) AS charge_day,
     COALESCE(TRY_CAST(json_extract(Tags, '$.snapshot_ts_ms') AS BIGINT), 0) AS snapshot_ts_ms,
+    COALESCE(json_extract_string(Tags, '$.dataset'), ServiceName) AS dataset,
     COALESCE(json_extract_string(Tags, '$.cost_basis'), 'billed_usage') AS cost_basis
   FROM finops.focus_cost_and_usage
 ),
@@ -268,10 +276,11 @@ latest_run AS (
   SELECT
     ProviderName,
     BillingAccountId,
+    dataset,
     charge_day,
     MAX(snapshot_ts_ms) AS max_snapshot_ts_ms
   FROM tagged
-  GROUP BY ProviderName, BillingAccountId, charge_day
+  GROUP BY ProviderName, BillingAccountId, dataset, charge_day
 ),
 daily_spend AS (
   SELECT
@@ -284,6 +293,7 @@ daily_spend AS (
   INNER JOIN latest_run l
     ON t.ProviderName = l.ProviderName
     AND t.BillingAccountId = l.BillingAccountId
+    AND t.dataset = l.dataset
     AND t.charge_day = l.charge_day
     AND t.snapshot_ts_ms = l.max_snapshot_ts_ms
   WHERE t.cost_basis = 'billed_usage'
