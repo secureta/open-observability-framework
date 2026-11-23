@@ -99,6 +99,9 @@
           ocsfLuaStore = ./adapters/collect/fluent-bit-journald/ocsf.lua;
           vectorYamlSrc = ./adapters/collect/vector-journald/vector.yaml;
           vectorGhaYamlSrc = ./adapters/collect/vector-github-actions/vector.yaml;
+          cfAuditPollerSrc = ./adapters/collect/cloudflare-audit-logs/poller.mjs;
+          vectorCfLogpushYamlSrc = ./adapters/collect/vector-cloudflare-logpush/vector.yaml;
+          cfGraphqlExporterSrc = ./adapters/collect/cloudflare-graphql-exporter/exporter.mjs;
           fluentBitConfRaw = builtins.readFile ./adapters/collect/fluent-bit-journald/fluent-bit.conf;
           otelcolYamlSrc = ./adapters/collect/otel-collector-journald/otelcol.yaml;
 
@@ -233,6 +236,11 @@
               cp ${vectorGhaYamlSrc} "$out"
             '';
 
+          oofVectorCfLogpushConfig =
+            pkgs.runCommand "oof-vector-cloudflare-logpush.yaml" { } ''
+              cp ${vectorCfLogpushYamlSrc} "$out"
+            '';
+
           oofFluentBitConfig = mkFluentBitConfig { };
 
           oofOtelcolConfig =
@@ -273,6 +281,50 @@
             };
           };
 
+          oofCfAuditPoller =
+            pkgs.runCommand "oof-cloudflare-audit-logs-0.1.0"
+              {
+                nativeBuildInputs = [ pkgs.makeWrapper ];
+                meta = {
+                  mainProgram = "oof-cloudflare-audit-logs";
+                };
+              }
+              ''
+                mkdir -p "$out/bin" "$out/share/oof-cloudflare-audit-logs"
+                cp ${cfAuditPollerSrc} "$out/share/oof-cloudflare-audit-logs/poller.mjs"
+                makeWrapper ${lib.getExe pkgs.nodejs} "$out/bin/oof-cloudflare-audit-logs" \
+                  --add-flags "$out/share/oof-cloudflare-audit-logs/poller.mjs"
+              '';
+
+          oofVectorCfLogpush = pkgs.symlinkJoin {
+            name = "oof-vector-cloudflare-logpush-${pkgs.vector.version}";
+            paths = [ pkgs.vector ];
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            postBuild = ''
+              wrapProgram "$out/bin/vector" \
+                --set VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION "true" \
+                --set-default VECTOR_CONFIG "${oofVectorCfLogpushConfig}"
+            '';
+            meta = pkgs.vector.meta // {
+              mainProgram = "vector";
+            };
+          };
+
+          oofCfGraphqlExporter =
+            pkgs.runCommand "oof-cloudflare-graphql-exporter-0.1.0"
+              {
+                nativeBuildInputs = [ pkgs.makeWrapper ];
+                meta = {
+                  mainProgram = "oof-cloudflare-graphql-exporter";
+                };
+              }
+              ''
+                mkdir -p "$out/bin" "$out/share/oof-cloudflare-graphql-exporter"
+                cp ${cfGraphqlExporterSrc} "$out/share/oof-cloudflare-graphql-exporter/exporter.mjs"
+                makeWrapper ${lib.getExe pkgs.nodejs} "$out/bin/oof-cloudflare-graphql-exporter" \
+                  --add-flags "$out/share/oof-cloudflare-graphql-exporter/exporter.mjs"
+              '';
+
           oofFluentBit = pkgs.symlinkJoin {
             name = "oof-fluent-bit-${pkgs.fluent-bit.version}";
             paths = [ pkgs.fluent-bit ];
@@ -309,11 +361,15 @@
             mkPrometheusConfig
             oofVectorConfig
             oofVectorGhaConfig
+            oofVectorCfLogpushConfig
             oofFluentBitConfig
             oofOtelcolConfig
             oofPrometheusConfig
             oofVector
             oofVectorGha
+            oofCfAuditPoller
+            oofVectorCfLogpush
+            oofCfGraphqlExporter
             oofFluentBit
             oofPrometheus
             ;
@@ -484,6 +540,10 @@
 
       isWildcardIpv4 = c: c.kind == "ipv4" && c.octets == [ 0 0 0 0 ];
       isWildcardIpv6 = c: c.kind == "ipv6" && c.words == [ 0 0 0 0 0 0 0 0 ];
+      isLoopbackCanonical =
+        c:
+        (c.kind == "ipv4" && builtins.elemAt c.octets 0 == 127)
+        || (c.kind == "ipv6" && c.words == [ 0 0 0 0 0 0 0 1 ]);
 
       hostsCollide =
         aCanon: bCanon:
@@ -603,11 +663,15 @@
             {
               oof-vector-config = assets.oofVectorConfig;
               oof-vector-github-actions-config = assets.oofVectorGhaConfig;
+              oof-vector-cloudflare-logpush-config = assets.oofVectorCfLogpushConfig;
               oof-fluent-bit-config = assets.oofFluentBitConfig;
               oof-otelcol-config = assets.oofOtelcolConfig;
               oof-prometheus-config = assets.oofPrometheusConfig;
               oof-vector = assets.oofVector;
               oof-vector-github-actions = assets.oofVectorGha;
+              oof-cloudflare-audit-logs = assets.oofCfAuditPoller;
+              oof-vector-cloudflare-logpush = assets.oofVectorCfLogpush;
+              oof-cloudflare-graphql-exporter = assets.oofCfGraphqlExporter;
               oof-fluent-bit = assets.oofFluentBit;
               oof-prometheus = assets.oofPrometheus;
             }
@@ -655,6 +719,8 @@
           bridgeHttpParsed = parseSocketAddr cfg.otelBridge.httpListen;
           bridgeTargetParsed = parseHttpUrlHostPort cfg.otelBridge.bridgeEndpoint;
           ghaWebhookParsed = parseSocketAddr cfg.githubActionsWebhook.listen;
+          cfLogpushParsed = parseSocketAddr cfg.cloudflareLogpush.listen;
+          cfExporterParsed = parseSocketAddr cfg.cloudflareGraphqlExporter.listen;
           promListenParsed = parseSocketAddr cfg.prometheus.listenAddress;
 
           promTargetEntries = lib.mapAttrsToList (
@@ -737,7 +803,15 @@
                 name = "services.oof-collector.githubActionsWebhook.listen";
                 parsed = ghaWebhookParsed;
               })
+              ++ (lib.optional cfg.cloudflareLogpush.enable {
+                name = "services.oof-collector.cloudflareLogpush.listen";
+                parsed = cfLogpushParsed;
+              })
             ))
+            ++ (lib.optional cfg.cloudflareGraphqlExporter.enable {
+              name = "services.oof-collector.cloudflareGraphqlExporter.listen";
+              parsed = cfExporterParsed;
+            })
             ++ (lib.optional cfg.prometheus.enable {
               name = "services.oof-collector.prometheus.listenAddress";
               parsed = promListenParsed;
@@ -874,6 +948,94 @@
               };
             };
 
+            cloudflareAuditLogs = {
+              enable = lib.mkEnableOption "co-located checkpointed Cloudflare Account Audit Logs poller normalizing audit events into OCSF v1.3.0";
+
+              nodePackage = lib.mkPackageOption pkgs "nodejs" { };
+
+              apiBaseUrl = lib.mkOption {
+                type = lib.types.str;
+                default = "https://api.cloudflare.com/client/v4";
+                description = "Cloudflare v4 REST API base URL for Audit Logs polling.";
+              };
+
+              perPage = lib.mkOption {
+                type = lib.types.ints.between 1 1000;
+                default = 100;
+                description = "Maximum number of audit log entries requested per page.";
+              };
+
+              pollIntervalSecs = lib.mkOption {
+                type = lib.types.ints.between 5 3600;
+                default = 60;
+                description = "Polling interval in seconds between bounded [since, before] windows.";
+              };
+
+              lookbackSecs = lib.mkOption {
+                type = lib.types.ints.between 60 86400;
+                default = 300;
+                description = "Initial lookback window in seconds when no persisted checkpoint exists.";
+              };
+
+              environmentFile = lib.mkOption {
+                type = lib.types.nullOr (lib.types.strMatching "^/[^[:space:]]+$");
+                default = null;
+                description = "Optional separate systemd EnvironmentFile containing OOF_CLOUDFLARE_ACCOUNT_ID and OOF_CLOUDFLARE_API_TOKEN (defaults to services.oof-collector.environmentFile). Must point outside /nix/store.";
+              };
+            };
+
+            cloudflareLogpush = {
+              enable = lib.mkEnableOption "co-located Vector Cloudflare Logpush HTTP receiver normalizing edge/WAF/Access logs into OCSF v1.3.0";
+
+              listen = lib.mkOption {
+                type = lib.types.str;
+                default = "127.0.0.1:8089";
+                description = "Host:port for the Cloudflare Logpush HTTP receiver (/logpush/cloudflare).";
+              };
+
+              environmentFile = lib.mkOption {
+                type = lib.types.nullOr (lib.types.strMatching "^/[^[:space:]]+$");
+                default = null;
+                description = "Optional separate systemd EnvironmentFile containing OOF_CLOUDFLARE_LOGPUSH_TOKEN (defaults to services.oof-collector.environmentFile). Must point outside /nix/store.";
+              };
+            };
+
+            cloudflareGraphqlExporter = {
+              enable = lib.mkEnableOption "loopback Prometheus exporter querying Cloudflare GraphQL Analytics API (disabled by default)";
+
+              nodePackage = lib.mkPackageOption pkgs "nodejs" { };
+
+              listen = lib.mkOption {
+                type = lib.types.str;
+                default = "127.0.0.1:9199";
+                description = "Host:port for the Cloudflare GraphQL Analytics Prometheus exporter (/metrics).";
+              };
+
+              environmentFile = lib.mkOption {
+                type = lib.types.nullOr (lib.types.strMatching "^/[^[:space:]]+$");
+                default = null;
+                description = "Runtime systemd EnvironmentFile containing OOF_CLOUDFLARE_API_TOKEN and OOF_CLOUDFLARE_ZONE_IDS. Must point outside /nix/store.";
+              };
+
+              graphqlEndpoint = lib.mkOption {
+                type = lib.types.str;
+                default = "https://api.cloudflare.com/client/v4/graphql";
+                description = "Cloudflare GraphQL Analytics API endpoint URL.";
+              };
+
+              windowMinutes = lib.mkOption {
+                type = lib.types.ints.between 1 60;
+                default = 5;
+                description = "Lookback aggregation window in minutes for httpRequests1mGroups.";
+              };
+
+              cacheTtlSecs = lib.mkOption {
+                type = lib.types.ints.between 0 300;
+                default = 60;
+                description = "In-memory scrape cache TTL in seconds.";
+              };
+            };
+
             extraConfigFiles = lib.mkOption {
               type = lib.types.listOf (lib.types.strMatching "^/[^[:space:]]+$");
               default = [ ];
@@ -964,7 +1126,7 @@
           };
 
           config = lib.mkMerge [
-            (lib.mkIf (cfg.enable || cfg.prometheus.enable) {
+            (lib.mkIf (cfg.enable || cfg.prometheus.enable || cfg.cloudflareGraphqlExporter.enable) {
               assertions = [
                 {
                   assertion = collidingPairs == [ ];
@@ -1014,6 +1176,24 @@
                     || cfg.githubActionsWebhook.environmentFile == null
                     || !(lib.hasPrefix builtins.storeDir cfg.githubActionsWebhook.environmentFile);
                   message = "services.oof-collector.githubActionsWebhook.environmentFile must NOT point inside /nix/store.";
+                }
+                {
+                  assertion =
+                    (!cfg.cloudflareAuditLogs.enable)
+                    || cfg.cloudflareAuditLogs.environmentFile == null
+                    || !(lib.hasPrefix builtins.storeDir cfg.cloudflareAuditLogs.environmentFile);
+                  message = "services.oof-collector.cloudflareAuditLogs.environmentFile must NOT point inside /nix/store.";
+                }
+                {
+                  assertion = (!cfg.cloudflareLogpush.enable) || cfLogpushParsed.valid;
+                  message = "services.oof-collector.cloudflareLogpush.listen ('${cfg.cloudflareLogpush.listen}') must be a valid IPv4/IPv6 socket address (ip:port, e.g. 127.0.0.1:8089).";
+                }
+                {
+                  assertion =
+                    (!cfg.cloudflareLogpush.enable)
+                    || cfg.cloudflareLogpush.environmentFile == null
+                    || !(lib.hasPrefix builtins.storeDir cfg.cloudflareLogpush.environmentFile);
+                  message = "services.oof-collector.cloudflareLogpush.environmentFile must NOT point inside /nix/store.";
                 }
               ];
 
@@ -1139,6 +1319,133 @@
                     "--dangerously-allow-env-var-interpolation"
                     "--config"
                     assets.oofVectorGhaConfig
+                  ];
+                };
+              };
+
+              systemd.services.oof-cloudflare-audit-logs = lib.mkIf cfg.cloudflareAuditLogs.enable {
+                description = "Open Observability Framework Cloudflare Audit Logs Poller (Checkpointed OCSF v1.3.0)";
+                wantedBy = [ "multi-user.target" ];
+                after = [ "network-online.target" ];
+                wants = [ "network-online.target" ];
+
+                environment = {
+                  OOF_CLOUDFLARE_API_BASE_URL = cfg.cloudflareAuditLogs.apiBaseUrl;
+                  OOF_CLOUDFLARE_AUDIT_PER_PAGE = toString cfg.cloudflareAuditLogs.perPage;
+                  OOF_CLOUDFLARE_AUDIT_POLL_INTERVAL_SECS = toString cfg.cloudflareAuditLogs.pollIntervalSecs;
+                  OOF_CLOUDFLARE_AUDIT_LOOKBACK_SECS = toString cfg.cloudflareAuditLogs.lookbackSecs;
+                  OOF_CF_AUDIT_CHECKPOINT_FILE = "/var/lib/oof-cloudflare-audit-logs/checkpoint.json";
+                };
+
+                serviceConfig = {
+                  Type = "simple";
+                  DynamicUser = true;
+                  StateDirectory = "oof-cloudflare-audit-logs";
+                  EnvironmentFile =
+                    if cfg.cloudflareAuditLogs.environmentFile != null then
+                      [
+                        cfg.environmentFile
+                        cfg.cloudflareAuditLogs.environmentFile
+                      ]
+                    else
+                      cfg.environmentFile;
+                  Restart = "on-failure";
+                  RestartSec = "5s";
+                  NoNewPrivileges = true;
+                  ProtectSystem = "strict";
+                  ProtectHome = true;
+                  PrivateTmp = true;
+                  ExecStart = utils.escapeSystemdExecArgs [
+                    (lib.getExe cfg.cloudflareAuditLogs.nodePackage)
+                    "${./adapters/collect/cloudflare-audit-logs/poller.mjs}"
+                  ];
+                };
+              };
+
+              systemd.services.oof-cloudflare-logpush = lib.mkIf cfg.cloudflareLogpush.enable {
+                description = "Open Observability Framework Cloudflare Logpush Collector (Vector)";
+                wantedBy = [ "multi-user.target" ];
+                after = [ "network-online.target" ];
+                wants = [ "network-online.target" ];
+
+                environment = {
+                  VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION = "true";
+                  OOF_VECTOR_DATA_DIR = "/var/lib/oof-cloudflare-logpush";
+                  OOF_CF_LOGPUSH_LISTEN = cfg.cloudflareLogpush.listen;
+                };
+
+                serviceConfig = {
+                  Type = "simple";
+                  DynamicUser = true;
+                  StateDirectory = "oof-cloudflare-logpush";
+                  EnvironmentFile =
+                    if cfg.cloudflareLogpush.environmentFile != null then
+                      [
+                        cfg.environmentFile
+                        cfg.cloudflareLogpush.environmentFile
+                      ]
+                    else
+                      cfg.environmentFile;
+                  Restart = "on-failure";
+                  RestartSec = "5s";
+                  NoNewPrivileges = true;
+                  ProtectSystem = "strict";
+                  ProtectHome = true;
+                  PrivateTmp = true;
+                  ExecStart = utils.escapeSystemdExecArgs [
+                    (lib.getExe cfg.vectorPackage)
+                    "--dangerously-allow-env-var-interpolation"
+                    "--config"
+                    assets.oofVectorCfLogpushConfig
+                  ];
+                };
+              };
+            })
+
+            (lib.mkIf cfg.cloudflareGraphqlExporter.enable {
+              assertions = [
+                {
+                  assertion = cfExporterParsed.valid && isLoopbackCanonical cfExporterParsed.canonical;
+                  message = "services.oof-collector.cloudflareGraphqlExporter.listen ('${cfg.cloudflareGraphqlExporter.listen}') must be a loopback IPv4/IPv6 socket address (127.0.0.0/8 or [::1], e.g. 127.0.0.1:9199) because /metrics is unauthenticated.";
+                }
+                {
+                  assertion = cfg.cloudflareGraphqlExporter.environmentFile != null;
+                  message = "services.oof-collector.cloudflareGraphqlExporter.environmentFile must be set when cloudflareGraphqlExporter.enable = true.";
+                }
+                {
+                  assertion =
+                    cfg.cloudflareGraphqlExporter.environmentFile == null
+                    || !(lib.hasPrefix builtins.storeDir cfg.cloudflareGraphqlExporter.environmentFile);
+                  message = "services.oof-collector.cloudflareGraphqlExporter.environmentFile must NOT point inside /nix/store.";
+                }
+              ];
+
+              systemd.services.oof-cloudflare-graphql-exporter = {
+                description = "Open Observability Framework Cloudflare GraphQL Analytics Prometheus Exporter";
+                wantedBy = [ "multi-user.target" ];
+                after = [ "network-online.target" ];
+                wants = [ "network-online.target" ];
+
+                environment = {
+                  OOF_CF_EXPORTER_LISTEN = cfg.cloudflareGraphqlExporter.listen;
+                  OOF_CLOUDFLARE_GRAPHQL_ENDPOINT = cfg.cloudflareGraphqlExporter.graphqlEndpoint;
+                  OOF_CF_EXPORTER_WINDOW_MINUTES = toString cfg.cloudflareGraphqlExporter.windowMinutes;
+                  OOF_CF_EXPORTER_CACHE_TTL_SECS = toString cfg.cloudflareGraphqlExporter.cacheTtlSecs;
+                };
+
+                serviceConfig = {
+                  Type = "simple";
+                  DynamicUser = true;
+                  EnvironmentFile = cfg.cloudflareGraphqlExporter.environmentFile;
+                  Restart = "on-failure";
+                  RestartSec = "5s";
+                  NoNewPrivileges = true;
+                  ProtectSystem = "strict";
+                  ProtectHome = true;
+                  PrivateTmp = true;
+                  ExecStart = utils.escapeSystemdExecArgs [
+                    (lib.getExe cfg.cloudflareGraphqlExporter.nodePackage)
+                    "${./adapters/collect/cloudflare-graphql-exporter/exporter.mjs}"
                   ];
                 };
               };
@@ -1344,6 +1651,55 @@
                     enable = true;
                     listen = "127.0.0.1:8088";
                     environmentFile = "/run/secrets/oof-gha-webhook.env";
+                  };
+                };
+              };
+
+              cfTelemetryCfg = evalNixos {
+                services.oof-collector = {
+                  enable = true;
+                  collector = "vector";
+                  environmentFile = "/run/secrets/oof-collector.env";
+                  cloudflareAuditLogs = {
+                    enable = true;
+                    environmentFile = "/run/secrets/oof-cf-audit.env";
+                  };
+                  cloudflareLogpush = {
+                    enable = true;
+                    listen = "127.0.0.1:8089";
+                    environmentFile = "/run/secrets/oof-cf-logpush.env";
+                  };
+                  cloudflareGraphqlExporter = {
+                    enable = true;
+                    listen = "127.0.0.1:9199";
+                    environmentFile = "/run/secrets/oof-cf-graphql.env";
+                  };
+                };
+              };
+
+              badCfPortCollisionCfg = evalNixos {
+                services.oof-collector = {
+                  enable = true;
+                  collector = "vector";
+                  environmentFile = "/run/secrets/oof-collector.env";
+                  cloudflareLogpush = {
+                    enable = true;
+                    listen = "127.0.0.1:8089";
+                  };
+                  cloudflareGraphqlExporter = {
+                    enable = true;
+                    listen = "127.0.0.1:8089";
+                    environmentFile = "/run/secrets/oof-cf-graphql.env";
+                  };
+                };
+              };
+
+              badCfExporterNonLoopbackCfg = evalNixos {
+                services.oof-collector = {
+                  cloudflareGraphqlExporter = {
+                    enable = true;
+                    listen = "0.0.0.0:9199";
+                    environmentFile = "/run/secrets/oof-cf-graphql.env";
                   };
                 };
               };
@@ -1588,6 +1944,13 @@
                   ghaWebhookListen = ghaWebhookCfg.config.systemd.services.oof-github-actions-webhook.environment.OOF_GHA_WEBHOOK_LISTEN;
                   badGhaCollisionRejected = !(checkAssertionsPass badGhaPortCollisionCfg);
 
+                  cfTelemetryOk = checkAssertionsPass cfTelemetryCfg;
+                  cfAuditExec = cfTelemetryCfg.config.systemd.services.oof-cloudflare-audit-logs.serviceConfig.ExecStart;
+                  cfLogpushListen = cfTelemetryCfg.config.systemd.services.oof-cloudflare-logpush.environment.OOF_CF_LOGPUSH_LISTEN;
+                  cfExporterListen = cfTelemetryCfg.config.systemd.services.oof-cloudflare-graphql-exporter.environment.OOF_CF_EXPORTER_LISTEN;
+                  badCfPortCollisionRejected = !(checkAssertionsPass badCfPortCollisionCfg);
+                  badCfExporterNonLoopbackRejected = !(checkAssertionsPass badCfExporterNonLoopbackCfg);
+
                   promDefaultDisabled = !(promDefaultDisabledCfg.config.services.oof-collector.prometheus.enable);
                   promDefaultHasUnit = builtins.hasAttr "oof-prometheus" promDefaultDisabledCfg.config.systemd.services;
                   promEnabledOk = checkAssertionsPass promEnabledCfg;
@@ -1678,6 +2041,13 @@
                       assert.match(s.ghaWebhookExec, /--dangerously-allow-env-var-interpolation/);
                       assert.equal(s.ghaWebhookListen, "127.0.0.1:8088");
                       assert.equal(s.badGhaCollisionRejected, true);
+
+                      assert.equal(s.cfTelemetryOk, true);
+                      assert.match(s.cfAuditExec, /poller\.mjs/);
+                      assert.equal(s.cfLogpushListen, "127.0.0.1:8089");
+                      assert.equal(s.cfExporterListen, "127.0.0.1:9199");
+                      assert.equal(s.badCfPortCollisionRejected, true);
+                      assert.equal(s.badCfExporterNonLoopbackRejected, true);
 
                       assert.equal(s.promDefaultDisabled, true);
                       assert.equal(s.promDefaultHasUnit, false);
@@ -1786,6 +2156,31 @@
                       ${assets.oofFluentBit}/bin/fluent-bit --dry-run
 
                     node --test ${self}/tests/ocsf-contracts.test.mjs
+                    touch "$out"
+                  '';
+
+              cloudflare-telemetry =
+                pkgs.runCommand "oof-cloudflare-telemetry"
+                  {
+                    nativeBuildInputs = [
+                      pkgs.nodejs
+                      pkgs.vector
+                      pkgs.prometheus
+                      pkgs.prometheus.cli
+                    ];
+                  }
+                  ''
+                    export HOME="$TMPDIR/home"
+                    mkdir -p "$HOME"
+
+                    OOF_VECTOR_DATA_DIR="$TMPDIR/vec-cf-logpush-data" \
+                      OOF_BASIN_ENDPOINT="https://example-stream.ingest.cloudflare.com" \
+                      OOF_INGEST_TOKEN="dummy-basin-token" \
+                      OOF_CLOUDFLARE_LOGPUSH_TOKEN="dummy-logpush-token" \
+                      OOF_CF_LOGPUSH_LISTEN="127.0.0.1:8089" \
+                      ${assets.oofVectorCfLogpush}/bin/vector validate --no-environment
+
+                    node --test ${self}/tests/cloudflare-telemetry.test.mjs
                     touch "$out"
                   '';
             }

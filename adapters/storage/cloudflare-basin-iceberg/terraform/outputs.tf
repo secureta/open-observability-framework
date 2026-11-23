@@ -74,6 +74,13 @@ output "focus_pipeline_id" {
   value       = var.enable_finops ? cloudflare_pipeline.focus[0].id : null
 }
 
+output "logpush_job_ids" {
+  description = "Map of provisioned Cloudflare Logpush job names to their numeric IDs (omits destination_conf secrets)."
+  value = {
+    for k, job in cloudflare_logpush_job.telemetry : k => job.id
+  }
+}
+
 output "ai_stream_id" {
   description = "Provisioned Basin HTTP stream ID for AI usage telemetry (null when enable_ai_usage = false)."
   value       = var.enable_ai_usage ? restful_resource.ai_usage_stream[0].output.id : null
