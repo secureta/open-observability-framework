@@ -5,6 +5,12 @@ locals {
   ocsf_schema  = jsondecode(file(local.schema_path))
   rendered_sql = replace(replace(file(local.pipeline_sql_path), "__SINK_NAME__", var.sink_name), "__STREAM_NAME__", var.stream_name)
 
+  focus_schema_path       = var.finops_schema_file != "" ? var.finops_schema_file : "${path.module}/../../../../contracts/focus/cost-and-usage.basin.json"
+  focus_pipeline_sql_path = var.finops_pipeline_sql_file != "" ? var.finops_pipeline_sql_file : "${path.module}/../focus_pipeline.sql"
+
+  focus_schema       = var.enable_finops ? jsondecode(file(local.focus_schema_path)) : { fields = [] }
+  rendered_focus_sql = var.enable_finops ? replace(replace(file(local.focus_pipeline_sql_path), "__SINK_NAME__", var.finops_sink_name), "__STREAM_NAME__", var.finops_stream_name) : ""
+
   bucket_name = var.create_bucket ? cloudflare_r2_bucket.lake[0].name : var.bucket_name
 
   discovered_ingest_permission_group_ids = var.create_ingest_token && var.ingest_token_permission_group_id == null ? [
@@ -146,6 +152,98 @@ resource "cloudflare_account_token" "ingest" {
     precondition {
       condition     = local.resolved_ingest_permission_group_id != null
       error_message = "Could not resolve 'Pipelines Send' permission group ID; set ingest_token_permission_group_id explicitly."
+    }
+  }
+}
+
+resource "restful_resource" "focus_stream" {
+  count = var.enable_finops ? 1 : 0
+
+  path            = "/accounts/${var.cloudflare_account_id}/pipelines/v1/streams"
+  read_path       = "$(path)/$(body.id)"
+  update_path     = "$(path)/$(body.id)"
+  delete_path     = "$(path)/$(body.id)"
+  update_method   = "PATCH"
+  create_selector = "result"
+  read_selector   = "result"
+  force_new_attrs = ["name", "format", "schema"]
+  output_attrs    = ["id", "name", "endpoint", "version"]
+
+  body = {
+    name = var.finops_stream_name
+    format = {
+      type = "json"
+    }
+    http = {
+      enabled        = true
+      authentication = true
+      cors = {
+        origins = var.stream_cors_origins
+      }
+    }
+    worker_binding = {
+      enabled = false
+    }
+    schema = {
+      fields = local.focus_schema.fields
+    }
+  }
+}
+
+resource "cloudflare_pipeline_sink" "focus" {
+  count = var.enable_finops ? 1 : 0
+
+  account_id = var.cloudflare_account_id
+  name       = var.finops_sink_name
+  type       = "r2_data_catalog"
+
+  format = {
+    type = "parquet"
+  }
+
+  config = {
+    account_id = var.cloudflare_account_id
+    bucket     = local.bucket_name
+    namespace  = var.finops_namespace
+    table_name = var.finops_table_name
+    token      = var.catalog_token
+    rolling_policy = {
+      interval_seconds = var.roll_interval_seconds
+    }
+  }
+
+  depends_on = [
+    cloudflare_r2_bucket.lake,
+    cloudflare_r2_data_catalog.lake,
+  ]
+}
+
+resource "cloudflare_pipeline" "focus" {
+  count = var.enable_finops ? 1 : 0
+
+  account_id = var.cloudflare_account_id
+  name       = var.finops_pipeline_name
+  sql        = local.rendered_focus_sql
+
+  depends_on = [
+    restful_resource.focus_stream,
+    cloudflare_pipeline_sink.focus,
+  ]
+
+  lifecycle {
+    replace_triggered_by = [
+      restful_resource.focus_stream[0].id,
+      cloudflare_pipeline_sink.focus[0].id,
+    ]
+
+    precondition {
+      condition     = var.finops_stream_name != var.finops_sink_name
+      error_message = "finops_stream_name and finops_sink_name must be distinct SQL identifiers."
+    }
+
+    precondition {
+      condition     = var.finops_stream_name != var.stream_name && var.finops_sink_name != var.sink_name
+      error_message = "FOCUS stream/sink names must be distinct from the OCSF stream/sink names."
     }
   }
 }

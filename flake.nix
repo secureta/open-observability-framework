@@ -1738,6 +1738,20 @@
                     touch "$out"
                   '';
 
+              finops-contracts =
+                pkgs.runCommand "oof-finops-contracts"
+                  {
+                    nativeBuildInputs = [
+                      pkgs.nodejs
+                    ];
+                  }
+                  ''
+                    export HOME="$TMPDIR/home"
+                    mkdir -p "$HOME"
+                    node --test ${self}/tests/finops-contracts.test.mjs
+                    touch "$out"
+                  '';
+
               ocsf-contracts =
                 pkgs.runCommand "oof-ocsf-contracts"
                   {

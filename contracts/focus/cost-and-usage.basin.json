@@ -1,0 +1,223 @@
+{
+  "fields": [
+    {
+      "name": "AvailabilityZone",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "BilledCost",
+      "type": "float64",
+      "required": true
+    },
+    {
+      "name": "BillingAccountId",
+      "type": "string",
+      "required": true
+    },
+    {
+      "name": "BillingAccountName",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "BillingCurrency",
+      "type": "string",
+      "required": true
+    },
+    {
+      "name": "BillingPeriodEnd",
+      "type": "timestamp",
+      "unit": "millisecond",
+      "required": true
+    },
+    {
+      "name": "BillingPeriodStart",
+      "type": "timestamp",
+      "unit": "millisecond",
+      "required": true
+    },
+    {
+      "name": "ChargeCategory",
+      "type": "string",
+      "required": true
+    },
+    {
+      "name": "ChargeClass",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "ChargeDescription",
+      "type": "string",
+      "required": true
+    },
+    {
+      "name": "ChargeFrequency",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "ChargePeriodEnd",
+      "type": "timestamp",
+      "unit": "millisecond",
+      "required": true
+    },
+    {
+      "name": "ChargePeriodStart",
+      "type": "timestamp",
+      "unit": "millisecond",
+      "required": true
+    },
+    {
+      "name": "CommitmentDiscountCategory",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "CommitmentDiscountId",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "CommitmentDiscountName",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "CommitmentDiscountStatus",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "CommitmentDiscountType",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "ConsumedQuantity",
+      "type": "float64",
+      "required": false
+    },
+    {
+      "name": "ConsumedUnit",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "ContractedCost",
+      "type": "float64",
+      "required": false
+    },
+    {
+      "name": "ContractedUnitPrice",
+      "type": "float64",
+      "required": false
+    },
+    {
+      "name": "EffectiveCost",
+      "type": "float64",
+      "required": true
+    },
+    {
+      "name": "InvoiceIssuerName",
+      "type": "string",
+      "required": true
+    },
+    {
+      "name": "ListCost",
+      "type": "float64",
+      "required": false
+    },
+    {
+      "name": "ListUnitPrice",
+      "type": "float64",
+      "required": false
+    },
+    {
+      "name": "PricingCategory",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "PricingQuantity",
+      "type": "float64",
+      "required": false
+    },
+    {
+      "name": "PricingUnit",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "ProviderName",
+      "type": "string",
+      "required": true
+    },
+    {
+      "name": "PublisherName",
+      "type": "string",
+      "required": true
+    },
+    {
+      "name": "RegionId",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "RegionName",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "ResourceId",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "ResourceName",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "ResourceType",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "ServiceCategory",
+      "type": "string",
+      "required": true
+    },
+    {
+      "name": "ServiceName",
+      "type": "string",
+      "required": true
+    },
+    {
+      "name": "SkuId",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "SkuPriceId",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "SubAccountId",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "SubAccountName",
+      "type": "string",
+      "required": false
+    },
+    {
+      "name": "Tags",
+      "type": "json",
+      "required": false
+    }
+  ]
+}
