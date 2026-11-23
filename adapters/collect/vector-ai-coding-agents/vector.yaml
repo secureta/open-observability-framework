@@ -1,7 +1,7 @@
 # Open Observability Framework — Vector Coding-Agent AI Usage Collector
 #
 # Collects metadata-only AI usage telemetry (capture_content: none) from:
-#   1. Authenticated OTLP HTTP logs (127.0.0.1:4328, Bearer token required): Claude Code, Codex CLI, generic OTel GenAI
+#   1. Authenticated OTLP/HTTP JSON logs (127.0.0.1:4328/v1/logs, HTTP 401 on missing/invalid auth): Claude Code, Codex CLI, generic OTel GenAI
 #   2. Local JSONL transcripts: Antigravity (agy) / herdr sessions
 #   3. Local JSONL sessions: Pi (pi-coding-agent)
 #
@@ -12,7 +12,7 @@
 # Required environment variables:
 #   OOF_AI_BASIN_ENDPOINT   (e.g. https://<AI_STREAM_ID>.ingest.cloudflare.com)
 #   OOF_AI_INGEST_TOKEN     (Cloudflare Account API Token with Pipelines Send)
-#   OOF_AI_OTLP_AUTH_TOKEN  (Shared local Bearer token required on OTLP HTTP Authorization header)
+#   OOF_AI_OTLP_AUTH_TOKEN  (Shared local auth secret enforced at the HTTP listener; returns HTTP 401 on mismatch)
 #
 # Optional environment variables:
 #   OOF_VECTOR_AI_DATA_DIR    (default: /var/lib/vector-ai)
@@ -22,8 +22,9 @@
 #   OOF_PI_SESSIONS_GLOB      (e.g. /home/<user>/.pi/agent/sessions/**/*.jsonl)
 #
 # Security note:
-#   Local OTLP HTTP ingestion requires `Authorization: Bearer <OOF_AI_OTLP_AUTH_TOKEN>` on every request;
-#   unauthenticated or mismatched requests are dropped before normalization and the token is never forwarded to Basin.
+#   Local OTLP/HTTP JSON ingestion enforces HTTP authentication at the listener before accepting
+#   batches (returning HTTP 401 on missing/invalid credentials), exposes no unauthenticated gRPC
+#   listener, and never forwards local credentials to Basin.
 #
 # Vector >= 0.60 note:
 #   Run with VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true or --dangerously-allow-env-var-interpolation.
@@ -31,16 +32,16 @@
 data_dir: "${OOF_VECTOR_AI_DATA_DIR:-/var/lib/vector-ai}"
 
 sources:
-  otlp:
-    type: opentelemetry
-    # Vector requires the grpc block; unauthenticated gRPC submissions carry no HTTP authorization header
-    # and are dropped by genai_otlp_auth so only authenticated OTLP HTTP requests are accepted.
-    grpc:
-      address: "${OOF_AI_OTLP_GRPC_LISTEN:-127.0.0.1:4327}"
-    http:
-      address: "${OOF_AI_OTLP_HTTP_LISTEN:-127.0.0.1:4328}"
-      headers:
-        - authorization
+  otlp_http:
+    type: http_server
+    address: "${OOF_AI_OTLP_HTTP_LISTEN:-127.0.0.1:4328}"
+    path: "/v1/logs"
+    strict_path: true
+    decoding:
+      codec: json
+    auth:
+      strategy: bearer
+      token: "${OOF_AI_OTLP_AUTH_TOKEN}"
 
   antigravity_transcripts:
     type: file
@@ -55,25 +56,86 @@ sources:
     read_from: beginning
 
 transforms:
-  genai_otlp_auth:
-    type: filter
+  genai_otlp_decode:
+    type: remap
     inputs:
-      - otlp.logs
-    condition: |
-      expected = "Bearer " + "${OOF_AI_OTLP_AUTH_TOKEN}"
-      auth_hdr = if exists(.authorization) && is_string(.authorization) {
-        string!(.authorization)
-      } else if exists(%opentelemetry.headers.authorization) && is_string(%opentelemetry.headers.authorization) {
-        string!(%opentelemetry.headers.authorization)
-      } else {
-        ""
+      - otlp_http
+    source: |
+      # Expand OTLP/HTTP JSON ExportLogsServiceRequest (resourceLogs[].scopeLogs[].logRecords[])
+      # into flat log events consumed by genai_otlp_logs.
+      events = []
+      if exists(.resourceLogs) && is_array(.resourceLogs) {
+        for_each(array!(.resourceLogs)) -> |_ri, rl| {
+          if is_object(rl) {
+            res_map = {}
+            if exists(rl.resource) && is_object(rl.resource) && exists(rl.resource.attributes) && is_array(rl.resource.attributes) {
+              for_each(array!(rl.resource.attributes)) -> |_ai, kv| {
+                if is_object(kv) && exists(kv.key) && is_string(kv.key) && exists(kv.value) && is_object(kv.value) {
+                  k = string!(kv.key)
+                  v = kv.value
+                  val = if exists(v.stringValue) { v.stringValue } else if exists(v.intValue) { v.intValue } else if exists(v.doubleValue) { v.doubleValue } else if exists(v.boolValue) { v.boolValue } else { null }
+                  if val != null { res_map = set!(res_map, [k], val) }
+                }
+              }
+            }
+            if exists(rl.scopeLogs) && is_array(rl.scopeLogs) {
+              for_each(array!(rl.scopeLogs)) -> |_si, sl| {
+                if is_object(sl) && exists(sl.logRecords) && is_array(sl.logRecords) {
+                  for_each(array!(sl.logRecords)) -> |_li, lr| {
+                    if is_object(lr) {
+                      attr_map = {}
+                      if exists(lr.attributes) && is_array(lr.attributes) {
+                        for_each(array!(lr.attributes)) -> |_ki, kv| {
+                          if is_object(kv) && exists(kv.key) && is_string(kv.key) && exists(kv.value) && is_object(kv.value) {
+                            k = string!(kv.key)
+                            v = kv.value
+                            val = if exists(v.stringValue) { v.stringValue } else if exists(v.intValue) { v.intValue } else if exists(v.doubleValue) { v.doubleValue } else if exists(v.boolValue) { v.boolValue } else { null }
+                            if val != null { attr_map = set!(attr_map, [k], val) }
+                          }
+                        }
+                      }
+                      ts_val = null
+                      raw_nano = if exists(lr.timeUnixNano) && lr.timeUnixNano != null {
+                        lr.timeUnixNano
+                      } else if exists(lr.observedTimeUnixNano) && lr.observedTimeUnixNano != null {
+                        lr.observedTimeUnixNano
+                      } else { null }
+                      if raw_nano != null {
+                        ns_int, ns_err = to_int(raw_nano)
+                        if ns_err == null && ns_int > 0 {
+                          parsed_ns, p_err = from_unix_timestamp(ns_int, unit: "nanoseconds")
+                          if p_err == null { ts_val = parsed_ns }
+                        }
+                      }
+                      ev = {
+                        "resources": res_map,
+                        "attributes": attr_map
+                      }
+                      if ts_val != null { ev.timestamp = ts_val }
+                      if exists(lr.eventName) && is_string(lr.eventName) && string!(lr.eventName) != "" {
+                        ev.event_name = string!(lr.eventName)
+                      }
+                      if exists(lr.traceId) && is_string(lr.traceId) && string!(lr.traceId) != "" {
+                        ev.trace_id = string!(lr.traceId)
+                      }
+                      if exists(lr.spanId) && is_string(lr.spanId) && string!(lr.spanId) != "" {
+                        ev.span_id = string!(lr.spanId)
+                      }
+                      events = push(events, ev)
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
       }
-      "${OOF_AI_OTLP_AUTH_TOKEN}" != "" && auth_hdr == expected
+      . = events
 
   genai_otlp_logs:
     type: remap
     inputs:
-      - genai_otlp_auth
+      - genai_otlp_decode
     source: |
       now_ts = now()
       res = if exists(.resources) && is_object(.resources) { .resources } else { {} }
@@ -909,45 +971,46 @@ tests:
               assert_eq!(.event_name, "gen_ai.client.event")
               assert!(!contains(encode_json(.), "PRIVATE_PROMPT_IN_BODY"))
 
-  - name: otlp_auth_rejects_unauthenticated_and_allows_valid_bearer
+  - name: otlp_http_json_export_decodes_and_normalizes
     inputs:
-      - insert_at: genai_otlp_auth
+      - insert_at: genai_otlp_decode
         type: log
         log_fields:
-          timestamp: "2026-11-23T03:01:40Z"
-          resources:
-            service.name: "claude-code"
-          attributes:
-            event.name: "api_request"
-            model: "claude-sonnet-4-6"
-      - insert_at: genai_otlp_auth
-        type: log
-        log_fields:
-          timestamp: "2026-11-23T03:01:41Z"
-          authorization: "Bearer wrong-token"
-          resources:
-            service.name: "claude-code"
-          attributes:
-            event.name: "api_request"
-            model: "claude-sonnet-4-6"
-      - insert_at: genai_otlp_auth
-        type: log
-        log_fields:
-          timestamp: "2026-11-23T03:01:42Z"
-          authorization: "Bearer ${OOF_AI_OTLP_AUTH_TOKEN}"
-          resources:
-            service.name: "claude-code"
-          attributes:
-            event.name: "api_request"
-            model: "claude-sonnet-4-6"
-            session.id: "sess-auth-ok"
+          resourceLogs:
+            - resource:
+                attributes:
+                  - key: "service.name"
+                    value:
+                      stringValue: "claude-code"
+              scopeLogs:
+                - logRecords:
+                    - timeUnixNano: "1795402902000000000"
+                      eventName: "api_request"
+                      traceId: "4bf92f3577b34da6a3ce929d0e0e4736"
+                      attributes:
+                        - key: "model"
+                          value:
+                            stringValue: "claude-sonnet-4-6"
+                        - key: "input_tokens"
+                          value:
+                            intValue: "100"
+                        - key: "output_tokens"
+                          value:
+                            intValue: "50"
+                        - key: "session.id"
+                          value:
+                            stringValue: "sess-otlp-json-ok"
     outputs:
       - extract_from: genai_content_policy
         conditions:
           - type: vrl
             source: |
-              assert_eq!(.session_id, "sess-auth-ok")
-              assert!(!exists(.authorization))
+              assert_eq!(.service.name, "claude-code")
+              assert_eq!(.event_name, "claude_code.api_request")
+              assert_eq!(.operation_name, "chat")
+              assert_eq!(.gen_ai.usage.total_tokens, 150)
+              assert_eq!(.session_id, "sess-otlp-json-ok")
+              assert_eq!(.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736")
 
   - name: antigravity_transcript_strips_content_and_thinking
     inputs:
