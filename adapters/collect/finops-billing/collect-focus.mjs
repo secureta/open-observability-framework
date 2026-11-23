@@ -5,7 +5,8 @@ const DEFAULT_CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4";
 const DEFAULT_GITHUB_API_BASE = "https://api.github.com";
 
 export const DEFAULT_CLOUDFLARE_PRICING = {
-  // Public Cloudflare standard list prices (USD)
+  // Public Cloudflare standard list prices (USD) used for pre-allowance list-price estimates.
+  // Actual billed/effective spend is kept at 0 for analytics-derived rows until invoice billing data is ingested.
   r2StoragePerGbMonth: 0.015,
   r2ClassAPerMillionOps: 4.5,
   r2ClassBPerMillionOps: 0.36,
@@ -13,6 +14,7 @@ export const DEFAULT_CLOUDFLARE_PRICING = {
   daysPerBillingMonth: 30,
 };
 
+// Documented Cloudflare R2 Class A (mutating/list) operations
 const R2_CLASS_A_ACTIONS = new Set([
   "ListBuckets",
   "PutBucket",
@@ -31,6 +33,28 @@ const R2_CLASS_A_ACTIONS = new Set([
   "PutBucketLifecycleConfiguration",
   "LifecycleStorageTierTransition",
   "RecordUsage",
+]);
+
+// Documented Cloudflare R2 Class B (read/head) operations
+const R2_CLASS_B_ACTIONS = new Set([
+  "HeadBucket",
+  "HeadObject",
+  "GetObject",
+  "UsageSummary",
+  "GetBucketEncryption",
+  "GetBucketLocation",
+  "GetBucketCors",
+  "GetBucketLifecycleConfiguration",
+]);
+
+// Documented Cloudflare R2 free operations
+const R2_FREE_ACTIONS = new Set([
+  "DeleteObject",
+  "DeleteBucket",
+  "AbortMultipartUpload",
+  "DeleteBucketCors",
+  "DeleteBucketEncryption",
+  "DeleteBucketLifecycleConfiguration",
 ]);
 
 function cleanNonEmptyString(val) {
@@ -73,8 +97,7 @@ export function resolveUtcDayWindow(dateInput, nowDate = new Date()) {
     targetDate = new Date(`${dateInput.trim()}T00:00:00.000Z`);
   } else {
     // Default to previous complete UTC day
-    const d = new Date(Date.UTC(nowDate.getUTCFullYear(), nowDate.getUTCMonth(), nowDate.getUTCDate() - 1));
-    targetDate = d;
+    targetDate = new Date(Date.UTC(nowDate.getUTCFullYear(), nowDate.getUTCMonth(), nowDate.getUTCDate() - 1));
   }
   if (Number.isNaN(targetDate.getTime())) {
     throw new Error(`Invalid UTC date window: ${String(dateInput)}`);
@@ -170,8 +193,11 @@ export function buildFocusRecord(input) {
 }
 
 export function classifyR2Action(actionType) {
-  if (typeof actionType !== "string") return "B";
-  return R2_CLASS_A_ACTIONS.has(actionType) ? "A" : "B";
+  if (typeof actionType !== "string") return "unknown";
+  if (R2_CLASS_A_ACTIONS.has(actionType)) return "A";
+  if (R2_CLASS_B_ACTIONS.has(actionType)) return "B";
+  if (R2_FREE_ACTIONS.has(actionType)) return "free";
+  return "unknown";
 }
 
 export function normalizeCloudflareAnalyticsToFocus(
@@ -181,6 +207,7 @@ export function normalizeCloudflareAnalyticsToFocus(
     accountName = null,
     window,
     pricing = DEFAULT_CLOUDFLARE_PRICING,
+    snapshotTsMs = Date.now(),
   }
 ) {
   const effectivePricing = { ...DEFAULT_CLOUDFLARE_PRICING, ...pricing };
@@ -190,7 +217,7 @@ export function normalizeCloudflareAnalyticsToFocus(
   const acct = accounts[0];
   const records = [];
 
-  // 1. Cloudflare R2 Storage (bytes -> daily prorated GB-month)
+  // 1. Cloudflare R2 Storage (bytes -> daily prorated GB-month, list-price estimate only)
   const storageGroups = Array.isArray(acct.r2StorageAdaptiveGroups) ? acct.r2StorageAdaptiveGroups : [];
   const storageByBucket = new Map();
   for (const g of storageGroups) {
@@ -205,7 +232,7 @@ export function normalizeCloudflareAnalyticsToFocus(
   for (const [bucket, totalBytes] of storageByBucket.entries()) {
     const gb = totalBytes / 1e9;
     const gbMonthDaily = gb / effectivePricing.daysPerBillingMonth;
-    const cost = gbMonthDaily * effectivePricing.r2StoragePerGbMonth;
+    const listEstimate = gbMonthDaily * effectivePricing.r2StoragePerGbMonth;
     records.push(
       buildFocusRecord({
         BillingAccountId: accountId,
@@ -214,7 +241,7 @@ export function normalizeCloudflareAnalyticsToFocus(
         BillingPeriodStart: window.billingPeriodStart,
         BillingPeriodEnd: window.billingPeriodEnd,
         ChargeCategory: "Usage",
-        ChargeDescription: `Cloudflare R2 storage for bucket ${bucket} (${window.dateString})`,
+        ChargeDescription: `Cloudflare R2 storage usage (list-price estimate) for bucket ${bucket} (${window.dateString})`,
         ChargeFrequency: "Usage-Based",
         ChargePeriodStart: window.chargePeriodStart,
         ChargePeriodEnd: window.chargePeriodEnd,
@@ -233,14 +260,16 @@ export function normalizeCloudflareAnalyticsToFocus(
         PricingQuantity: gbMonthDaily,
         PricingUnit: "GB-Month",
         ListUnitPrice: effectivePricing.r2StoragePerGbMonth,
-        ContractedUnitPrice: effectivePricing.r2StoragePerGbMonth,
-        ListCost: cost,
-        ContractedCost: cost,
-        BilledCost: cost,
-        EffectiveCost: cost,
+        ListCost: listEstimate,
+        // Analytics data does not reflect account-wide monthly free allowances or invoices.
+        BilledCost: 0,
+        EffectiveCost: 0,
         Tags: {
           oof_collector: "oof-finops-billing",
           source_api: "cloudflare-graphql-analytics",
+          cost_basis: "list_price_estimate",
+          snapshot_ts_ms: snapshotTsMs,
+          snapshot_date: window.dateString,
           bucket,
           peak_storage_bytes: totalBytes,
         },
@@ -248,7 +277,7 @@ export function normalizeCloudflareAnalyticsToFocus(
     );
   }
 
-  // 2. Cloudflare R2 Operations (Class A & Class B)
+  // 2. Cloudflare R2 Operations (explicit Class A, Class B, free, and unknown categories)
   const opsGroups = Array.isArray(acct.r2OperationsAdaptiveGroups) ? acct.r2OperationsAdaptiveGroups : [];
   const opsByBucketAndClass = new Map();
   for (const g of opsGroups) {
@@ -263,12 +292,26 @@ export function normalizeCloudflareAnalyticsToFocus(
 
   for (const [key, requests] of opsByBucketAndClass.entries()) {
     const [bucket, opClass] = key.split("::");
-    const isClassA = opClass === "A";
-    const unitPricePerMillion = isClassA
-      ? effectivePricing.r2ClassAPerMillionOps
-      : effectivePricing.r2ClassBPerMillionOps;
+    let skuId = "r2_unclassified_ops";
+    let unitPricePerMillion = 0;
+    let descLabel = "unclassified";
+
+    if (opClass === "A") {
+      skuId = "r2_class_a_ops";
+      unitPricePerMillion = effectivePricing.r2ClassAPerMillionOps;
+      descLabel = "Class A";
+    } else if (opClass === "B") {
+      skuId = "r2_class_b_ops";
+      unitPricePerMillion = effectivePricing.r2ClassBPerMillionOps;
+      descLabel = "Class B";
+    } else if (opClass === "free") {
+      skuId = "r2_free_ops";
+      unitPricePerMillion = 0;
+      descLabel = "free";
+    }
+
     const millionOps = requests / 1e6;
-    const cost = millionOps * unitPricePerMillion;
+    const listEstimate = millionOps * unitPricePerMillion;
 
     records.push(
       buildFocusRecord({
@@ -278,7 +321,7 @@ export function normalizeCloudflareAnalyticsToFocus(
         BillingPeriodStart: window.billingPeriodStart,
         BillingPeriodEnd: window.billingPeriodEnd,
         ChargeCategory: "Usage",
-        ChargeDescription: `Cloudflare R2 Class ${opClass} operations for bucket ${bucket} (${window.dateString})`,
+        ChargeDescription: `Cloudflare R2 ${descLabel} operations (list-price estimate) for bucket ${bucket} (${window.dateString})`,
         ChargeFrequency: "Usage-Based",
         ChargePeriodStart: window.chargePeriodStart,
         ChargePeriodEnd: window.chargePeriodEnd,
@@ -290,21 +333,22 @@ export function normalizeCloudflareAnalyticsToFocus(
         ResourceId: `r2:${accountId}:${bucket}`,
         ResourceName: bucket,
         ResourceType: "R2 Bucket",
-        SkuId: isClassA ? "r2_class_a_ops" : "r2_class_b_ops",
+        SkuId: skuId,
         PricingCategory: "Standard",
         ConsumedQuantity: requests,
         ConsumedUnit: "Requests",
         PricingQuantity: millionOps,
         PricingUnit: "1M Requests",
         ListUnitPrice: unitPricePerMillion,
-        ContractedUnitPrice: unitPricePerMillion,
-        ListCost: cost,
-        ContractedCost: cost,
-        BilledCost: cost,
-        EffectiveCost: cost,
+        ListCost: listEstimate,
+        BilledCost: 0,
+        EffectiveCost: 0,
         Tags: {
           oof_collector: "oof-finops-billing",
           source_api: "cloudflare-graphql-analytics",
+          cost_basis: "list_price_estimate",
+          snapshot_ts_ms: snapshotTsMs,
+          snapshot_date: window.dateString,
           bucket,
           r2_operation_class: opClass,
         },
@@ -312,14 +356,21 @@ export function normalizeCloudflareAnalyticsToFocus(
     );
   }
 
-  // 3. Optional Cloudflare Pipelines / Basin ingestion volume (when returned by API)
-  const pipelineGroups = Array.isArray(acct.pipelinesAdaptiveGroups) ? acct.pipelinesAdaptiveGroups : [];
+  // 3. Cloudflare Pipelines / Basin ingestion volume (`pipelinesOperatorAdaptiveGroups.sum.bytesIn`)
+  const pipelineGroups = Array.isArray(acct.pipelinesOperatorAdaptiveGroups)
+    ? acct.pipelinesOperatorAdaptiveGroups
+    : [];
+  const bytesByPipeline = new Map();
   for (const g of pipelineGroups) {
-    const pipelineName = cleanNonEmptyString(g?.dimensions?.pipelineName) || "default-pipeline";
-    const bytesIngested = toFiniteNumber(g?.sum?.bytesIngested ?? g?.sum?.bytes, 0);
-    if (bytesIngested <= 0) continue;
-    const gb = bytesIngested / 1e9;
-    const cost = gb * effectivePricing.pipelinesPerGbIngested;
+    const pipelineId = cleanNonEmptyString(g?.dimensions?.pipelineId) || "default-pipeline";
+    const bytesIn = toFiniteNumber(g?.sum?.bytesIn, 0);
+    if (bytesIn <= 0) continue;
+    bytesByPipeline.set(pipelineId, (bytesByPipeline.get(pipelineId) || 0) + bytesIn);
+  }
+
+  for (const [pipelineId, bytesIn] of bytesByPipeline.entries()) {
+    const gb = bytesIn / 1e9;
+    const listEstimate = gb * effectivePricing.pipelinesPerGbIngested;
     records.push(
       buildFocusRecord({
         BillingAccountId: accountId,
@@ -328,7 +379,7 @@ export function normalizeCloudflareAnalyticsToFocus(
         BillingPeriodStart: window.billingPeriodStart,
         BillingPeriodEnd: window.billingPeriodEnd,
         ChargeCategory: "Usage",
-        ChargeDescription: `Cloudflare Pipelines ingestion for ${pipelineName} (${window.dateString})`,
+        ChargeDescription: `Cloudflare Pipelines ingestion (list-price estimate) for ${pipelineId} (${window.dateString})`,
         ChargeFrequency: "Usage-Based",
         ChargePeriodStart: window.chargePeriodStart,
         ChargePeriodEnd: window.chargePeriodEnd,
@@ -337,8 +388,8 @@ export function normalizeCloudflareAnalyticsToFocus(
         InvoiceIssuerName: "Cloudflare",
         ServiceCategory: "Analytics",
         ServiceName: "Cloudflare Pipelines",
-        ResourceId: `pipelines:${accountId}:${pipelineName}`,
-        ResourceName: pipelineName,
+        ResourceId: `pipelines:${accountId}:${pipelineId}`,
+        ResourceName: pipelineId,
         ResourceType: "Basin Pipeline",
         SkuId: "pipelines_ingest_gb",
         PricingCategory: "Standard",
@@ -347,16 +398,17 @@ export function normalizeCloudflareAnalyticsToFocus(
         PricingQuantity: gb,
         PricingUnit: "GB",
         ListUnitPrice: effectivePricing.pipelinesPerGbIngested,
-        ContractedUnitPrice: effectivePricing.pipelinesPerGbIngested,
-        ListCost: cost,
-        ContractedCost: cost,
-        BilledCost: cost,
-        EffectiveCost: cost,
+        ListCost: listEstimate,
+        BilledCost: 0,
+        EffectiveCost: 0,
         Tags: {
           oof_collector: "oof-finops-billing",
           source_api: "cloudflare-graphql-analytics",
-          pipeline: pipelineName,
-          bytes_ingested: bytesIngested,
+          cost_basis: "list_price_estimate",
+          snapshot_ts_ms: snapshotTsMs,
+          snapshot_date: window.dateString,
+          pipeline_id: pipelineId,
+          bytes_in: bytesIn,
         },
       })
     );
@@ -365,28 +417,20 @@ export function normalizeCloudflareAnalyticsToFocus(
   return records;
 }
 
-export async function collectCloudflareFocus({
-  accountId,
-  accountName = null,
-  apiToken,
-  window,
-  apiBaseUrl = DEFAULT_CLOUDFLARE_API_BASE,
-  pricing = DEFAULT_CLOUDFLARE_PRICING,
-  fetchImpl = fetch,
-  allowInsecureHttp = false,
-}) {
-  const cleanAccountId = cleanNonEmptyString(accountId);
-  const cleanToken = cleanNonEmptyString(apiToken);
-  if (!cleanAccountId || !/^[a-fA-F0-9]{32}$/.test(cleanAccountId)) {
-    throw new Error("CLOUDFLARE_ACCOUNT_ID must be a 32-character hexadecimal account ID");
-  }
-  if (!cleanToken) {
-    throw new Error("Missing CLOUDFLARE_API_TOKEN for Cloudflare FinOps collection");
-  }
-  const base = validateUrl(apiBaseUrl, "CLOUDFLARE_API_BASE_URL", allowInsecureHttp);
+export function buildCloudflareGraphqlQuery({ includePipelines = false } = {}) {
+  const pipelinesSelection = includePipelines
+    ? `
+          pipelinesOperatorAdaptiveGroups(
+            limit: 1000
+            filter: { datetime_geq: $start, datetime_lt: $end }
+          ) {
+            dimensions { pipelineId }
+            sum { bytesIn }
+          }`
+    : "";
 
-  const query = `
-    query OofFinopsR2Usage($accountTag: string!, $start: Time!, $end: Time!) {
+  return `
+    query OofFinopsUsage($accountTag: string!, $start: Time!, $end: Time!) {
       viewer {
         accounts(filter: { accountTag: $accountTag }) {
           r2StorageAdaptiveGroups(
@@ -402,11 +446,35 @@ export async function collectCloudflareFocus({
           ) {
             dimensions { bucketName actionType }
             sum { requests }
-          }
+          }${pipelinesSelection}
         }
       }
     }
   `;
+}
+
+export async function collectCloudflareFocus({
+  accountId,
+  accountName = null,
+  apiToken,
+  window,
+  apiBaseUrl = DEFAULT_CLOUDFLARE_API_BASE,
+  pricing = DEFAULT_CLOUDFLARE_PRICING,
+  includePipelines = false,
+  snapshotTsMs = Date.now(),
+  fetchImpl = fetch,
+  allowInsecureHttp = false,
+}) {
+  const cleanAccountId = cleanNonEmptyString(accountId);
+  const cleanToken = cleanNonEmptyString(apiToken);
+  if (!cleanAccountId || !/^[a-fA-F0-9]{32}$/.test(cleanAccountId)) {
+    throw new Error("CLOUDFLARE_ACCOUNT_ID must be a 32-character hexadecimal account ID");
+  }
+  if (!cleanToken) {
+    throw new Error("Missing CLOUDFLARE_API_TOKEN for Cloudflare FinOps collection");
+  }
+  const base = validateUrl(apiBaseUrl, "CLOUDFLARE_API_BASE_URL", allowInsecureHttp);
+  const query = buildCloudflareGraphqlQuery({ includePipelines });
 
   const response = await fetchImpl(`${base}/graphql`, {
     method: "POST",
@@ -438,6 +506,7 @@ export async function collectCloudflareFocus({
     accountName,
     window,
     pricing,
+    snapshotTsMs,
   });
 }
 
@@ -458,7 +527,7 @@ function mapGitHubProduct(product) {
 
 export function normalizeGitHubBillingUsageToFocus(
   payload,
-  { billingAccountId, billingAccountName = null, window }
+  { billingAccountId, billingAccountName = null, window, snapshotTsMs = Date.now() }
 ) {
   const items = Array.isArray(payload?.usageItems) ? payload.usageItems : [];
   const records = [];
@@ -525,6 +594,9 @@ export function normalizeGitHubBillingUsageToFocus(
         Tags: {
           oof_collector: "oof-finops-billing",
           source_api: "github-billing-usage",
+          cost_basis: "billed_usage",
+          snapshot_ts_ms: snapshotTsMs,
+          snapshot_date: itemWindow.dateString,
           github_product: cleanNonEmptyString(item?.product) || "unknown",
           organization: orgName,
           repository: repoName,
@@ -543,6 +615,7 @@ export async function collectGitHubFocus({
   token,
   window,
   apiBaseUrl = DEFAULT_GITHUB_API_BASE,
+  snapshotTsMs = Date.now(),
   fetchImpl = fetch,
   allowInsecureHttp = false,
 }) {
@@ -586,6 +659,7 @@ export async function collectGitHubFocus({
     billingAccountId,
     billingAccountName: billingAccountId,
     window,
+    snapshotTsMs,
   });
 }
 
@@ -620,7 +694,13 @@ export async function sendFocusToBasin(
   return { status: response.status, count: batch.length };
 }
 
-export async function runFinopsCollection({ env = process.env, dryRun = false, fetchImpl = fetch, allowInsecureHttp = false } = {}) {
+export async function runFinopsCollection({
+  env = process.env,
+  dryRun = false,
+  snapshotTsMs = Date.now(),
+  fetchImpl = fetch,
+  allowInsecureHttp = false,
+} = {}) {
   const window = resolveUtcDayWindow(cleanNonEmptyString(env.OOF_FINOPS_DATE));
   let pricing = DEFAULT_CLOUDFLARE_PRICING;
   const pricingJson = cleanNonEmptyString(env.OOF_CF_PRICING_JSON);
@@ -631,6 +711,9 @@ export async function runFinopsCollection({ env = process.env, dryRun = false, f
     }
     pricing = { ...DEFAULT_CLOUDFLARE_PRICING, ...parsed };
   }
+
+  const includePipelines =
+    (cleanNonEmptyString(env.OOF_CF_INCLUDE_PIPELINES) || "").toLowerCase() === "true";
 
   const allRecords = [];
   let sourcesConfigured = 0;
@@ -646,6 +729,8 @@ export async function runFinopsCollection({ env = process.env, dryRun = false, f
       window,
       apiBaseUrl: cleanNonEmptyString(env.CLOUDFLARE_API_BASE_URL) || DEFAULT_CLOUDFLARE_API_BASE,
       pricing,
+      includePipelines,
+      snapshotTsMs,
       fetchImpl,
       allowInsecureHttp,
     });
@@ -663,6 +748,7 @@ export async function runFinopsCollection({ env = process.env, dryRun = false, f
       token: ghToken,
       window,
       apiBaseUrl: cleanNonEmptyString(env.GITHUB_API_BASE_URL) || DEFAULT_GITHUB_API_BASE,
+      snapshotTsMs,
       fetchImpl,
       allowInsecureHttp,
     });
@@ -676,7 +762,7 @@ export async function runFinopsCollection({ env = process.env, dryRun = false, f
   }
 
   if (dryRun) {
-    return { dryRun: true, date: window.dateString, count: allRecords.length, records: allRecords };
+    return { dryRun: true, date: window.dateString, snapshotTsMs, count: allRecords.length, records: allRecords };
   }
 
   const sendResult = await sendFocusToBasin(allRecords, {
@@ -689,6 +775,7 @@ export async function runFinopsCollection({ env = process.env, dryRun = false, f
   return {
     dryRun: false,
     date: window.dateString,
+    snapshotTsMs,
     count: sendResult.count,
     status: sendResult.status,
   };
@@ -698,10 +785,10 @@ async function main() {
   const dryRun = process.argv.includes("--dry-run");
   const result = await runFinopsCollection({ env: process.env, dryRun });
   if (dryRun) {
-    process.stdout.write(`${JSON.stringify({ date: result.date, count: result.count, records: result.records }, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify({ date: result.date, snapshotTsMs: result.snapshotTsMs, count: result.count, records: result.records }, null, 2)}\n`);
   } else {
     process.stdout.write(
-      `Sent ${result.count} FOCUS v1.0 record(s) for ${result.date} to Basin (HTTP ${result.status})\n`
+      `Sent ${result.count} FOCUS v1.0 record(s) for ${result.date} (snapshot=${result.snapshotTsMs}) to Basin (HTTP ${result.status})\n`
     );
   }
 }

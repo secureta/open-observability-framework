@@ -7,6 +7,7 @@ import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 import {
   DEFAULT_CLOUDFLARE_PRICING,
+  buildCloudflareGraphqlQuery,
   classifyR2Action,
   normalizeCloudflareAnalyticsToFocus,
   normalizeGitHubBillingUsageToFocus,
@@ -158,7 +159,7 @@ test("focus_pipeline.sql SELECT columns match FOCUS v1.0 Basin schema 1:1", () =
   assert.deepEqual(sqlColumns, schemaColumns);
 });
 
-test("FinOps monitoring SQL queries (DuckDB & Basin SQL dialects) stay aligned and dialect-clean", () => {
+test("FinOps monitoring SQL queries (DuckDB & Basin SQL dialects) deduplicate snapshots, separate cost_basis, avoid mixed-unit sums, and use strict 7-calendar-day baselines", () => {
   const duckdbSql = fs.readFileSync(FINOPS_SQL_PATH, "utf8");
   const basinSql = fs.readFileSync(FINOPS_BASIN_SQL_PATH, "utf8");
 
@@ -168,7 +169,16 @@ test("FinOps monitoring SQL queries (DuckDB & Basin SQL dialects) stay aligned a
     assert.match(sql, /estimated_usd/);
     assert.match(sql, /estimated_waste_usd/);
     assert.match(sql, /approx_payload_mib/);
+    assert.match(sql, /max_snapshot_ts_ms/);
+    assert.match(sql, /cost_basis = 'billed_usage'/);
+    assert.match(sql, /INTERVAL '7' DAY/);
     assert.match(sql, /spike_ratio/);
+    assert.doesNotMatch(sql, /ROWS BETWEEN 7 PRECEDING/);
+
+    // Query 6 (resource cost ranking) must not sum ConsumedQuantity across incompatible units
+    const q6Match = sql.match(/-- 6\. Top cost-bearing resources[\s\S]*?-- 7\./);
+    assert.ok(q6Match, "Could not locate Query 6 block");
+    assert.doesNotMatch(q6Match[0], /SUM\(ConsumedQuantity\)/);
   }
 
   assert.match(duckdbSql, /json_extract_string\(/);
@@ -180,12 +190,14 @@ test("FinOps monitoring SQL queries (DuckDB & Basin SQL dialects) stay aligned a
   assert.doesNotMatch(basinSql, /TRY_CAST\(/);
 });
 
-test("Terraform and Pulumi IaC modules expose matching opt-in FinOps FOCUS resources", () => {
+test("Terraform and Pulumi IaC modules expose matching opt-in FinOps FOCUS resources without conditional type coercion", () => {
   const tfMain = fs.readFileSync(path.join(TERRAFORM_DIR, "main.tf"), "utf8");
   const tfVars = fs.readFileSync(path.join(TERRAFORM_DIR, "variables.tf"), "utf8");
   const tfOuts = fs.readFileSync(path.join(TERRAFORM_DIR, "outputs.tf"), "utf8");
 
   assert.match(tfVars, /variable "enable_finops"/);
+  assert.match(tfMain, /focus_schema\s*=\s*var\.enable_finops\s*\?\s*jsondecode\(file\(local\.focus_schema_path\)\)\s*:\s*null/);
+  assert.doesNotMatch(tfMain, /focus_schema\s*=.*\{\s*fields\s*=\s*\[\s*\]\s*\}/);
   assert.match(tfMain, /resource "restful_resource" "focus_stream"/);
   assert.match(tfMain, /resource "cloudflare_pipeline_sink" "focus"/);
   assert.match(tfMain, /resource "cloudflare_pipeline" "focus"/);
@@ -213,12 +225,27 @@ test("stack.schema.json supports focus schema profile and optional finops slot",
   assert.deepEqual(stackSchema.properties.finops.properties.providers.items.enum, ["cloudflare", "github"]);
 });
 
-test("Cloudflare and GitHub FOCUS normalizers compute accurate costs and conform strictly to FOCUS v1.0", () => {
+test("Cloudflare and GitHub FOCUS normalizers classify R2 free/unknown ops safely, separate list estimates from billed spend, and tag snapshots", () => {
   const schema = JSON.parse(fs.readFileSync(FOCUS_SCHEMA_PATH, "utf8"));
   const window = resolveUtcDayWindow("2026-11-22");
+  const snapshotTsMs = 1795305600000;
 
   assert.equal(classifyR2Action("PutObject"), "A");
   assert.equal(classifyR2Action("GetObject"), "B");
+  assert.equal(classifyR2Action("DeleteObject"), "free");
+  assert.equal(classifyR2Action("DeleteBucket"), "free");
+  assert.equal(classifyR2Action("AbortMultipartUpload"), "free");
+  assert.equal(classifyR2Action("SomeFutureAction"), "unknown");
+
+  const defaultQuery = buildCloudflareGraphqlQuery({ includePipelines: false });
+  assert.match(defaultQuery, /r2StorageAdaptiveGroups/);
+  assert.match(defaultQuery, /r2OperationsAdaptiveGroups/);
+  assert.doesNotMatch(defaultQuery, /pipelinesOperatorAdaptiveGroups/);
+
+  const withPipelinesQuery = buildCloudflareGraphqlQuery({ includePipelines: true });
+  assert.match(withPipelinesQuery, /pipelinesOperatorAdaptiveGroups/);
+  assert.match(withPipelinesQuery, /pipelineId/);
+  assert.match(withPipelinesQuery, /bytesIn/);
 
   const cfRecords = normalizeCloudflareAnalyticsToFocus(
     {
@@ -235,9 +262,11 @@ test("Cloudflare and GitHub FOCUS normalizers compute accurate costs and conform
               r2OperationsAdaptiveGroups: [
                 { dimensions: { bucketName: "oof-telemetry", actionType: "PutObject" }, sum: { requests: 1_000_000 } },
                 { dimensions: { bucketName: "oof-telemetry", actionType: "GetObject" }, sum: { requests: 2_000_000 } },
+                { dimensions: { bucketName: "oof-telemetry", actionType: "DeleteObject" }, sum: { requests: 100_000 } },
+                { dimensions: { bucketName: "oof-telemetry", actionType: "FutureUnknownAction" }, sum: { requests: 50_000 } },
               ],
-              pipelinesAdaptiveGroups: [
-                { dimensions: { pipelineName: "ocsf_event_log_to_iceberg" }, sum: { bytesIngested: 4_000_000_000 } },
+              pipelinesOperatorAdaptiveGroups: [
+                { dimensions: { pipelineId: "ocsf_event_log_to_iceberg" }, sum: { bytesIn: 4_000_000_000 } },
               ],
             },
           ],
@@ -249,22 +278,35 @@ test("Cloudflare and GitHub FOCUS normalizers compute accurate costs and conform
       accountName: "oof-prod",
       window,
       pricing: DEFAULT_CLOUDFLARE_PRICING,
+      snapshotTsMs,
     }
   );
 
-  assert.equal(cfRecords.length, 4);
-  for (const r of cfRecords) assertFocusRecordMatchesSchema(r, schema.fields);
+  assert.equal(cfRecords.length, 6);
+  for (const r of cfRecords) {
+    assertFocusRecordMatchesSchema(r, schema.fields);
+    // Analytics-derived Cloudflare rows must never report positive BilledCost / EffectiveCost
+    assert.equal(r.BilledCost, 0);
+    assert.equal(r.EffectiveCost, 0);
+    assert.equal(r.Tags.cost_basis, "list_price_estimate");
+    assert.equal(r.Tags.snapshot_ts_ms, snapshotTsMs);
+  }
 
   const storageRec = cfRecords.find((r) => r.SkuId === "r2_storage_standard");
   const classARec = cfRecords.find((r) => r.SkuId === "r2_class_a_ops");
   const classBRec = cfRecords.find((r) => r.SkuId === "r2_class_b_ops");
+  const freeRec = cfRecords.find((r) => r.SkuId === "r2_free_ops");
+  const unknownRec = cfRecords.find((r) => r.SkuId === "r2_unclassified_ops");
   const pipeRec = cfRecords.find((r) => r.SkuId === "pipelines_ingest_gb");
 
-  // 30 GB / 30 days = 1 GB-month * $0.015 = $0.015
-  assert.equal(storageRec.EffectiveCost, 0.015);
-  assert.equal(classARec.EffectiveCost, 4.5);
-  assert.equal(classBRec.EffectiveCost, 0.72);
-  assert.equal(pipeRec.EffectiveCost, 0.1);
+  assert.equal(storageRec.ListCost, 0.015);
+  assert.equal(classARec.ListCost, 4.5);
+  assert.equal(classBRec.ListCost, 0.72);
+  assert.equal(freeRec.ListCost, 0);
+  assert.equal(freeRec.ConsumedQuantity, 100_000);
+  assert.equal(unknownRec.ListCost, 0);
+  assert.equal(unknownRec.ConsumedQuantity, 50_000);
+  assert.equal(pipeRec.ListCost, 0.1);
 
   const ghRecords = normalizeGitHubBillingUsageToFocus(
     {
@@ -297,23 +339,28 @@ test("Cloudflare and GitHub FOCUS normalizers compute accurate costs and conform
         },
       ],
     },
-    { billingAccountId: "acme-org", billingAccountName: "acme-org", window }
+    { billingAccountId: "acme-org", billingAccountName: "acme-org", window, snapshotTsMs }
   );
 
   assert.equal(ghRecords.length, 2);
-  for (const r of ghRecords) assertFocusRecordMatchesSchema(r, schema.fields);
+  for (const r of ghRecords) {
+    assertFocusRecordMatchesSchema(r, schema.fields);
+    assert.equal(r.Tags.cost_basis, "billed_usage");
+    assert.equal(r.Tags.snapshot_ts_ms, snapshotTsMs);
+  }
   assert.equal(ghRecords[0].ListCost, 0.96);
   assert.equal(ghRecords[0].EffectiveCost, 0);
   assert.equal(ghRecords[1].EffectiveCost, 0.8);
   assert.equal(ghRecords[1].ServiceName, "GitHub Actions");
 });
 
-test("E2E FinOps collector fetches Cloudflare + GitHub APIs, gzips FOCUS v1.0 batch to Basin HTTP, and enforces HTTPS + secret hygiene", async () => {
+test("E2E FinOps collector fetches Cloudflare R2+Pipelines + GitHub APIs, gzips FOCUS v1.0 batch to Basin HTTP, and enforces HTTPS + secret hygiene", async () => {
   const schema = JSON.parse(fs.readFileSync(FOCUS_SCHEMA_PATH, "utf8"));
   const cfToken = "test-cf-token-0123456789abcdef0123456789";
   const ghToken = "test-github-token-0123456789abcdef";
   const basinToken = "test-basin-token-0123456789abcdef";
 
+  let receivedGraphqlQuery = null;
   let receivedBasinAuth = null;
   let receivedBasinEncoding = null;
   let receivedBasinRecords = null;
@@ -325,6 +372,8 @@ test("E2E FinOps collector fetches Cloudflare + GitHub APIs, gzips FOCUS v1.0 ba
 
     if (req.method === "POST" && req.url === "/client/v4/graphql") {
       assert.equal(req.headers.authorization, `Bearer ${cfToken}`);
+      const gqlBody = JSON.parse(rawBody.toString("utf8"));
+      receivedGraphqlQuery = gqlBody.query;
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(
         JSON.stringify({
@@ -337,6 +386,10 @@ test("E2E FinOps collector fetches Cloudflare + GitHub APIs, gzips FOCUS v1.0 ba
                   ],
                   r2OperationsAdaptiveGroups: [
                     { dimensions: { bucketName: "oof-telemetry", actionType: "PutObject" }, sum: { requests: 500_000 } },
+                    { dimensions: { bucketName: "oof-telemetry", actionType: "DeleteObject" }, sum: { requests: 100_000 } },
+                  ],
+                  pipelinesOperatorAdaptiveGroups: [
+                    { dimensions: { pipelineId: "pipe-123" }, sum: { bytesIn: 2_000_000_000 } },
                   ],
                 },
               ],
@@ -401,10 +454,11 @@ test("E2E FinOps collector fetches Cloudflare + GitHub APIs, gzips FOCUS v1.0 ba
       /must use https:\/\//
     );
 
-    // 2. Full E2E collection & ingest with allowInsecureHttp for local loopback test
+    // 2. Full E2E collection & ingest with Pipelines enabled
     const result = await runFinopsCollection({
       env: {
         OOF_FINOPS_DATE: "2026-11-22",
+        OOF_CF_INCLUDE_PIPELINES: "true",
         CLOUDFLARE_ACCOUNT_ID: "0123456789abcdef0123456789abcdef",
         CLOUDFLARE_API_TOKEN: cfToken,
         CLOUDFLARE_API_BASE_URL: `${baseUrl}/client/v4`,
@@ -414,21 +468,27 @@ test("E2E FinOps collector fetches Cloudflare + GitHub APIs, gzips FOCUS v1.0 ba
         OOF_FOCUS_BASIN_ENDPOINT: `${baseUrl}/basin-focus`,
         OOF_INGEST_TOKEN: basinToken,
       },
+      snapshotTsMs: 1795305600123,
       allowInsecureHttp: true,
     });
 
+    assert.match(receivedGraphqlQuery, /pipelinesOperatorAdaptiveGroups/);
+    assert.match(receivedGraphqlQuery, /bytesIn/);
     assert.equal(result.status, 200);
-    assert.equal(result.count, 3);
+    assert.equal(result.count, 5);
     assert.equal(receivedBasinAuth, `Bearer ${basinToken}`);
     assert.equal(receivedBasinEncoding, "gzip");
-    assert.equal(receivedBasinRecords.length, 3);
+    assert.equal(receivedBasinRecords.length, 5);
 
     for (const rec of receivedBasinRecords) {
       assertFocusRecordMatchesSchema(rec, schema.fields);
+      assert.equal(rec.Tags.snapshot_ts_ms, 1795305600123);
     }
 
     const providers = new Set(receivedBasinRecords.map((r) => r.ProviderName));
     assert.deepEqual(providers, new Set(["Cloudflare", "GitHub"]));
+    assert.ok(receivedBasinRecords.some((r) => r.ServiceName === "Cloudflare Pipelines" && r.ListCost === 0.05));
+    assert.ok(receivedBasinRecords.some((r) => r.SkuId === "r2_free_ops" && r.ListCost === 0));
 
     // 3. Error messages must never leak tokens
     await assert.rejects(

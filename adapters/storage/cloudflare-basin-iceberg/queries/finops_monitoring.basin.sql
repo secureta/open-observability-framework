@@ -150,13 +150,43 @@ ORDER BY event_day DESC, approx_payload_mib DESC
 LIMIT 200;
 
 -- ============================================================================
--- Part 3: Actual Cost & Usage (FOCUS v1.0 Iceberg Table: finops.focus_cost_and_usage)
+-- Part 3: FOCUS v1.0 Cost & Usage (Iceberg Table: finops.focus_cost_and_usage)
+-- Note: Every Part 3 query selects only the latest snapshot (`Tags.snapshot_ts_ms`)
+-- per (ProviderName, BillingAccountId, charge_day) so reruns never double-count,
+-- and separates invoice-backed `billed_usage` from `list_price_estimate` rows.
 -- ============================================================================
 
--- 5. Daily cost & usage summary by provider, service, and SKU
+-- 5. Daily cost & usage summary by provider, cost_basis, service, and SKU
+WITH tagged AS (
+  SELECT
+    *,
+    DATE_TRUNC('day', ChargePeriodStart) AS charge_day,
+    COALESCE(json_get_int(Tags, 'snapshot_ts_ms'), 0) AS snapshot_ts_ms,
+    COALESCE(json_get_str(Tags, 'cost_basis'), 'billed_usage') AS cost_basis
+  FROM finops.focus_cost_and_usage
+),
+latest_run AS (
+  SELECT
+    ProviderName,
+    BillingAccountId,
+    charge_day,
+    MAX(snapshot_ts_ms) AS max_snapshot_ts_ms
+  FROM tagged
+  GROUP BY ProviderName, BillingAccountId, charge_day
+),
+dedup_focus AS (
+  SELECT t.*
+  FROM tagged t
+  INNER JOIN latest_run l
+    ON t.ProviderName = l.ProviderName
+    AND t.BillingAccountId = l.BillingAccountId
+    AND t.charge_day = l.charge_day
+    AND t.snapshot_ts_ms = l.max_snapshot_ts_ms
+)
 SELECT
-  DATE_TRUNC('day', ChargePeriodStart) AS charge_day,
+  charge_day,
   ProviderName,
+  cost_basis,
   ServiceCategory,
   ServiceName,
   SkuId,
@@ -166,65 +196,128 @@ SELECT
   ROUND(SUM(ListCost), 4) AS total_list_cost,
   ROUND(SUM(BilledCost), 4) AS total_billed_cost,
   ROUND(SUM(EffectiveCost), 4) AS total_effective_cost
-FROM finops.focus_cost_and_usage
+FROM dedup_focus
 GROUP BY
-  DATE_TRUNC('day', ChargePeriodStart),
+  charge_day,
   ProviderName,
+  cost_basis,
   ServiceCategory,
   ServiceName,
   SkuId,
   BillingCurrency,
   ConsumedUnit
-ORDER BY charge_day DESC, total_effective_cost DESC
+ORDER BY charge_day DESC, total_effective_cost DESC, total_list_cost DESC
 LIMIT 200;
 
--- 6. Top cost-bearing resources (Cloudflare R2 buckets, Pipelines, GitHub repositories)
+-- 6. Top cost-bearing resources (cross-SKU cost ranking; omits mixed-unit quantity sums)
+WITH tagged AS (
+  SELECT
+    *,
+    DATE_TRUNC('day', ChargePeriodStart) AS charge_day,
+    COALESCE(json_get_int(Tags, 'snapshot_ts_ms'), 0) AS snapshot_ts_ms,
+    COALESCE(json_get_str(Tags, 'cost_basis'), 'billed_usage') AS cost_basis
+  FROM finops.focus_cost_and_usage
+),
+latest_run AS (
+  SELECT
+    ProviderName,
+    BillingAccountId,
+    charge_day,
+    MAX(snapshot_ts_ms) AS max_snapshot_ts_ms
+  FROM tagged
+  GROUP BY ProviderName, BillingAccountId, charge_day
+),
+dedup_focus AS (
+  SELECT t.*
+  FROM tagged t
+  INNER JOIN latest_run l
+    ON t.ProviderName = l.ProviderName
+    AND t.BillingAccountId = l.BillingAccountId
+    AND t.charge_day = l.charge_day
+    AND t.snapshot_ts_ms = l.max_snapshot_ts_ms
+)
 SELECT
   ProviderName,
+  cost_basis,
   ServiceName,
   ResourceType,
   ResourceName,
   BillingCurrency,
-  ROUND(SUM(ConsumedQuantity), 4) AS total_consumed_quantity,
+  ROUND(SUM(ListCost), 4) AS total_list_cost,
   ROUND(SUM(BilledCost), 4) AS total_billed_cost,
   ROUND(SUM(EffectiveCost), 4) AS total_effective_cost,
   MIN(ChargePeriodStart) AS first_charge_start,
   MAX(ChargePeriodEnd) AS last_charge_end
-FROM finops.focus_cost_and_usage
-GROUP BY ProviderName, ServiceName, ResourceType, ResourceName, BillingCurrency
-ORDER BY total_effective_cost DESC
+FROM dedup_focus
+GROUP BY ProviderName, cost_basis, ServiceName, ResourceType, ResourceName, BillingCurrency
+ORDER BY total_effective_cost DESC, total_list_cost DESC
 LIMIT 100;
 
--- 7. Daily spend anomaly detection vs. rolling 7-day baseline per provider & service
-WITH daily_spend AS (
+-- 7. Daily billed-spend anomaly detection vs. strict preceding 7-calendar-day average
+-- Excludes list-price estimates (`cost_basis = 'billed_usage'` only) and restricts baseline
+-- strictly to [charge_day - 7 days, charge_day - 1 day] divided by 7 calendar days.
+WITH tagged AS (
   SELECT
+    *,
     DATE_TRUNC('day', ChargePeriodStart) AS charge_day,
-    ProviderName,
-    ServiceName,
-    BillingCurrency,
-    SUM(EffectiveCost) AS daily_effective_cost
+    COALESCE(json_get_int(Tags, 'snapshot_ts_ms'), 0) AS snapshot_ts_ms,
+    COALESCE(json_get_str(Tags, 'cost_basis'), 'billed_usage') AS cost_basis
   FROM finops.focus_cost_and_usage
-  GROUP BY DATE_TRUNC('day', ChargePeriodStart), ProviderName, ServiceName, BillingCurrency
+),
+latest_run AS (
+  SELECT
+    ProviderName,
+    BillingAccountId,
+    charge_day,
+    MAX(snapshot_ts_ms) AS max_snapshot_ts_ms
+  FROM tagged
+  GROUP BY ProviderName, BillingAccountId, charge_day
+),
+daily_spend AS (
+  SELECT
+    t.charge_day,
+    t.ProviderName,
+    t.ServiceName,
+    t.BillingCurrency,
+    SUM(t.EffectiveCost) AS daily_effective_cost
+  FROM tagged t
+  INNER JOIN latest_run l
+    ON t.ProviderName = l.ProviderName
+    AND t.BillingAccountId = l.BillingAccountId
+    AND t.charge_day = l.charge_day
+    AND t.snapshot_ts_ms = l.max_snapshot_ts_ms
+  WHERE t.cost_basis = 'billed_usage'
+  GROUP BY t.charge_day, t.ProviderName, t.ServiceName, t.BillingCurrency
 ),
 with_baseline AS (
   SELECT
-    charge_day,
-    ProviderName,
-    ServiceName,
-    BillingCurrency,
-    daily_effective_cost,
-    AVG(daily_effective_cost) OVER (
-      PARTITION BY ProviderName, ServiceName, BillingCurrency
-      ORDER BY charge_day
-      ROWS BETWEEN 7 PRECEDING AND 1 PRECEDING
-    ) AS prev_7d_avg_cost
-  FROM daily_spend
+    cur.charge_day,
+    cur.ProviderName,
+    cur.ServiceName,
+    cur.BillingCurrency,
+    cur.daily_effective_cost,
+    SUM(prev.daily_effective_cost) / 7.0 AS prev_7d_avg_cost,
+    COUNT(prev.charge_day) AS prior_active_days
+  FROM daily_spend cur
+  LEFT JOIN daily_spend prev
+    ON prev.ProviderName = cur.ProviderName
+    AND prev.ServiceName = cur.ServiceName
+    AND prev.BillingCurrency = cur.BillingCurrency
+    AND prev.charge_day >= cur.charge_day - INTERVAL '7' DAY
+    AND prev.charge_day < cur.charge_day
+  GROUP BY
+    cur.charge_day,
+    cur.ProviderName,
+    cur.ServiceName,
+    cur.BillingCurrency,
+    cur.daily_effective_cost
 )
 SELECT
   charge_day,
   ProviderName,
   ServiceName,
   BillingCurrency,
+  prior_active_days,
   ROUND(daily_effective_cost, 4) AS daily_effective_cost,
   ROUND(prev_7d_avg_cost, 4) AS prev_7d_avg_cost,
   ROUND(
@@ -236,7 +329,8 @@ SELECT
     2
   ) AS spike_ratio
 FROM with_baseline
-WHERE prev_7d_avg_cost IS NOT NULL
+WHERE prior_active_days >= 1
+  AND prev_7d_avg_cost IS NOT NULL
   AND prev_7d_avg_cost > 0
   AND daily_effective_cost > prev_7d_avg_cost * 1.5
 ORDER BY charge_day DESC, spike_ratio DESC

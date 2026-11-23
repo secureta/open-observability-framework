@@ -19,9 +19,9 @@ This directory defines the vendor-neutral FinOps telemetry contract for the Open
 | `ResourceName` / `ResourceId` | R2 bucket name / Pipeline name | Repository name (`owner/repo` or repo slug) |
 | `SkuId` | e.g. `r2_storage_standard`, `r2_class_a_ops`, `r2_class_b_ops`, `pipelines_ingest_gb` | GitHub Billing `sku` (e.g. `actions_linux`, `actions_macos`, `actions_windows`) |
 | `ConsumedQuantity` / `ConsumedUnit` | GB-month, Operations, GB | Minutes, GB-Hours, GB |
-| `BilledCost` / `EffectiveCost` / `ListCost` | Calculated USD cost (configurable unit pricing) | `netAmount` / `netAmount` / `grossAmount` from GitHub Billing API |
+| `BilledCost` / `EffectiveCost` / `ListCost` | `0` / `0` / list-price estimate (`Tags.cost_basis = "list_price_estimate"`) because GraphQL analytics reflects raw usage, not invoice charges after free allowances | `netAmount` / `netAmount` / `grossAmount` (`Tags.cost_basis = "billed_usage"`) from GitHub Billing API |
 | `ChargePeriodStart` / `ChargePeriodEnd` | UTC period boundaries (RFC 3339 ms) | UTC day/usage window boundaries (RFC 3339 ms) |
-| `Tags` | JSON object (`oof_collector`, `pricing_source`, `bucket`, etc.) | JSON object (`oof_collector`, `organization`, `repository`, `product`, etc.) |
+| `Tags` | JSON object (`oof_collector`, `cost_basis`, `snapshot_ts_ms`, `snapshot_date`, `bucket`, etc.) | JSON object (`oof_collector`, `cost_basis`, `snapshot_ts_ms`, `snapshot_date`, `organization`, `repository`, etc.) |
 
 ## Lockstep Files
 
