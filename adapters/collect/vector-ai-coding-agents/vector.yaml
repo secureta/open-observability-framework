@@ -112,7 +112,7 @@ transforms:
 
       op_name = if exists(attrs."gen_ai.operation.name") && is_string(attrs."gen_ai.operation.name") {
         string!(attrs."gen_ai.operation.name")
-      } else if raw_event == "claude_code.api_request" || raw_event == "claude_code.api_error" || raw_event == "claude_code.assistant_response" || raw_event == "codex.api_request" || raw_event == "codex.sse_event" || raw_event == "codex.agent_response" {
+      } else if raw_event == "claude_code.api_request" || raw_event == "claude_code.api_error" || raw_event == "claude_code.assistant_response" || raw_event == "codex.api_request" || raw_event == "codex.websocket_request" || raw_event == "codex.sse_event" || raw_event == "codex.websocket_event" || raw_event == "codex.agent_response" {
         "chat"
       } else if raw_event == "claude_code.tool_result" || raw_event == "codex.tool_result" {
         "execute_tool"
@@ -193,10 +193,10 @@ transforms:
         status = "error"
         error_type = string!(attrs."error.type")
       }
-      # Codex emits error.message on failed SSE events or API requests without an HTTP status; never persist the message text.
-      if status == "ok" && (raw_event == "codex.sse_event" || raw_event == "codex.api_request") && exists(attrs."error.message") && is_string(attrs."error.message") && string!(attrs."error.message") != "" {
+      # Codex emits error.message on failed SSE/WebSocket events or API requests without an HTTP status; never persist the message text.
+      if status == "ok" && (raw_event == "codex.sse_event" || raw_event == "codex.websocket_event" || raw_event == "codex.api_request" || raw_event == "codex.websocket_request") && exists(attrs."error.message") && is_string(attrs."error.message") && string!(attrs."error.message") != "" {
         status = "error"
-        error_type = if raw_event == "codex.sse_event" { "stream_error" } else { "api_error" }
+        error_type = if raw_event == "codex.sse_event" || raw_event == "codex.websocket_event" { "stream_error" } else { "api_error" }
       }
 
       duration_ms = null
@@ -849,6 +849,29 @@ tests:
               raw = encode_json(.)
               assert!(!contains(raw, "SECRET_UPSTREAM_ERR_DETAIL"))
               assert!(!contains(raw, "SENSITIVE_RAW_BODY_MUST_NOT_LEAK"))
+
+  - name: codex_websocket_request_classified_as_chat
+    inputs:
+      - insert_at: genai_otlp_logs
+        type: log
+        log_fields:
+          timestamp: "2026-11-23T03:01:25Z"
+          resources:
+            service.name: "codex-cli"
+          attributes:
+            event.name: "codex.websocket_request"
+            model: "gpt-5-codex"
+            duration_ms: 45.2
+            conversation.id: "conv-codex-ws"
+    outputs:
+      - extract_from: genai_content_policy
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event_name, "codex.websocket_request")
+              assert_eq!(.operation_name, "chat")
+              assert_eq!(.status, "ok")
+              assert_eq!(.duration_ms, 45.2)
 
   - name: otlp_missing_event_name_never_copies_raw_body
     inputs:

@@ -90,6 +90,7 @@ test("pipeline_ai_usage.sql SELECT columns match genai-usage.basin.json in stric
 test("ai_coding_agents.sql references ai.genai_usage and OCSF correlation join", () => {
   const sql = fs.readFileSync(AI_QUERIES_SQL_PATH, "utf8");
   assert.ok(sql.includes("FROM ai.genai_usage"), "queries must target ai.genai_usage");
+  assert.ok(sql.includes("codex.websocket_request"), "daily rollup must count Codex WebSocket requests");
   assert.ok(
     sql.includes("siem.ocsf_event_log_activity"),
     "queries must include SIEM correlation query against siem.ocsf_event_log_activity"
