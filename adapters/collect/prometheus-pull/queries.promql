@@ -1,0 +1,24 @@
+# Open Observability Framework — Prometheus Pull Metrics Queries
+# Target: local Prometheus TSDB (default loopback listen: http://127.0.0.1:9090)
+#
+# Distinguishing zero connections from scrape failure and missing samples:
+#   - Active connections (healthy):  up{job="cloudflared"} == 1 AND cloudflared_tunnel_ha_connections{job="cloudflared"} > 0
+#   - Zero connections (healthy):    up{job="cloudflared"} == 1 AND cloudflared_tunnel_ha_connections{job="cloudflared"} == 0
+#   - Scrape failure (timeout/5xx/malformed/refused): up{job="cloudflared"} == 0 (metric sample absent)
+#   - Metric missing (HTTP 200 without metric):       up{job="cloudflared"} == 1 AND absent(cloudflared_tunnel_ha_connections{job="cloudflared"}) == 1
+#   - Collector down / no scrapes yet:                absent(up{job="cloudflared"}) == 1
+
+# 1. Latest active HA connection count (returns 0 when connected count is zero; empty on scrape failure or missing metric)
+cloudflared_tunnel_ha_connections{job="cloudflared"}
+
+# 2. Scrape health (1 = last scrape succeeded, 0 = timeout / HTTP error / malformed response / connection error)
+up{job="cloudflared"}
+
+# 3. Explicitly detect zero active connections while scraping succeeded (distinguished from failure/missing)
+(cloudflared_tunnel_ha_connections{job="cloudflared"} == 0) and on(job) (up{job="cloudflared"} == 1)
+
+# 4. Explicitly detect scrape failure (timeout, HTTP error, malformed exposition, unreachable target)
+up{job="cloudflared"} == 0
+
+# 5. Explicitly detect metric missing despite a successful HTTP 200 scrape
+absent(cloudflared_tunnel_ha_connections{job="cloudflared"}) and on(job) (up{job="cloudflared"} == 1)
