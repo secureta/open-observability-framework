@@ -57,19 +57,20 @@ Both [Vector](../../adapters/collect/vector-journald/vector.yaml) and [Fluent Bi
 | `metadata.log_level` (`string`) | `PRIORITY` (string) | `severity_text` | Raw source severity text/code |
 | `metadata.log_facility` (`string`) | `SYSLOG_FACILITY` | — | Syslog facility code |
 | `device.type_id` / `type` | `1` / `"Server"` | `0` / `"Unknown"` | OCSF `device.type_id` is required |
-| `device.hostname` (`string`) | `_HOSTNAME` -> `host` | `resources["host.name"]` -> `resources["service.instance.id"]` | Host identifier |
-| `device.uid` (`string`) | `_MACHINE_ID` | `resources["host.id"]` | Host/machine unique ID |
+| `device.hostname` (`string`) | `_HOSTNAME` -> `host` | Collector host `gethostname()` (Vector `get_hostname()`, Fluent Bit `/proc/sys/kernel/hostname`) | Host identifier; OTLP `host.name` stays in `unmapped.resource` |
+| `device.uid` (`string`) | `_MACHINE_ID` | — | Host/machine unique ID; OTLP `host.id` stays in `unmapped.resource` |
 | `device.os_machine_uuid` (`string`) | `_MACHINE_ID` | — | systemd machine UUID |
 | `device.boot_uid` (`string`) | `_BOOT_ID` | — | Kernel boot UUID |
-| `device.os` (`struct`) | `{ name: "Linux", type_id: 200 }` | Mapped from `resources["os.type"]` (`linux`=`200`, `windows`=`100`, `darwin`/`macos`=`300`) | OCSF requires both `name` and `type_id`; omitted on OTLP if unknown |
-| `actor.process.pid` (`int64`) | `_PID` -> `SYSLOG_PID` | `resources["process.pid"]` -> `attributes["process.pid"]` | Strict base-10 non-negative integer |
-| `actor.process.name` (`string`) | `_COMM` -> `SYSLOG_IDENTIFIER` | `resources["process.executable.name"]` -> `resources["service.name"]` | Process/service name |
-| `actor.process.path` (`string`) | `_EXE` | `resources["process.executable.path"]` | Executable path |
-| `actor.process.cmd_line` (`string`) | `_CMDLINE` | `resources["process.command_line"]` | Command line string |
-| `actor.user.uid` (`string`) | `_UID` (string) | `attributes["user.id"]` -> `attributes["enduser.id"]` | OCSF `user.uid` is `string_t` |
-| `actor.user.uid_numeric` (`int64`) | `_UID` (parsed int if `^[0-9]{1,15}$`) | `user.id` (parsed int if `^[0-9]{1,15}$`) | Only populated alongside `actor.user.uid` |
-| `actor.user.name` (`string`) | — | `attributes["user.name"]` -> `attributes["user.full_name"]` | Username if present |
+| `device.os` (`struct`) | `{ name: "Linux", type_id: 200 }` | — | OCSF requires both `name` and `type_id`; OTLP `os.type` stays in `unmapped.resource` |
+| `actor.process.pid` (`int64`) | `_PID` -> `SYSLOG_PID` | — | Strict base-10 non-negative integer |
+| `actor.process.name` (`string`) | `_COMM` -> `SYSLOG_IDENTIFIER` | — | Process/service name |
+| `actor.process.path` (`string`) | `_EXE` | — | Executable path |
+| `actor.process.cmd_line` (`string`) | `_CMDLINE` | — | Command line string |
+| `actor.user.uid` (`string`) | `_UID` (string) | — | OCSF `user.uid` is `string_t` |
+| `actor.user.uid_numeric` (`int64`) | `_UID` (parsed int if `^[0-9]{1,15}$`) | — | Only populated alongside `actor.user.uid` |
 | `unmapped` (`json`) | Non-consumed fields + valid `span_id` | Non-consumed `attributes` / `resources` + valid `span_id` | Omitted (`null`) when empty; never serialized as `[]` |
+
+The OTLP listeners are unauthenticated, so OTLP `host.*`, `service.instance.id`, `os.type`, `process.*`, `user.*` and `enduser.id` values are unverified sender claims. Both collectors keep them under `unmapped.resource` / `unmapped.attributes` and never map them into `device` or `actor`; `device.hostname` always records the collector host that received the event.
 
 ---
 

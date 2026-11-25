@@ -9,6 +9,11 @@
 #   OOF_BASIN_ENDPOINT   (e.g. https://<STREAM_ID>.ingest.cloudflare.com)
 #   OOF_INGEST_TOKEN     (Cloudflare Account API Token with `Basin Pipelines Send`)
 #
+# Trust boundary: the OTLP listeners are unauthenticated, so OTLP host / process / user
+# attributes are sender claims. They are kept under `unmapped.resource` / `unmapped.attributes`
+# and never mapped into `device` / `actor`; `device.hostname` is this collector host.
+# Keep the listeners on loopback (never a wildcard address).
+#
 # Optional environment variables:
 #   OOF_VECTOR_DATA_DIR    (default: /var/lib/vector)
 #   OOF_OTLP_GRPC_LISTEN   (default: 127.0.0.1:4317; set to 127.0.0.1:4319 if bridging behind co-located otelcol)
@@ -511,113 +516,10 @@ transforms:
         event_uid = span_clean
       }
 
-      hostname = null
-      if exists(res."host.name") && is_string(res."host.name") && string!(res."host.name") != "" {
-        hostname = string!(res."host.name")
-      } else if exists(res."service.instance.id") && is_string(res."service.instance.id") && string!(res."service.instance.id") != "" {
-        hostname = string!(res."service.instance.id")
-      }
-
-      host_id = if exists(res."host.id") && is_string(res."host.id") && string!(res."host.id") != "" { string!(res."host.id") } else { null }
-
-      # OCSF device.os requires both name and type_id; omit device.os completely if os.type is unknown
-      os_obj = null
-      if exists(res."os.type") && is_string(res."os.type") {
-        os_lc = downcase(string!(res."os.type"))
-        if os_lc == "linux" {
-          os_obj = { "name": "Linux", "type_id": 200 }
-        } else if os_lc == "windows" {
-          os_obj = { "name": "Windows", "type_id": 100 }
-        } else if os_lc == "darwin" || os_lc == "macos" {
-          os_obj = { "name": "macOS", "type_id": 300 }
-        }
-      }
-
-      pid_val = null
-      if exists(res."process.pid") && res."process.pid" != null {
-        if is_integer(res."process.pid") {
-          pi = int!(res."process.pid")
-          if pi >= 0 && pi <= 9007199254740991 { pid_val = pi }
-        } else if is_string(res."process.pid") {
-          ps = string!(res."process.pid")
-          if match(ps, r'^[0-9]{1,15}$') { pid_val = to_int!(ps) }
-        }
-      }
-      if pid_val == null && exists(attrs."process.pid") && attrs."process.pid" != null {
-        if is_integer(attrs."process.pid") {
-          pi = int!(attrs."process.pid")
-          if pi >= 0 && pi <= 9007199254740991 { pid_val = pi }
-        } else if is_string(attrs."process.pid") {
-          ps = string!(attrs."process.pid")
-          if match(ps, r'^[0-9]{1,15}$') { pid_val = to_int!(ps) }
-        }
-      }
-
-      proc_name = if exists(res."process.executable.name") && is_string(res."process.executable.name") && string!(res."process.executable.name") != "" {
-        string!(res."process.executable.name")
-      } else {
-        service_name
-      }
-      proc_path = if exists(res."process.executable.path") && is_string(res."process.executable.path") && string!(res."process.executable.path") != "" {
-        string!(res."process.executable.path")
-      } else { null }
-      proc_cmd = if exists(res."process.command_line") && is_string(res."process.command_line") && string!(res."process.command_line") != "" {
-        string!(res."process.command_line")
-      } else { null }
-
-      uid_str = null
-      uid_num = null
-      if exists(attrs."user.id") && attrs."user.id" != null {
-        if is_integer(attrs."user.id") {
-          uv = int!(attrs."user.id")
-          if uv >= 0 && uv <= 9007199254740991 {
-            uid_str = to_string(uv)
-            uid_num = uv
-          }
-        } else if is_string(attrs."user.id") {
-          us = string!(attrs."user.id")
-          if us != "" {
-            uid_str = us
-            if match(us, r'^[0-9]{1,15}$') { uid_num = to_int!(us) }
-          }
-        }
-      }
-      if uid_str == null && exists(attrs."enduser.id") && attrs."enduser.id" != null {
-        if is_integer(attrs."enduser.id") {
-          uv = int!(attrs."enduser.id")
-          if uv >= 0 && uv <= 9007199254740991 {
-            uid_str = to_string(uv)
-            uid_num = uv
-          }
-        } else if is_string(attrs."enduser.id") {
-          us = string!(attrs."enduser.id")
-          if us != "" {
-            uid_str = us
-            if match(us, r'^[0-9]{1,15}$') { uid_num = to_int!(us) }
-          }
-        }
-      }
-
-      user_name = if exists(attrs."user.name") && is_string(attrs."user.name") && string!(attrs."user.name") != "" {
-        string!(attrs."user.name")
-      } else if exists(attrs."user.full_name") && is_string(attrs."user.full_name") && string!(attrs."user.full_name") != "" {
-        string!(attrs."user.full_name")
-      } else { null }
-
-      proc = {}
-      if pid_val != null { proc.pid = pid_val }
-      if proc_name != null { proc.name = proc_name }
-      if proc_path != null { proc.path = proc_path }
-      if proc_cmd != null { proc.cmd_line = proc_cmd }
-
-      usr = {}
-      if uid_str != null { usr.uid = uid_str }
-      if uid_num != null { usr.uid_numeric = uid_num }
-      if user_name != null { usr.name = user_name }
-
-      act = {}
-      if length(proc) > 0 { act.process = proc }
-      if length(usr) > 0 { act.user = usr }
+      # OTLP senders are unauthenticated: never promote sender-claimed host / process / user
+      # identity into `device` or `actor`. Claimed values stay under `unmapped.resource` /
+      # `unmapped.attributes`, and `device.hostname` is the collector host's own hostname.
+      hostname = get_hostname() ?? null
 
       meta = {
         "version": "1.3.0",
@@ -638,25 +540,9 @@ transforms:
         "type": "Unknown"
       }
       if hostname != null { dev.hostname = hostname }
-      if host_id != null { dev.uid = host_id }
-      if os_obj != null { dev.os = os_obj }
 
       del(attrs."event.id")
-      del(attrs."process.pid")
-      del(attrs."user.id")
-      del(attrs."enduser.id")
-      del(attrs."user.name")
-      del(attrs."user.full_name")
-
-      del(res."host.name")
-      del(res."service.instance.id")
-      del(res."host.id")
-      del(res."os.type")
-      del(res."process.pid")
-      del(res."process.executable.name")
       del(res."service.name")
-      del(res."process.executable.path")
-      del(res."process.command_line")
 
       unmapped = {}
       if length(attrs) > 0 { unmapped.attributes = attrs }
@@ -685,7 +571,6 @@ transforms:
       if msg != null { out.message = msg }
       if log_name != null { out.log_name = log_name }
       out.log_provider = log_provider
-      if length(act) > 0 { out.actor = act }
       if length(unmapped) > 0 { out.unmapped = unmapped }
 
       . = out
@@ -805,10 +690,56 @@ tests:
               .log_provider == "opentelemetry" &&
               .metadata.correlation_uid == "0af7651916cd43dd8448eb211c80319c" &&
               .metadata.original_event_uid == "b7ad6b7169203331" &&
-              .device.os.name == "Linux" &&
-              .device.os.type_id == 200 &&
-              .actor.user.uid == "1001" &&
-              .actor.user.uid_numeric == 1001 &&
+              .device.hostname == get_hostname!() &&
+              !exists(.device.os) &&
+              !exists(.actor) &&
               .unmapped.span_id == "b7ad6b7169203331" &&
               .unmapped.attributes."order.id" == "ord-99" &&
-              .unmapped.resource."deployment.environment" == "prod"
+              .unmapped.attributes."user.id" == "1001" &&
+              .unmapped.resource."host.name" == "app-02" &&
+              .unmapped.resource."os.type" == "linux" &&
+              .unmapped.resource."deployment.environment" == "prod" &&
+              !exists(.unmapped.resource."service.name")
+
+  - name: ocsf_otlp_sender_claimed_identity_is_unverified
+    inputs:
+      - insert_at: ocsf_otlp_logs
+        type: log
+        log_fields:
+          timestamp: "2025-01-10T08:00:01.000Z"
+          severity_number: 9
+          message: "forged privileged login"
+          resources:
+            service.name: "sshd"
+            host.name: "other"
+            host.id: "forged-machine-id"
+            service.instance.id: "other-instance"
+            process.pid: 1
+            process.executable.name: "sshd"
+            process.executable.path: "/usr/sbin/sshd"
+            process.command_line: "sshd: root [priv]"
+          attributes:
+            user.id: "0"
+            enduser.id: "0"
+            user.name: "root"
+            process.pid: 1
+    outputs:
+      - extract_from: ocsf_otlp_logs
+        conditions:
+          - type: vrl
+            source: |
+              !exists(.actor) &&
+              .device.hostname == get_hostname!() &&
+              .device.hostname != "other" &&
+              !exists(.device.uid) &&
+              .unmapped.attributes."user.id" == "0" &&
+              .unmapped.attributes."enduser.id" == "0" &&
+              .unmapped.attributes."user.name" == "root" &&
+              .unmapped.attributes."process.pid" == 1 &&
+              .unmapped.resource."host.name" == "other" &&
+              .unmapped.resource."host.id" == "forged-machine-id" &&
+              .unmapped.resource."service.instance.id" == "other-instance" &&
+              .unmapped.resource."process.pid" == 1 &&
+              .unmapped.resource."process.executable.name" == "sshd" &&
+              .unmapped.resource."process.executable.path" == "/usr/sbin/sshd" &&
+              .unmapped.resource."process.command_line" == "sshd: root [priv]"
