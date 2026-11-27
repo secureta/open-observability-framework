@@ -27,7 +27,8 @@ All zone metrics carry only a single low-cardinality `zone` label (the configure
 - `OOF_CLOUDFLARE_ZONE_IDS` *(required)* — Comma-separated 32-hex Zone IDs or `alias=zoneId` pairs (e.g. `prod=0123456789abcdef0123456789abcdef`)
 - `OOF_CF_EXPORTER_LISTEN` *(optional)* — Defaults to `127.0.0.1:9199`
 - `OOF_CLOUDFLARE_GRAPHQL_ENDPOINT` *(optional)* — Defaults to `https://api.cloudflare.com/client/v4/graphql`
-- `OOF_CF_EXPORTER_WINDOW_MINUTES` *(optional)* — Aggregation lookback window in minutes (default: `5`, range `1..60`)
+- `OOF_CF_EXPORTER_DATASET` *(optional)* — GraphQL dataset to query: `httpRequests1mGroups` (default, Pro+ plans) or `httpRequests1hGroups` (Free plans)
+- `OOF_CF_EXPORTER_WINDOW_MINUTES` *(optional)* — Aggregation lookback window in minutes (default: `5` for `httpRequests1mGroups`, `60` for `httpRequests1hGroups`; range `1..60` for 1m, `60..1440` for 1h)
 - `OOF_CF_EXPORTER_CACHE_TTL_SECS` *(optional)* — Scrape response cache TTL in seconds (default: `60`)
 - `OOF_CF_EXPORTER_TIMEOUT_MS` *(optional)* — Upstream GraphQL HTTP timeout in ms (default: `10000`)
 
@@ -38,6 +39,7 @@ services.oof-collector = {
   cloudflareGraphqlExporter = {
     enable = true;
     listen = "127.0.0.1:9199";
+    # dataset = "httpRequests1hGroups"; # Required for Cloudflare Free-plan zones
     environmentFile = config.sops.secrets."oof-cf-analytics.env".path;
   };
 

@@ -154,9 +154,17 @@ test("focus_pipeline.sql SELECT columns match FOCUS v1.0 Basin schema 1:1", () =
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
+  for (const col of sqlColumns) {
+    assert.match(
+      col,
+      /^"[A-Za-z0-9_]+"$/,
+      `FOCUS PascalCase column must be double-quoted to prevent DataFusion lowercase folding: ${col}`
+    );
+  }
+  const unquotedSqlColumns = sqlColumns.map((c) => c.slice(1, -1));
   const schemaColumns = schema.fields.map((f) => f.name);
 
-  assert.deepEqual(sqlColumns, schemaColumns);
+  assert.deepEqual(unquotedSqlColumns, schemaColumns);
 });
 
 test("FinOps monitoring SQL queries (DuckDB & Basin SQL dialects) deduplicate snapshots, separate cost_basis, avoid mixed-unit sums, and use strict 7-calendar-day baselines", () => {
