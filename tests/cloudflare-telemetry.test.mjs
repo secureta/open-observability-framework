@@ -519,6 +519,51 @@ test("Cloudflare GraphQL Analytics Exporter: 11-zone batching (<=10/query), loop
   const zones = mod.parseZoneSpecs(elevenSpec);
   assert.equal(zones.length, 11);
 
+  // Verify hourly dataset support for Cloudflare Free plans (httpRequests1hGroups)
+  const hourlyPayload = mod.buildGraphqlPayload(zones.slice(0, 1), {
+    nowMs: Date.UTC(2026, 10, 27, 1, 34, 56),
+    windowMinutes: 60,
+    dataset: "httpRequests1hGroups",
+  });
+  assert.match(hourlyPayload.query, /\bhttpRequests1hGroups\(/);
+  assert.equal(hourlyPayload.variables.since, "2026-11-27T00:00:00.000Z");
+  assert.equal(hourlyPayload.variables.until, "2026-11-27T01:00:00.000Z");
+
+  const hourlyAgg = mod.aggregateZoneAnalytics(
+    {
+      data: {
+        viewer: {
+          zones: [
+            {
+              zoneTag: zones[0].zoneId,
+              httpRequests1hGroups: [
+                {
+                  sum: {
+                    requests: 42,
+                    cachedRequests: 10,
+                    encryptedRequests: 40,
+                    threats: 1,
+                    bytes: 12345,
+                    cachedBytes: 2345,
+                    responseStatusMap: [{ edgeResponseStatus: 200, requests: 42 }],
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      },
+    },
+    zones.slice(0, 1)
+  );
+  assert.equal(hourlyAgg[0].requests, 42);
+  assert.equal(hourlyAgg[0].status2xx, 42);
+
+  assert.throws(
+    () => mod.buildGraphqlPayload(zones.slice(0, 1), { dataset: "httpRequests1dGroups" }),
+    /Unsupported OOF_CF_EXPORTER_DATASET/
+  );
+
   const gqlRequests = [];
   let failUpstream = false;
   const gqlPort = await getFreeLoopbackPort();

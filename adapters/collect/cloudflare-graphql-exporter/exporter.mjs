@@ -7,12 +7,19 @@ const MAX_ZONES_PER_QUERY = 10;
 const ZONE_ID_RE = /^[a-fA-F0-9]{32}$/;
 const ZONE_ALIAS_RE = /^[a-zA-Z0-9._-]+$/;
 
-const ZONE_ANALYTICS_QUERY = `
+const DEFAULT_DATASET = "httpRequests1mGroups";
+const ALLOWED_DATASETS = new Set(["httpRequests1mGroups", "httpRequests1hGroups"]);
+
+function buildZoneAnalyticsQuery(dataset = DEFAULT_DATASET) {
+  if (!ALLOWED_DATASETS.has(dataset)) {
+    throw new Error(`Unsupported OOF_CF_EXPORTER_DATASET '${dataset}'; expected httpRequests1mGroups or httpRequests1hGroups.`);
+  }
+  return `
 query OofZoneAnalytics($zoneTags: [string!], $since: Time!, $until: Time!) {
   viewer {
     zones(filter: { zoneTag_in: $zoneTags }) {
       zoneTag
-      httpRequests1mGroups(
+      ${dataset}(
         limit: 100
         filter: { datetime_geq: $since, datetime_lt: $until }
       ) {
@@ -33,6 +40,7 @@ query OofZoneAnalytics($zoneTags: [string!], $since: Time!, $until: Time!) {
   }
 }
 `.trim();
+}
 
 export function escapePromLabelValue(val) {
   return String(val)
@@ -114,12 +122,16 @@ export function parseListenAddress(listenStr = DEFAULT_LISTEN, { requireLoopback
   return { host, port };
 }
 
-export function buildGraphqlPayload(zoneEntries, { nowMs = Date.now(), windowMinutes = 5 } = {}) {
-  const safeWindow = Math.max(1, Math.min(60, Math.floor(windowMinutes)));
-  const untilMs = Math.floor(nowMs / 60000) * 60000;
+export function buildGraphqlPayload(zoneEntries, { nowMs = Date.now(), windowMinutes = 5, dataset = DEFAULT_DATASET } = {}) {
+  const isHourly = dataset === "httpRequests1hGroups";
+  const stepMs = isHourly ? 3600000 : 60000;
+  const safeWindow = isHourly
+    ? Math.max(60, Math.min(1440, Math.ceil(windowMinutes / 60) * 60))
+    : Math.max(1, Math.min(60, Math.floor(windowMinutes)));
+  const untilMs = Math.floor(nowMs / stepMs) * stepMs;
   const sinceMs = untilMs - safeWindow * 60000;
   return {
-    query: ZONE_ANALYTICS_QUERY,
+    query: buildZoneAnalyticsQuery(dataset),
     variables: {
       zoneTags: zoneEntries.map((z) => z.zoneId),
       since: new Date(sinceMs).toISOString(),
@@ -128,13 +140,13 @@ export function buildGraphqlPayload(zoneEntries, { nowMs = Date.now(), windowMin
   };
 }
 
-export function buildGraphqlPayloads(zoneEntries, { nowMs = Date.now(), windowMinutes = 5 } = {}) {
+export function buildGraphqlPayloads(zoneEntries, { nowMs = Date.now(), windowMinutes = 5, dataset = DEFAULT_DATASET } = {}) {
   const chunks = [];
   for (let i = 0; i < zoneEntries.length; i += MAX_ZONES_PER_QUERY) {
     const slice = zoneEntries.slice(i, i + MAX_ZONES_PER_QUERY);
     chunks.push({
       zoneEntries: slice,
-      payload: buildGraphqlPayload(slice, { nowMs, windowMinutes }),
+      payload: buildGraphqlPayload(slice, { nowMs, windowMinutes, dataset }),
     });
   }
   return chunks;
@@ -193,7 +205,11 @@ export function aggregateZoneAnalytics(graphqlBody, zoneEntries) {
       status4xx: 0,
       status5xx: 0,
     };
-    const groups = Array.isArray(z.httpRequests1mGroups) ? z.httpRequests1mGroups : [];
+    const groups = Array.isArray(z.httpRequests1mGroups)
+      ? z.httpRequests1mGroups
+      : Array.isArray(z.httpRequests1hGroups)
+        ? z.httpRequests1hGroups
+        : [];
     for (const grp of groups) {
       const s = grp?.sum;
       if (!s || typeof s !== "object") continue;
@@ -300,6 +316,7 @@ export function createExporterServer(options) {
     apiToken,
     zoneEntries,
     graphqlEndpoint = DEFAULT_GRAPHQL_ENDPOINT,
+    dataset = DEFAULT_DATASET,
     windowMinutes = 5,
     cacheTtlSecs = 60,
     timeoutMs = 10000,
@@ -323,7 +340,7 @@ export function createExporterServer(options) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const batches = buildGraphqlPayloads(zoneEntries, { nowMs, windowMinutes });
+      const batches = buildGraphqlPayloads(zoneEntries, { nowMs, windowMinutes, dataset });
       const mergedMetrics = [];
       for (const batch of batches) {
         const res = await fetchImpl(graphqlEndpoint, {
@@ -388,7 +405,8 @@ async function main() {
   const zoneEntries = parseZoneSpecs(process.env.OOF_CLOUDFLARE_ZONE_IDS || "");
   const listenAddr = parseListenAddress(process.env.OOF_CF_EXPORTER_LISTEN || DEFAULT_LISTEN);
   const graphqlEndpoint = process.env.OOF_CLOUDFLARE_GRAPHQL_ENDPOINT || DEFAULT_GRAPHQL_ENDPOINT;
-  const windowMinutes = Number(process.env.OOF_CF_EXPORTER_WINDOW_MINUTES || 5);
+  const dataset = process.env.OOF_CF_EXPORTER_DATASET || DEFAULT_DATASET;
+  const windowMinutes = Number(process.env.OOF_CF_EXPORTER_WINDOW_MINUTES || (dataset === "httpRequests1hGroups" ? 60 : 5));
   const cacheTtlSecs = Number(process.env.OOF_CF_EXPORTER_CACHE_TTL_SECS || 60);
   const timeoutMs = Number(process.env.OOF_CF_EXPORTER_TIMEOUT_MS || 10000);
 
@@ -396,6 +414,7 @@ async function main() {
     apiToken,
     zoneEntries,
     graphqlEndpoint,
+    dataset,
     windowMinutes,
     cacheTtlSecs,
     timeoutMs,
