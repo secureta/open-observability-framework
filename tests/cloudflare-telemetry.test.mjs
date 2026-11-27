@@ -572,6 +572,14 @@ test("Cloudflare GraphQL Analytics Exporter: 11-zone batching (<=10/query), loop
       }),
     /Unsupported OOF_CF_EXPORTER_DATASET/
   );
+  assert.deepEqual(
+    mod.parseCliArgs(["--dataset=httpRequests1hGroups", "--window-minutes=120"]),
+    { dataset: "httpRequests1hGroups", windowMinutes: 120 }
+  );
+  assert.deepEqual(
+    mod.parseCliArgs(["--dataset", "httpRequests1mGroups", "--window-minutes", "15"]),
+    { dataset: "httpRequests1mGroups", windowMinutes: 15 }
+  );
 
   const gqlRequests = [];
   let failUpstream = false;

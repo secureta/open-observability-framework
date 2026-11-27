@@ -412,13 +412,35 @@ export function createExporterServer(options) {
   return server;
 }
 
+export function parseCliArgs(argv = []) {
+  const out = {};
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg.startsWith("--dataset=")) {
+      out.dataset = arg.slice("--dataset=".length);
+    } else if (arg === "--dataset" && i + 1 < argv.length) {
+      out.dataset = argv[++i];
+    } else if (arg.startsWith("--window-minutes=")) {
+      out.windowMinutes = Number(arg.slice("--window-minutes=".length));
+    } else if (arg === "--window-minutes" && i + 1 < argv.length) {
+      out.windowMinutes = Number(argv[++i]);
+    }
+  }
+  return out;
+}
+
 async function main() {
+  const cliArgs = parseCliArgs(process.argv.slice(2));
   const apiToken = process.env.OOF_CLOUDFLARE_API_TOKEN || "";
   const zoneEntries = parseZoneSpecs(process.env.OOF_CLOUDFLARE_ZONE_IDS || "");
   const listenAddr = parseListenAddress(process.env.OOF_CF_EXPORTER_LISTEN || DEFAULT_LISTEN);
   const graphqlEndpoint = process.env.OOF_CLOUDFLARE_GRAPHQL_ENDPOINT || DEFAULT_GRAPHQL_ENDPOINT;
-  const dataset = process.env.OOF_CF_EXPORTER_DATASET || DEFAULT_DATASET;
-  const windowMinutes = Number(process.env.OOF_CF_EXPORTER_WINDOW_MINUTES || (dataset === "httpRequests1hGroups" ? 60 : 5));
+  const dataset = cliArgs.dataset || process.env.OOF_CF_EXPORTER_DATASET || DEFAULT_DATASET;
+  const defaultWindow = dataset === "httpRequests1hGroups" ? 60 : 5;
+  const windowMinutes =
+    cliArgs.windowMinutes !== undefined
+      ? cliArgs.windowMinutes
+      : Number(process.env.OOF_CF_EXPORTER_WINDOW_MINUTES || defaultWindow);
   const cacheTtlSecs = Number(process.env.OOF_CF_EXPORTER_CACHE_TTL_SECS || 60);
   const timeoutMs = Number(process.env.OOF_CF_EXPORTER_TIMEOUT_MS || 10000);
 

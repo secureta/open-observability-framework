@@ -1474,6 +1474,8 @@
                   ExecStart = utils.escapeSystemdExecArgs [
                     (lib.getExe cfg.cloudflareGraphqlExporter.nodePackage)
                     "${./adapters/collect/cloudflare-graphql-exporter/exporter.mjs}"
+                    "--dataset=${cfg.cloudflareGraphqlExporter.dataset}"
+                    "--window-minutes=${toString effectiveExporterWindowMinutes}"
                   ];
                 };
               };
