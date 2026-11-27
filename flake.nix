@@ -1023,10 +1023,19 @@
                 description = "Cloudflare GraphQL Analytics API endpoint URL.";
               };
 
+              dataset = lib.mkOption {
+                type = lib.types.enum [
+                  "httpRequests1mGroups"
+                  "httpRequests1hGroups"
+                ];
+                default = "httpRequests1mGroups";
+                description = "Cloudflare GraphQL Analytics dataset (httpRequests1mGroups for Pro+ plans, httpRequests1hGroups for Free plans).";
+              };
+
               windowMinutes = lib.mkOption {
-                type = lib.types.ints.between 1 60;
-                default = 5;
-                description = "Lookback aggregation window in minutes for httpRequests1mGroups.";
+                type = lib.types.nullOr (lib.types.ints.between 1 1440);
+                default = null;
+                description = "Lookback aggregation window in minutes (defaults to 5 for httpRequests1mGroups [1..60], 60 for httpRequests1hGroups [60..1440]).";
               };
 
               cacheTtlSecs = lib.mkOption {
@@ -1402,7 +1411,17 @@
               };
             })
 
-            (lib.mkIf cfg.cloudflareGraphqlExporter.enable {
+            (lib.mkIf cfg.cloudflareGraphqlExporter.enable (
+              let
+                effectiveExporterWindowMinutes =
+                  if cfg.cloudflareGraphqlExporter.windowMinutes != null then
+                    cfg.cloudflareGraphqlExporter.windowMinutes
+                  else if cfg.cloudflareGraphqlExporter.dataset == "httpRequests1hGroups" then
+                    60
+                  else
+                    5;
+              in
+              {
               assertions = [
                 {
                   assertion = cfExporterParsed.valid && isLoopbackCanonical cfExporterParsed.canonical;
@@ -1418,6 +1437,14 @@
                     || !(lib.hasPrefix builtins.storeDir cfg.cloudflareGraphqlExporter.environmentFile);
                   message = "services.oof-collector.cloudflareGraphqlExporter.environmentFile must NOT point inside /nix/store.";
                 }
+                {
+                  assertion =
+                    if cfg.cloudflareGraphqlExporter.dataset == "httpRequests1hGroups" then
+                      effectiveExporterWindowMinutes >= 60 && effectiveExporterWindowMinutes <= 1440
+                    else
+                      effectiveExporterWindowMinutes >= 1 && effectiveExporterWindowMinutes <= 60;
+                  message = "services.oof-collector.cloudflareGraphqlExporter.windowMinutes (${toString effectiveExporterWindowMinutes}) is out of range for dataset '${cfg.cloudflareGraphqlExporter.dataset}' (expected 1..60 for httpRequests1mGroups or 60..1440 for httpRequests1hGroups).";
+                }
               ];
 
               systemd.services.oof-cloudflare-graphql-exporter = {
@@ -1429,7 +1456,8 @@
                 environment = {
                   OOF_CF_EXPORTER_LISTEN = cfg.cloudflareGraphqlExporter.listen;
                   OOF_CLOUDFLARE_GRAPHQL_ENDPOINT = cfg.cloudflareGraphqlExporter.graphqlEndpoint;
-                  OOF_CF_EXPORTER_WINDOW_MINUTES = toString cfg.cloudflareGraphqlExporter.windowMinutes;
+                  OOF_CF_EXPORTER_DATASET = cfg.cloudflareGraphqlExporter.dataset;
+                  OOF_CF_EXPORTER_WINDOW_MINUTES = toString effectiveExporterWindowMinutes;
                   OOF_CF_EXPORTER_CACHE_TTL_SECS = toString cfg.cloudflareGraphqlExporter.cacheTtlSecs;
                 };
 
@@ -1449,7 +1477,7 @@
                   ];
                 };
               };
-            })
+            }))
 
             (lib.mkIf cfg.prometheus.enable {
               assertions =

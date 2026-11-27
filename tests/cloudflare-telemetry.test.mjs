@@ -563,6 +563,15 @@ test("Cloudflare GraphQL Analytics Exporter: 11-zone batching (<=10/query), loop
     () => mod.buildGraphqlPayload(zones.slice(0, 1), { dataset: "httpRequests1dGroups" }),
     /Unsupported OOF_CF_EXPORTER_DATASET/
   );
+  assert.throws(
+    () =>
+      mod.createExporterServer({
+        apiToken: "mock-gql-token",
+        zoneEntries: zones.slice(0, 1),
+        dataset: "httpRequests1HGroups",
+      }),
+    /Unsupported OOF_CF_EXPORTER_DATASET/
+  );
 
   const gqlRequests = [];
   let failUpstream = false;

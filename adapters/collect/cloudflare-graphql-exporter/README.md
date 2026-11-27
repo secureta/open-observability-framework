@@ -39,6 +39,7 @@ services.oof-collector = {
   cloudflareGraphqlExporter = {
     enable = true;
     listen = "127.0.0.1:9199";
+    # dataset = "httpRequests1hGroups"; # Required for Cloudflare Free-plan zones
     environmentFile = config.sops.secrets."oof-cf-analytics.env".path;
   };
 

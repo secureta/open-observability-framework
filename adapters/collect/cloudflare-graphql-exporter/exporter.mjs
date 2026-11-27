@@ -10,10 +10,15 @@ const ZONE_ALIAS_RE = /^[a-zA-Z0-9._-]+$/;
 const DEFAULT_DATASET = "httpRequests1mGroups";
 const ALLOWED_DATASETS = new Set(["httpRequests1mGroups", "httpRequests1hGroups"]);
 
-function buildZoneAnalyticsQuery(dataset = DEFAULT_DATASET) {
+export function assertValidDataset(dataset = DEFAULT_DATASET) {
   if (!ALLOWED_DATASETS.has(dataset)) {
     throw new Error(`Unsupported OOF_CF_EXPORTER_DATASET '${dataset}'; expected httpRequests1mGroups or httpRequests1hGroups.`);
   }
+  return dataset;
+}
+
+function buildZoneAnalyticsQuery(dataset = DEFAULT_DATASET) {
+  assertValidDataset(dataset);
   return `
 query OofZoneAnalytics($zoneTags: [string!], $since: Time!, $until: Time!) {
   viewer {
@@ -326,9 +331,12 @@ export function createExporterServer(options) {
   if (typeof apiToken !== "string" || apiToken.trim() === "") {
     throw new Error("OOF_CLOUDFLARE_API_TOKEN must be non-empty.");
   }
+  assertValidDataset(dataset);
 
+  const stepMs = dataset === "httpRequests1hGroups" ? 3600000 : 60000;
   let cachedBody = null;
   let cachedAtMs = 0;
+  let cachedUntilMs = 0;
 
   async function scrapeMetrics() {
     const nowMs = Date.now();
@@ -336,6 +344,7 @@ export function createExporterServer(options) {
       return cachedBody;
     }
 
+    const requestUntilMs = Math.floor(nowMs / stepMs) * stepMs;
     const startNs = process.hrtime.bigint();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -364,8 +373,11 @@ export function createExporterServer(options) {
 
       const elapsedSec = Number(process.hrtime.bigint() - startNs) / 1e9;
       const body = renderPrometheusMetrics(mergedMetrics, { scrapeSuccess: 1, durationSeconds: elapsedSec });
-      cachedBody = body;
-      cachedAtMs = Date.now();
+      if (requestUntilMs >= cachedUntilMs) {
+        cachedBody = body;
+        cachedAtMs = Date.now();
+        cachedUntilMs = requestUntilMs;
+      }
       return body;
     } catch {
       const elapsedSec = Number(process.hrtime.bigint() - startNs) / 1e9;
